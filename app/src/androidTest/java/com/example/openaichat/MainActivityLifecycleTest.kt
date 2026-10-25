@@ -85,7 +85,10 @@ class MainActivityLifecycleTest {
     private fun assertActualSendAfterInterruptedOpenRouterResponse(reopen: Boolean, errorEvent: Boolean) {
         val (server, testHttpClient) = createHttpsMockServer()
         val endpoint = server.url("/api/v1").toString()
-        val firstSse = "data: " + JSONObject().put("id", "gen-unfinished")
+        // Both scenarios share the native SQLite database. A provider ID belongs
+        // to exactly one paid generation, even when another test ran first.
+        val firstGeneration = "gen-unfinished-" + java.util.UUID.randomUUID()
+        val firstSse = "data: " + JSONObject().put("id", firstGeneration)
             .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject()
                 .put("content", "Partial first answer.  ")))) + "\n\n" +
             if (errorEvent) "data: " + JSONObject().put("error", JSONObject()
@@ -127,8 +130,16 @@ class MainActivityLifecycleTest {
                     val last = history.lastOrNull()
                     if (last?.optString("role") == "assistant" && last.optString("status") == "failed") {
                         recordedAssistant = true
-                        assertTrue(last.optString("text").contains("Partial first answer."))
+                        assertEquals("The failed SSE must retain every received character", "Partial first answer.  ", last.optString("text"))
                         assertEquals("openrouter", last.optString("provider"))
+                        val expectedFailure = if (errorEvent) "Synthetic interrupted stream" else "OpenRouter SSE ended before [DONE]"
+                        assertTrue("Expected SSE failure, not a fixture/accounting failure: ${last.optString("error")}",
+                            last.optString("error").contains(expectedFailure))
+                        val chatId = prefs.getString("current_chat", null)!!
+                        ChatDatabase(activity).use { db ->
+                            val rows = db.listOpenRouterRounds(chatId, last.getString("request_id"))
+                            assertEquals(firstGeneration, rows.single().getString("generation_id"))
+                        }
                     }
                 }
                 if (recordedAssistant) break
@@ -1515,37 +1526,100 @@ class MainActivityLifecycleTest {
     @Test
     fun zipPreparationFailureClearsPreparationState() {
         val scenario = ActivityScenario.launch(MainActivity::class.java)
-        scenario.onActivity { activity ->
-            val brokenZip = java.io.File(activity.cacheDir, "broken.zip").apply {
-                writeText("not a zip archive")
-            }
-            @Suppress("UNCHECKED_CAST")
-            val pending = privateField(activity, "pendingUploadUris") as MutableList<Pair<String, String>>
-            pending.add(android.net.Uri.fromFile(brokenZip).toString() to "zip")
-
-            invoke(
-                activity,
-                "preparePendingOpenRouterZipsThenSend",
-                Boolean::class.javaPrimitiveType!!,
-                false
-            )
-        }
-
-        for (attempt in 0 until 40) {
-            var complete = false
+        val fixtureFiles = mutableListOf<java.io.File>()
+        val originalBytes = "Existing attachment — keep exact bytes 😀".toByteArray(Charsets.UTF_8)
+        val draft = "Do not lose this draft after ZIP failure"
+        val opened = CountDownLatch(1)
+        var sourceChat = ""
+        var attachmentSnapshot = ""
+        var pendingSnapshot = ""
+        try {
             scenario.onActivity { activity ->
-                complete = !(privateField(activity, "preparingZipAttachments") as Boolean)
+                activity.newChat()
+                sourceChat = currentChatId(activity)
+                val brokenZip = java.io.File.createTempFile("broken-", ".zip", activity.cacheDir).apply {
+                    writeText("not a zip archive"); fixtureFiles += this
+                }
+                val original = java.io.File.createTempFile("existing-", ".txt", activity.filesDir).apply {
+                    writeBytes(originalBytes); fixtureFiles += this
+                }
+                val attachment = OpenRouterAttachmentStore.classifyLocalFile(original, "existing.txt", "text/plain")
+                listOfNotNull(attachment.textPath, attachment.wirePath).forEach { fixtureFiles += java.io.File(it) }
+                @Suppress("UNCHECKED_CAST")
+                val attachments = privateField(activity, "attachedOpenRouterAttachments") as MutableList<OpenRouterLocalAttachment>
+                attachments.add(attachment)
+                attachmentSnapshot = attachment.toJson().toString()
+                @Suppress("UNCHECKED_CAST")
+                val pending = privateField(activity, "pendingUploadUris") as MutableList<Pair<String, String>>
+                val zipUri = Uri.fromFile(brokenZip).toString()
+                pending.add(zipUri to "zip")
+                pending.add(Uri.fromFile(original).toString() to "file")
+                (privateField(activity, "input") as android.widget.EditText).setText(draft)
+                invoke(activity, "persistComposerStateNow")
+                pendingSnapshot = JSONObject(activity.prefs.getString("composer_state_$sourceChat", null)!!)
+                    .getJSONArray("pending_uploads").toString()
+                setPrivateField(activity, "openRouterAttachmentInputStreamSource", AttachmentInputStreamSource { _, uri ->
+                    assertEquals(zipUri, uri.toString())
+                    opened.countDown()
+                    brokenZip.inputStream()
+                })
+                invoke(activity, "preparePendingOpenRouterZipsThenSend", Boolean::class.javaPrimitiveType!!, false)
+                assertTrue(privateField(activity, "preparingZipAttachments") as Boolean)
+                assertTrue(privateField(activity, "activeZipOperation") != null)
+                assertFalse((privateField(activity, "send") as Button).isEnabled)
             }
-            if (complete) break
-            SystemClock.sleep(25L)
+            assertTrue("The owned ZIP must actually reach the production parser", opened.await(2, TimeUnit.SECONDS))
+            for (attempt in 0 until 40) {
+                var complete = false
+                scenario.onActivity { activity ->
+                    complete = !(privateField(activity, "preparingZipAttachments") as Boolean)
+                }
+                if (complete) break
+                SystemClock.sleep(25L)
+            }
+            scenario.onActivity { activity ->
+                assertFalse(privateField(activity, "preparingZipAttachments") as Boolean)
+                assertEquals(null, privateField(activity, "activeZipOperation"))
+                assertTrue((privateField(activity, "send") as Button).isEnabled)
+                assertEquals("Ошибка ZIP: В ZIP не найдено поддерживаемых файлов",
+                    (privateField(activity, "status") as android.widget.TextView).text.toString())
+                assertEquals(draft, (privateField(activity, "input") as android.widget.EditText).text.toString())
+                @Suppress("UNCHECKED_CAST")
+                val attachments = privateField(activity, "attachedOpenRouterAttachments") as List<OpenRouterLocalAttachment>
+                assertEquals(attachmentSnapshot, attachments.single().toJson().toString())
+                @Suppress("UNCHECKED_CAST")
+                val pending = privateField(activity, "pendingUploadUris") as List<Pair<String, String>>
+                assertEquals(pendingSnapshot, JSONArray().apply {
+                    pending.forEach { (uri, kind) -> put(JSONObject().put("uri", uri).put("kind", kind)) }
+                }.toString())
+                val saved = JSONObject(activity.prefs.getString("composer_state_$sourceChat", null)!!)
+                assertEquals(draft, saved.getString("text"))
+                assertEquals(pendingSnapshot, saved.getJSONArray("pending_uploads").toString())
+                assertEquals(attachmentSnapshot, saved.getJSONArray("openrouter_attachments").getJSONObject(0).toString())
+                ChatDatabase(activity).use { db ->
+                    assertEquals(null, db.getActiveResponse(sourceChat))
+                    assertTrue(db.listRequestAccounting(sourceChat).isEmpty())
+                }
+            }
+            scenario.recreate()
+            scenario.onActivity { activity ->
+                assertEquals(draft, (privateField(activity, "input") as android.widget.EditText).text.toString())
+                @Suppress("UNCHECKED_CAST")
+                val attachments = privateField(activity, "attachedOpenRouterAttachments") as List<OpenRouterLocalAttachment>
+                assertEquals(attachmentSnapshot, attachments.single().toJson().toString())
+                assertTrue(originalBytes.contentEquals(java.io.File(attachments.single().path).readBytes()))
+                val saved = JSONObject(activity.prefs.getString("composer_state_$sourceChat", null)!!)
+                assertEquals(pendingSnapshot, saved.getJSONArray("pending_uploads").toString())
+            }
+        } finally {
+            scenario.close()
+            val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
+            if (sourceChat.isNotBlank()) {
+                ChatDatabase(context).use { it.deleteChat(sourceChat) }
+                context.getSharedPreferences("app", 0).edit().remove("composer_state_$sourceChat").commit()
+            }
+            fixtureFiles.forEach(java.io.File::delete)
         }
-
-        scenario.onActivity { activity ->
-            assertFalse(privateField(activity, "preparingZipAttachments") as Boolean)
-            val status = privateField(activity, "status") as android.widget.TextView
-            assertTrue(status.text.toString().contains("Не удалось подготовить ZIP"))
-        }
-        scenario.close()
     }
 
     @Test
@@ -2138,6 +2212,7 @@ class MainActivityLifecycleTest {
                 scenario.onActivity { activity ->
                     assertFalse(activity.prefs.getBoolean("background_responses", true))
                     assertEquals("openrouter", activity.prefs.getString("provider", null))
+                    assertEquals("Legacy model must wait for explicit selection", "gpt-6-astra", activity.prefs.getString("model", null))
                     activity.newChat()
                     fixtureChatId = activity.currentChatIdForTesting()
                 }
@@ -2148,6 +2223,18 @@ class MainActivityLifecycleTest {
                     val root = android.view.inspector.WindowInspector.getGlobalWindowViews().single { backgroundSwitch(it) != null }
                     assertFalse(backgroundSwitch(root)!!.isChecked)
                     root.findViewById<Button>(android.R.id.button2).performClick()
+                    assertEquals("gpt-6-astra", activity.prefs.getString("model", null))
+                    invoke(activity, "showModelPicker")
+                    fun choices(view: android.view.View): android.widget.ListView? {
+                        if (view is android.widget.ListView) return view
+                        if (view is android.view.ViewGroup) for (i in 0 until view.childCount)
+                            choices(view.getChildAt(i))?.let { return it }
+                        return null
+                    }
+                    val models = android.view.inspector.WindowInspector.getGlobalWindowViews().mapNotNull(::choices).single()
+                    assertTrue(models.adapter.getItem(0).toString().contains("Claude"))
+                    models.performItemClick(models.getChildAt(0), 0, models.adapter.getItemId(0))
+                    assertTrue("Fixture must explicitly select Claude before inference", ModelCatalog.isClaudeModel(activity.prefs.getString("model", null)))
                     assertTrue(SecureStore(activity).setOpenRouterApiKey("sk-or-synthetic-bg-false"))
                     setPrivateField(activity, "openRouterClientFactory",
                         { OpenRouterChatClient(endpoint, testHttpClient, reconcileGenerations = false) })
@@ -2158,7 +2245,9 @@ class MainActivityLifecycleTest {
                     ?: throw AssertionError("OpenRouter Send did not reach local HTTPS mock")
                 assertEquals("POST", recorded.method)
                 assertEquals("/api/v1/chat/completions", recorded.path)
-                assertFalse("OpenRouter does not accept the direct Responses background option", JSONObject(recorded.body.readUtf8()).has("background"))
+                val body = JSONObject(recorded.body.readUtf8())
+                assertFalse("OpenRouter does not accept the direct Responses background option", body.has("background"))
+                assertEquals(prefs.getString("model", null), body.getString("model"))
                 ChatDatabase(context).use { db ->
                     val active = db.getActiveResponse(fixtureChatId!!)!!
                     requestId = active.getString("request_id")

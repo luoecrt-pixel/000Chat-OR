@@ -35,11 +35,13 @@ class RawResponseRecoveryPersistenceTest {
             }
             ChatDatabase(context).use { db ->
                 val message = db.getChat(chat)!!.getJSONArray("messages").getJSONObject(0)
-                assertEquals(file.absolutePath, message.getJSONArray("annotations").getJSONObject(0).getString("local_path"))
-                assertTrue(db.listAllLocalFilePaths().contains(file.absolutePath))
-                assertArrayEquals(bytes, file.readBytes())
+                val received = File(message.getJSONArray("annotations").getJSONObject(0).getString("local_path"))
+                assertEquals("Android's data-dir aliases must resolve to the exact received source", file.canonicalFile, received.canonicalFile)
+                assertTrue(db.listAllLocalFilePaths().map { File(it).canonicalFile }.contains(file.canonicalFile))
+                assertArrayEquals(bytes, received.readBytes())
                 db.deleteChat(chat)
-                assertFalse(db.listAllLocalFilePaths().contains(file.absolutePath))
+                assertFalse(db.listAllLocalFilePaths().map { File(it).canonicalFile }.contains(file.canonicalFile))
+                assertArrayEquals("Deleting history releases ownership without modifying the original source", bytes, file.readBytes())
             }
         } finally { file.delete(); ChatDatabase(context).use { it.deleteChat(chat) } }
     }

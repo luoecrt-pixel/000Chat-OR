@@ -135,9 +135,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           disable-linux-hw-accel: false
-          script: |
-            gradle --no-daemon --stacktrace connectedDebugAndroidTest
-            python3 tools/test_android_process_recovery.py
+          script: python3 tools/test_android_process_recovery.py --instrumentation-first
 
       - name: Upload process recovery evidence
         if: always()

@@ -33,6 +33,8 @@ SCENARIOS = ("partial", "stopped", "replaced", "intent_gap", "deleted_intent")
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--instrumentation-first", action="store_true",
+                        help="Run connected Android tests first; still collect host recovery evidence if they fail")
     parser.add_argument("--serial", default=os.environ.get("ANDROID_SERIAL"))
     parser.add_argument("--app-apk", type=Path, default=Path("app/build/outputs/apk/debug/app-debug.apk"))
     parser.add_argument("--test-apk", type=Path,
@@ -55,6 +57,12 @@ def main() -> None:
 
     if command("shell", "getprop", "ro.kernel.qemu") != "1":
         raise SystemExit("Refusing process-kill tests on a physical device")
+    instrumentation_status = 0
+    if args.instrumentation_first:
+        print("Running connected Android instrumentation before host process recovery", flush=True)
+        instrumentation_status = subprocess.run(
+            ["gradle", "--no-daemon", "--stacktrace", "connectedDebugAndroidTest"], check=False).returncode
+        print(f"Android instrumentation exit status: {instrumentation_status}; collecting host recovery evidence", flush=True)
     # connectedDebugAndroidTest uninstalls its APKs on completion. Install the
     # exact current build for this separate host-driven run, retaining app data.
     for apk in (args.app_apk, args.test_apk):
@@ -163,6 +171,11 @@ def main() -> None:
                 if not failed:
                     raise
                 print(f"Process recovery cleanup also failed: {scenario}: {cleanup_error}", file=sys.stderr)
+
+    # A green recovery pass must never mask a failed connected suite. Recovery
+    # exceptions above also fail the job; both kinds of evidence are uploaded.
+    if instrumentation_status:
+        raise SystemExit(instrumentation_status)
 
 
 if __name__ == "__main__":
