@@ -159,6 +159,18 @@ def main() -> None:
             # preferences and the synthetic credential even if verification
             # timed out, failed, or never started. No app data is cleared.
             failed = sys.exc_info()[0] is not None
+            if failed:
+                try:
+                    # Collect only redacted app diagnostics and VM errors before
+                    # fixture cleanup removes its SQLite state. Never mask the
+                    # original test failure with an optional evidence failure.
+                    diagnostic = subprocess.run(adb + ["logcat", "-d", "-v", "brief",
+                        "AstraDiagnostics:D", "AndroidRuntime:E", "*:S"], capture_output=True,
+                        text=True, timeout=15)
+                    (args.reports / f"{scenario}-diagnostics.log").write_text(
+                        diagnostic.stdout + diagnostic.stderr, encoding="utf-8")
+                except Exception as diagnostic_error:
+                    print(f"Process recovery diagnostic collection failed: {type(diagnostic_error).__name__}", file=sys.stderr)
             try:
                 command("shell", "am", "force-stop", PACKAGE)
                 cleanup = command("shell", "am", "instrument", "-w", "-r", "-e", "class",

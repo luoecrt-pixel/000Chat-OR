@@ -48,6 +48,7 @@ class ProcessDeathRecoveryFixture {
     private val unfinishedReasoning = "unfinished-process-reasoning-data"
     private val original = "Original tool result\nUnicode 😀\n"
     private val appPreferenceKeys = listOf("current_chat", "provider", "model", "response_notifications")
+    private fun generationId(stage: String) = "gen-fixture-$runToken-$stage"
 
     private fun await(message: String, condition: () -> Boolean) {
         val deadline = SystemClock.elapsedRealtime() + 20_000L
@@ -56,6 +57,56 @@ class ProcessDeathRecoveryFixture {
             SystemClock.sleep(20)
         }
         assertTrue(message, condition())
+    }
+
+    private fun seedDiagnostics(server: MockWebServer): String {
+        fun safeError(raw: String): String = AstraDiagnostics(context).redactDisplayText(raw)
+            .replace(Regex("/(?:data|storage|sdcard|mnt|workspace)/[^\\s,;)\"]+"), "[local-path]").take(512)
+        val state = JSONObject().put("http_count", server.requestCount)
+            .put("runtime_present", OpenRouterResponseRuntime.contains(requestId))
+        try {
+            ChatDatabase(context).use { db ->
+                db.getActiveResponse(chatId)?.let { active ->
+                    state.put("active_owner_matches", active.optString("request_id") == requestId)
+                        .put("active_status", active.optString("status"))
+                        .put("active_text_chars", active.optString("text").length)
+                } ?: state.put("active_owner", JSONObject.NULL)
+                val messages = db.getChat(chatId)?.optJSONArray("messages") ?: JSONArray()
+                val terminal = (0 until messages.length()).mapNotNull { messages.optJSONObject(it) }
+                    .lastOrNull { it.optString("role") == "assistant" && it.optString("request_id") == requestId }
+                terminal?.let {
+                    state.put("assistant_status", it.optString("status"))
+                        .put("assistant_text_chars", it.optString("text").length)
+                        .put("assistant_error", safeError(it.optString("error")))
+                }
+                state.put("rounds", JSONArray().apply {
+                    db.listOpenRouterRounds(chatId, requestId).forEach { round -> put(JSONObject()
+                        .put("index", round.optInt("round_index"))
+                        .put("generation_id", round.optString("generation_id"))
+                        .put("cost_kind", round.optString("cost_kind"))
+                        .put("has_usage", round.has("usage_snapshot"))) }
+                })
+                state.put("request_status", db.listRequestAccounting(chatId, setOf(requestId))
+                    .singleOrNull()?.optString("local_status") ?: JSONObject.NULL)
+                val intent = db.getLocalArtifactIntent(chatId, requestId, providerCallId)
+                state.put("intent_state", intent?.optString("state") ?: JSONObject.NULL)
+                state.put("intent_tombstoned", intent?.optBoolean("tombstoned") ?: JSONObject.NULL)
+            }
+        } catch (error: Exception) {
+            state.put("diagnostic_db_error", error.javaClass.simpleName + ": " + safeError(error.message.orEmpty()))
+        }
+        return state.toString()
+    }
+
+    private fun awaitPartialPrefix(server: MockWebServer) {
+        val deadline = SystemClock.elapsedRealtime() + 20_000L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (ChatDatabase(context).use { it.getActiveResponse(chatId)?.optString("text") == prefix }) return
+            if (!OpenRouterResponseRuntime.contains(requestId))
+                throw AssertionError("Runtime exited before persisting its second-round prefix: " + seedDiagnostics(server))
+            SystemClock.sleep(20)
+        }
+        throw AssertionError("A real second HTTP round must persist the partial prefix: " + seedDiagnostics(server))
     }
 
     private fun savePreferences() {
@@ -105,14 +156,14 @@ class ProcessDeathRecoveryFixture {
         val call = JSONObject().put("index", 0).put("id", providerCallId).put("type", "function")
             .put("function", JSONObject().put("name", "create_local_text_file").put("arguments", JSONObject()
                 .put("filename", "process-result.txt").put("content", original).toString()))
-        val toolFrame = JSONObject().put("id", "gen-fixture-tool").put("model", model)
+        val toolFrame = JSONObject().put("id", generationId("tool")).put("model", model)
             .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject()
                 .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
                     .put("data", "synthetic-signed-process-data").put("index", 0)))
                 .put("tool_calls", JSONArray().put(call))).put("finish_reason", "tool_calls")))
         server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
             .setBody("data: $toolFrame\n\ndata: [DONE]\n\n"))
-        val partialFrame = JSONObject().put("id", "gen-fixture-partial").put("model", model)
+        val partialFrame = JSONObject().put("id", generationId("partial")).put("model", model)
             .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", prefix)
                 .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
                     .put("index", 0).put("data", unfinishedReasoning))))))
@@ -157,9 +208,7 @@ class ProcessDeathRecoveryFixture {
             waitForHostKill()
             return
         }
-        await("A real second HTTP round must persist the partial prefix") {
-            ChatDatabase(context).use { it.getActiveResponse(chatId)?.optString("text") == prefix }
-        }
+        awaitPartialPrefix(server)
         assertEquals(2, server.requestCount)
         ChatDatabase(context).use { db ->
             val checkpoint = db.getOpenRouterCheckpoint(chatId, requestId)!!
@@ -259,7 +308,7 @@ class ProcessDeathRecoveryFixture {
             dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
                 override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
                     if (!explicitReplayAllowed.get()) return MockResponse().setResponseCode(599).setBody("Unexpected recovery HTTP")
-                    val frame = JSONObject().put("id", "gen-fixture-explicit-replay").put("model", model)
+                    val frame = JSONObject().put("id", generationId("explicit-replay")).put("model", model)
                         .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", "Recovered file verified"))
                             .put("finish_reason", "stop")))
                     return MockResponse().setHeader("Content-Type", "text/event-stream")

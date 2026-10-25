@@ -1579,7 +1579,8 @@ class MainActivityLifecycleTest {
             }
             scenario.onActivity { activity ->
                 assertFalse(privateField(activity, "preparingZipAttachments") as Boolean)
-                assertEquals(null, privateField(activity, "activeZipOperation"))
+                assertEquals(null, MainActivity::class.java.getDeclaredField("activeZipOperation")
+                    .apply { isAccessible = true }.get(activity))
                 assertTrue((privateField(activity, "send") as Button).isEnabled)
                 assertEquals("Ошибка ZIP: В ZIP не найдено поддерживаемых файлов",
                     (privateField(activity, "status") as android.widget.TextView).text.toString())
