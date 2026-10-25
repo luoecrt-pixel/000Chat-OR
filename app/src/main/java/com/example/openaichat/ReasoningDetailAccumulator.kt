@@ -10,6 +10,8 @@ class ReasoningDetailAccumulator {
     private data class Identity(val kind: String, val value: String, val type: String)
     private val indexes = mutableMapOf<Identity, Int>()
     private val fragments = JSONArray()
+    var receivedCharacterCount: Long = 0L
+        private set
 
     private fun alias(kind: String, value: String, type: String): Identity {
         val untyped = Identity(kind, value, "")
@@ -30,6 +32,7 @@ class ReasoningDetailAccumulator {
             // Preserve the received fragment even if its identity proves inconsistent below.
             val raw = JsonProtocol.copy(details.get(i))
             fragments.put(raw)
+            receivedCharacterCount += raw.toString().length
             val item = raw as? JSONObject ?: throw IOException("Invalid reasoning detail fragment")
             val type = JsonProtocol.nonBlank(item, "type").orEmpty()
             val aliases = buildList {

@@ -45,6 +45,7 @@ class ProcessDeathRecoveryFixture {
     private val model = "anthropic/claude-sonnet-5.5"
     private val syntheticKey = "sk-or-v1-synthetic-process-fixture"
     private val prefix = "Полученный до остановки процесса текст 😀"
+    private val unfinishedReasoning = "unfinished-process-reasoning-data"
     private val original = "Original tool result\nUnicode 😀\n"
     private val appPreferenceKeys = listOf("current_chat", "provider", "model", "response_notifications")
 
@@ -112,7 +113,9 @@ class ProcessDeathRecoveryFixture {
         server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
             .setBody("data: $toolFrame\n\ndata: [DONE]\n\n"))
         val partialFrame = JSONObject().put("id", "gen-fixture-partial").put("model", model)
-            .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", prefix))))
+            .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", prefix)
+                .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
+                    .put("index", 0).put("data", unfinishedReasoning))))))
         val firstData = "data: $partialFrame"
         val padding = 510 - firstData.toByteArray(Charsets.UTF_8).size
         require(padding >= 0)
@@ -160,6 +163,7 @@ class ProcessDeathRecoveryFixture {
         assertEquals(2, server.requestCount)
         ChatDatabase(context).use { db ->
             val checkpoint = db.getOpenRouterCheckpoint(chatId, requestId)!!
+            assertUnfinishedReasoningRetainedOutsideReplay(checkpoint)
             val tail = checkpoint.getJSONArray("tail")
             assertEquals("synthetic-signed-process-data", tail.getJSONObject(0)
                 .getJSONArray("reasoning_details").getJSONObject(0).getString("data"))
@@ -168,7 +172,7 @@ class ProcessDeathRecoveryFixture {
             assertEquals(original, File(path).readText())
             saveArtifactEvidence(path, tail)
             if (scenario != "partial") {
-                assertTrue(db.stopActiveRequestOnce(chatId, requestId))
+                assertTrue(OpenRouterResponseRuntime.stop(context, chatId, requestId, false))
                 OpenRouterResponseRuntime.cancel(requestId)
                 if (scenario == "replaced") {
                     db.setActiveResponse(chatId, null, replacementId, "", "in_progress", System.currentTimeMillis(),
@@ -345,11 +349,18 @@ class ProcessDeathRecoveryFixture {
                 assertEquals("disconnected", answer.getString("status"))
                 assertEquals("openrouter", answer.getString("provider"))
                 val originalTail = JSONArray(prefs.getString("tail", "[]"))
-                val recoveredTail = answer.getJSONObject("openrouter_protocol").getJSONArray("tail")
+                val recoveredProtocol = answer.getJSONObject("openrouter_protocol")
+                assertUnfinishedReasoningRetainedOutsideReplay(recoveredProtocol)
+                val recoveredTail = recoveredProtocol.getJSONArray("tail")
                 for (index in 0 until originalTail.length())
                     assertEquals(originalTail.get(index).toString(), recoveredTail.get(index).toString())
+                val history = (0 until messages.length()).map { messages.getJSONObject(it) }
+                val wire = OpenRouterContextSnapshot.build(history, null, List(history.size) { emptyList() })
+                assertFalse("An unfinished signed round must not be replayed", wire.toString().contains(unfinishedReasoning))
             } else {
-                assertEquals(prefix, db.getRequestRecoveryArchive(chatId, requestId)!!.getString("text"))
+                val archive = db.getRequestRecoveryArchive(chatId, requestId)!!
+                assertEquals(prefix, archive.getString("text"))
+                assertUnfinishedReasoningRetainedOutsideReplay(archive.getJSONObject("openrouter_protocol"))
                 if (scenario == "replaced") {
                     assertEquals(replacementId, messages.getJSONObject(1).getString("request_id"))
                     assertEquals("Replacement prefix", messages.getJSONObject(1).getString("text"))
@@ -364,6 +375,15 @@ class ProcessDeathRecoveryFixture {
     private fun recordedRoundCount(db: ChatDatabase): Int = db.readableDatabase.rawQuery(
         "SELECT COUNT(*) FROM openrouter_request_rounds WHERE chat_id=? AND local_request_id=?",
         arrayOf(chatId, requestId)).use { it.moveToFirst(); it.getInt(0) }
+
+    private fun assertUnfinishedReasoningRetainedOutsideReplay(protocol: JSONObject) {
+        val interrupted = protocol.getJSONObject("interrupted_assistant")
+        assertEquals(prefix, interrupted.getString("content"))
+        assertFalse(interrupted.getBoolean("replay_safe"))
+        assertEquals(unfinishedReasoning, interrupted.getJSONArray("reasoning_details").getJSONObject(0).getString("data"))
+        assertEquals(unfinishedReasoning, interrupted.getJSONArray("reasoning_delta_fragments").getJSONObject(0).getString("data"))
+        assertFalse(protocol.getJSONArray("tail").toString().contains(unfinishedReasoning))
+    }
 
     private fun verifyArtifactEvidence() {
         val file = File(prefs.getString("result_path", "")!!)

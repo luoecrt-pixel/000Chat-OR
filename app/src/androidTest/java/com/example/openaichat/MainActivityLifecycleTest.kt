@@ -585,7 +585,7 @@ class MainActivityLifecycleTest {
             scenario.onActivity { activity ->
                 activity.newChat()
                 chatId = currentChatId(activity)
-                activity.prefs.edit().putString("provider", "openrouter").putString("model", "test/model")
+                activity.prefs.edit().putString("provider", "openrouter").putString("model", "anthropic/claude-test")
                     .putString("reasoning", "high").putBoolean("background_responses", false)
                     .putBoolean("github_tools", false).putBoolean("openrouter_web_search", false)
                     .putBoolean("openrouter_web_fetch", false).putString("openrouter_text_format", "text").apply()

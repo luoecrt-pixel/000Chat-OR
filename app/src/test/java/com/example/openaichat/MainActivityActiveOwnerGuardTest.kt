@@ -116,6 +116,29 @@ class MainActivityActiveOwnerGuardTest {
         }
     }
 
+    @Test fun stopArchiveFailureKeepsUiOwnerAndDraftForAnExplicitRetry() {
+        val generation = activity.activeGenerationForTesting()
+        ChatDatabase(context).use { db -> db.writableDatabase.execSQL("""CREATE TRIGGER fail_ui_stop
+            BEFORE INSERT ON request_recovery_archive BEGIN SELECT RAISE(ABORT, 'controlled UI Stop failure'); END""") }
+        invoke("stopCurrentResponse")
+        assertEquals(generation, activity.activeGenerationForTesting())
+        assertEquals(draft, (field("input") as EditText).text.toString())
+        assertEquals(View.VISIBLE, (field("stop") as View).visibility)
+        assertFalse((field("send") as Button).isEnabled)
+        assertTrue((field("status") as TextView).text.toString().contains("повторите Stop"))
+        ChatDatabase(context).use { db ->
+            assertEquals(requestId, db.getActiveResponse(chatId)!!.getString("request_id"))
+            assertEquals(partial, db.getActiveResponse(chatId)!!.getString("text"))
+            assertNull(db.getRequestRecoveryArchive(chatId, requestId))
+            db.writableDatabase.execSQL("DROP TRIGGER fail_ui_stop")
+        }
+        invoke("stopCurrentResponse")
+        ChatDatabase(context).use { db ->
+            assertNull(db.getActiveResponse(chatId))
+            assertEquals(partial, db.getRequestRecoveryArchive(chatId, requestId)!!.getString("text"))
+        }
+    }
+
     @Test fun conflictingOpenRouterAccountingAndLegacyCheckpointSurviveStartupWithoutFinalization() {
         controller!!.pause().stop().destroy()
         val conflictChat = "conflicting-provider-owner"

@@ -1201,7 +1201,8 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
      * finalizer either wins the ownership claim first or observes Stop; the
      * two cannot both persist a terminal assistant message.
      */
-    fun stopActiveRequestOnce(chatId: String, expectedRequestId: String, removeUserMessage: Boolean = false): Boolean {
+    fun stopActiveRequestOnce(chatId: String, expectedRequestId: String, removeUserMessage: Boolean = false,
+        streamSnapshot: OpenRouterStreamSnapshot? = null): Boolean {
         if (chatId.isBlank() || expectedRequestId.isBlank()) return false
         var stopped = false
         writableDatabase.transaction { db ->
@@ -1212,6 +1213,12 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             }
             if (!ActiveResponseWritePolicy.shouldCommit(active?.first, expectedRequestId)) {
                 return@transaction
+            }
+            // The runtime's SSE fence stays held through this transaction. The
+            // freshest parsed text and opaque fragments enter the winning archive
+            // before ownership/checkpoints are cleared, or the entire Stop rolls back.
+            if (streamSnapshot != null) check(checkpointOpenRouterStreamInDb(db, chatId, expectedRequestId, streamSnapshot)) {
+                "OpenRouter Stop snapshot owner mismatch"
             }
             // A tombstone also covers legacy requests with no accounting row.
             db.insertWithOnConflict(REQUEST_ACCOUNTING_TABLE, null, ContentValues().apply {
@@ -2664,6 +2671,31 @@ data class ExistingMessageRow(
             saved = true
         }
         return saved
+    }
+
+    /** Text and opaque stream fragments are one owner-aware durable snapshot. */
+    fun checkpointOpenRouterStream(chatId: String, requestId: String, snapshot: OpenRouterStreamSnapshot): Boolean {
+        var saved = false
+        writableDatabase.transaction { db -> saved = checkpointOpenRouterStreamInDb(db, chatId, requestId, snapshot) }
+        return saved
+    }
+
+    private fun checkpointOpenRouterStreamInDb(db: SQLiteDatabase, chatId: String, requestId: String,
+        snapshot: OpenRouterStreamSnapshot): Boolean {
+        val sequence = db.rawQuery("""SELECT active_last_sequence_number FROM $CHAT_TABLE
+            WHERE id=? AND active_request_id=? AND active_status IN ('starting','in_progress')
+            AND active_response_id IS NULL AND active_indexed_checkpoint IS NULL
+            AND EXISTS (SELECT 1 FROM $REQUEST_ACCOUNTING_TABLE a WHERE a.chat_id=$CHAT_TABLE.id
+                AND a.local_request_id=$CHAT_TABLE.active_request_id AND a.provider='openrouter' AND a.local_status='running')""",
+            arrayOf(chatId, requestId)).use { c -> if (c.moveToFirst()) c.getLong(0) + 1L else null } ?: return false
+        check(db.update(CHAT_TABLE, ContentValues().apply {
+            put("active_text", snapshot.text); put("active_status", "in_progress")
+            put("active_last_sequence_number", sequence); put("updated_at", System.currentTimeMillis())
+        }, "id=? AND active_request_id=?", arrayOf(chatId, requestId)) == 1)
+        check(db.insertWithOnConflict("openrouter_checkpoints", null, ContentValues().apply {
+            put("chat_id", chatId); put("request_id", requestId); put("protocol", snapshot.protocol.toString())
+        }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "OpenRouter stream checkpoint was not persisted" }
+        return true
     }
 
     fun saveOpenRouterCheckpoint(chatId: String, requestId: String, protocol: JSONObject): Boolean {

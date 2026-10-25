@@ -191,11 +191,12 @@ class MainActivitySettingsTest {
         assertEquals("anthropic", prefs.getString("openrouter_claude_route", null))
     }
 
-    @Test fun migrationReplacesRetiredProviderAndPreservesBackgroundChoice() {
+    @Test fun migrationReplacesRetiredProviderButPreservesModelForExplicitChoiceAndBackgroundSetting() {
         prefs.edit().putBoolean("background_responses", false).commit()
         val activity = launch("openai")
         assertEquals("openrouter", prefs.getString("provider", null))
-        assertEquals("anthropic/claude-opus-5.5", prefs.getString("model", null))
+        assertEquals("gpt-6-astra", prefs.getString("model", null))
+        assertFalse(ModelCatalog.isClaudeModel(prefs.getString("model", null)))
         assertFalse(prefs.getBoolean("background_responses", true))
         prefs.edit().putString("model", "anthropic/claude-custom").commit()
         MainActivity::class.java.getDeclaredMethod("migrateLegacySettingsPreferences").apply { isAccessible = true }.invoke(activity)

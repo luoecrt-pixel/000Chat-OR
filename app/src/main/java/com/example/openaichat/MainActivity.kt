@@ -524,7 +524,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 .putString("provider_label", ModelCatalog.source("openrouter").label)
             changed = true
         }
-        if (!ModelCatalog.isClaudeModel(prefs.getString("model", null))) {
+        if (prefs.getString("model", null).isNullOrBlank()) {
             editor.putString("model", ModelCatalog.source("openrouter").models.first().id)
             changed = true
         }
@@ -1270,7 +1270,13 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val serial = ++contextInspectionSerial
         val sourceChat = currentChatId()
         val generation = activeResponseState.state.generation
-        val configuration = captureContextConfiguration()
+        val configuration = try { captureContextConfiguration() } catch (_: IllegalArgumentException) {
+            contextBadgeInFlight = false
+            contextDialogPending = false
+            requestContextBadge.text = "Выберите модель Claude"
+            if (openDialog) status.text = "Сохранённая модель недоступна. Выберите Claude в списке моделей."
+            return
+        }
         val capturedHistory = ContextHistorySnapshot.capture(chat,
             if (::messageAdapter.isInitialized) messageAdapter.snapshot() else emptyList())
         val history = capturedHistory.messages
@@ -1631,12 +1637,18 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
 
     private fun normalizedProviderId(): String = "openrouter"
 
-    private fun normalizedModelId(): String = ModelCatalog.normalizedClaudeModel(prefs.getString("model", null))
+    private fun normalizedModelId(): String = try {
+        ModelCatalog.normalizedClaudeModel(prefs.getString("model", null))
+    } catch (_: IllegalArgumentException) {
+        prefs.getString("model", null)?.trim().orEmpty()
+    }
 
     private fun updateModelBadge() {
         if (!::modelBadge.isInitialized) return
         val source = ModelCatalog.source("openrouter")
-        val modelLabel = ModelCatalog.displayName(source.id, normalizedModelId())
+        val savedModel = normalizedModelId()
+        val modelLabel = if (OpenRouterClaudeRoute.isClaude(savedModel)) ModelCatalog.displayName(source.id, savedModel)
+            else "$savedModel · выберите Claude"
         modelBadge.text = "${source.label} · ${modelLabel} ▾"
         modelBadge.contentDescription = "Источник API: ${source.label}. Модель: ${modelLabel}. Выбрать модель"
         updateEffortBadge()
@@ -1654,7 +1666,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val source = ModelCatalog.source("openrouter")
         val normalized = normalizedModelId()
             val choices = source.models.toMutableList()
-        if (normalized.isNotBlank() && choices.none { it.id == normalized }) {
+        if (OpenRouterClaudeRoute.isClaude(normalized) && choices.none { it.id == normalized }) {
                 choices.add(0, ModelOption(normalized, "Текущая: $normalized"))
             }
         val labels = choices.map { it.label }.toTypedArray()
@@ -2568,14 +2580,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             return
         }
         val chatId=currentChatId()
-        activeResponseState.markUserStop()
         val active=try{activeResponsePersistence.getActiveResponse(chatId)}catch(_:Exception){null}
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         cancelPendingGitHubConfirmation()
         val activeRequestId=active?.optString("request_id").takeIf{!it.isNullOrBlank() && it!="null"}
             ?: chat.lastOrNull { it.optString("role") == "user" }?.let { JsonProtocol.nonBlank(it, "request_id") }
-        val stopped = activeRequestId?.let { chatDb.stopActiveRequestOnce(chatId, it, removeUserMessage = !activeRequestRegenerate) } ?: false
+        val stopped = try {
+            activeRequestId?.let { OpenRouterResponseRuntime.stop(this, chatId, it, removeUserMessage = !activeRequestRegenerate) } ?: false
+        } catch (error: Exception) {
+            diagnostics.log("openrouter_stop_save_failed", mapOf("error_type" to error.javaClass.simpleName))
+            status.text = "Не удалось сохранить остановку. Запрос остаётся активным; повторите Stop."
+            return
+        }
+        activeResponseState.markUserStop()
         activeRequestId?.let { OpenRouterResponseRuntime.cancel(it, "Остановлено пользователем") }
         if (activeRequestId != null && !stopped) {
             restoreCurrentChat()
@@ -2760,7 +2778,10 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             chat.lastOrNull { it.optString("role") == "user" }?.let { JSONObject(it.toString()) }
                 ?: run { status.text = "В этом чате нечего повторять"; return }
         } else null
-        val configuration = captureContextConfiguration()
+        val configuration = try { captureContextConfiguration() } catch (_: IllegalArgumentException) {
+            status.text = "Сохранённая модель недоступна. Выберите Claude в списке моделей."
+            return
+        }
         val openRouterResponseFormat = try {
             OpenRouterStructuredOutputPolicy.format(configuration.responseFormat, configuration.schema)
         } catch (_: Exception) {
@@ -4275,8 +4296,18 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val active = activeResponsePersistence.getActiveResponse(editingChatId)
         val editingRequestId = active?.optString("request_id").takeIf { !it.isNullOrBlank() && it != "null" }
         if (editingRequestId != null) {
+            val stopped = try { OpenRouterResponseRuntime.stop(this, editingChatId, editingRequestId, false) }
+            catch (error: Exception) {
+                diagnostics.log("openrouter_edit_stop_save_failed", mapOf("error_type" to error.javaClass.simpleName))
+                status.text = "Не удалось сохранить остановку. История сохранена; повторите редактирование."
+                return
+            }
+            if (!stopped) {
+                restoreCurrentChat()
+                status.text = "Ответ уже завершён. Повторите редактирование."
+                return
+            }
             OpenRouterResponseRuntime.cancel(editingRequestId, "Сообщение изменено")
-            chatDb.stopActiveRequestOnce(editingChatId, editingRequestId)
         }
         activeResponseState.nextGeneration()
         cancelOpenRouterRequest()
