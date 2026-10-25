@@ -7,7 +7,6 @@ import androidx.annotation.VisibleForTesting
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.ClipboardManager
-import android.database.Cursor
 import android.provider.OpenableColumns
 import android.provider.MediaStore
 import android.os.SystemClock
@@ -32,20 +31,11 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.speech.RecognizerIntent
 import android.text.*
-import android.text.style.*
-import android.util.Base64
 import android.view.*
 import android.widget.*
 import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import okio.Buffer
-import okio.BufferedSink
-import okio.ForwardingSink
-import okio.buffer
 import java.io.File
 import java.io.IOException
 import java.nio.charset.StandardCharsets
@@ -56,21 +46,14 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.CancellationException
-import java.security.KeyStore
 import java.util.UUID
-import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
 
 class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private data class HistoricalAttachmentTarget(val chatId: String, val expected: JSONObject,
         val manifestIndex: Int? = null, val fileIndex: Int? = null, val image: Boolean = false)
     private var pendingAttachmentRestore: HistoricalAttachmentTarget? = null
-    @VisibleForTesting internal var historicalAttachmentCredentialProvider: (() -> String)? = null
+
     private val pendingAttachmentChange = AtomicReference<String?>(null)
     private val historicalFilePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val target = pendingAttachmentRestore
@@ -88,34 +71,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val action: TextView
     )
 
-    private data class LocalUploadedFile(
-        val id: String,
-        val name: String,
-        val size: Long,
-        val path: String,
-        val mime: String
-    )
 
-    private class ProgressRequestBody(
-        private val delegate: RequestBody,
-        private val onProgress: (Long, Long) -> Unit
-    ) : RequestBody() {
-        override fun contentType() = delegate.contentType()
-        override fun contentLength() = delegate.contentLength()
-        override fun writeTo(sink: BufferedSink) {
-            val totalBytes = delegate.contentLength()
-            val countingSink = object : ForwardingSink(sink) {
-                var writtenBytes = 0L
-                override fun write(source: Buffer, byteCount: Long) {
-                    super.write(source, byteCount)
-                    writtenBytes += byteCount
-                    onProgress(writtenBytes, totalBytes)
-                }
-            }.buffer()
-            delegate.writeTo(countingSink)
-            countingSink.flush()
-        }
-    }
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
@@ -133,72 +89,60 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     // Reuse the Activity executor so response work stays independent and teardown
     // still owns every attachment task; a failed item does not block later items.
     private var attachmentPreparationTail = CompletableFuture.completedFuture(Unit)
-    private val resumableResponseClient by lazy { ResumableResponseStreamClient(this) }
+
     @Volatile private var openRouterClientFactory: () -> OpenRouterChatClient = { OpenRouterChatClient() }
     private val openRouterClient by lazy { openRouterClientFactory() }
     private val openRouterModelPreflightCall = AtomicReference<Call?>()
     private val pendingGitHubConfirmation = AtomicReference<CompletableFuture<Boolean>?>(null)
     private val pendingGitHubConfirmationDialog = AtomicReference<AlertDialog?>(null)
-    private var openAiLegacyConsentDialog: AlertDialog? = null
+
     private val currentGitHubToolOwner = ThreadLocal<Pair<String, Long>>()
     // Cancels an in-flight serialization before it can commit a user message or start HTTP.
     private val pendingOpenRouterPreparation = AtomicReference<String?>(null)
-    private val pendingOpenAiPreparation = AtomicReference<String?>(null)
-    @Volatile private var openRouterPreparationHook: (() -> Unit)? = null
-    @Volatile private var openAiPreparationHook: (() -> Unit)? = null
 
-    /** Captured on Send before asynchronous preparation can observe later settings edits. */
-    private data class OpenAiRequestOptionsSnapshot(
-        val fileAnalysis: Boolean,
-        val parallelTools: Boolean,
-        val cacheKey: String,
-        val autoCompaction: Boolean,
-        val textFormat: String,
-        val jsonSchema: String,
-        val web: Boolean,
-        val fileSearch: Boolean,
-        val vectorStore: String,
-        val codeInterpreter: Boolean,
-        val containerMemory: String,
-        val imageGeneration: Boolean,
-        val previousResponseId: String?
-    )
+    @Volatile private var openRouterPreparationHook: (() -> Unit)? = null
+
 
     private data class ContextConfiguration(
-        val provider: String, val model: String, val instructions: GenerationInstructions,
-        val openAi: OpenAiRequestOptionsSnapshot, val github: Boolean, val githubRepo: String, val githubBranches: String,
-        val webSearch: Boolean, val webFetch: Boolean, val parallel: Boolean, val cacheMode: String,
-        val route: OpenRouterClaudeRoute, val pdfEngine: String, val compatibleImages: Boolean,
-        val responseFormat: String, val schema: String
-    ) { override fun toString() = "ContextConfiguration(provider=$provider, model=$model)" }
-
-    private fun captureContextConfiguration(): ContextConfiguration {
-        val provider = prefs.getString("provider", "openai") ?: "openai"
-        val options = OpenAiRequestOptionsSnapshot(
-            fileAnalysis = prefs.getBoolean("file_analysis_tools", false),
-            parallelTools = prefs.getBoolean("parallel_tools", true), cacheKey = prefs.getString("cache_key", "")?.trim().orEmpty(),
-            autoCompaction = prefs.getBoolean("openai_auto_compaction", false), textFormat = prefs.getString("text_format", "text") ?: "text",
-            jsonSchema = prefs.getString("json_schema", "")?.trim().orEmpty(), web = prefs.getBoolean("web", false),
-            fileSearch = prefs.getBoolean("file_search", false), vectorStore = prefs.getString("vector_store", "")?.trim().orEmpty(),
-            codeInterpreter = prefs.getBoolean("code_interpreter", false),
-            containerMemory = prefs.getString("openai_container_memory", "1g")?.takeIf { it in setOf("1g", "4g", "16g", "64g") } ?: "1g",
-            imageGeneration = prefs.getBoolean("image_generation", false), previousResponseId = currentResponseId)
-        return ContextConfiguration(provider, ContextRequestPolicy.model(provider, prefs.getString("model", null)),
-            GenerationInstructions(prefs.getString("system_prompt", ""), prefs.getString("instructions", ""), presentationInstructionsForRequest()),
-            options, prefs.getBoolean("github_tools", false), prefs.getString("github_repo", "luoecrt-pixel/OpenAIApiChat")?.trim().orEmpty(),
-            prefs.getString("github_branches", "main")?.trim().orEmpty(), prefs.getBoolean("openrouter_web_search", false),
-            prefs.getBoolean("openrouter_web_fetch", false), prefs.getBoolean("parallel_tools", true),
-            prefs.getString("openrouter_cache_mode", "1h") ?: "1h", OpenRouterClaudeRoute.fromPreference(prefs.getString("openrouter_claude_route", null)),
-            prefs.getString("openrouter_pdf_engine", "native") ?: "native", prefs.getString("openrouter_image_mode", "original") == "compatible",
-            prefs.getString("openrouter_text_format", "text") ?: "text", prefs.getString("openrouter_json_schema", "").orEmpty())
+        val model: String,
+        val instructions: GenerationInstructions,
+        val github: Boolean,
+        val githubRepo: String,
+        val githubBranches: String,
+        val webSearch: Boolean,
+        val webFetch: Boolean,
+        val parallel: Boolean,
+        val cacheMode: String,
+        val route: OpenRouterClaudeRoute,
+        val pdfEngine: String,
+        val compatibleImages: Boolean,
+        val responseFormat: String,
+        val schema: String
+    ) {
+        override fun toString() = "ContextConfiguration(provider=openrouter, model=$model)"
     }
-    @Volatile private var openAiReceivedEventHook: ((JSONObject) -> Unit)? = null
-    // Deterministic lower budget for instrumentation; reducer always caps this
-    // by the production heap budget, so a test cannot raise the safety limit.
-    @Volatile private var openAiAccumulatorLimitForTests: Long = Long.MAX_VALUE
-    @Volatile private var openAiEffortMetricHook: (() -> Unit)? = null
-    private val preIdCreateWatches = ConcurrentHashMap<String, Any>()
-    private val activeResumeCalls = ConcurrentHashMap<String, Call>()
+
+    private fun captureContextConfiguration(): ContextConfiguration = ContextConfiguration(
+        model = ContextRequestPolicy.model("openrouter", prefs.getString("model", null)),
+        instructions = GenerationInstructions(
+            prefs.getString("system_prompt", ""),
+            prefs.getString("instructions", ""),
+            presentationInstructionsForRequest()
+        ),
+        github = prefs.getBoolean("github_tools", false),
+        githubRepo = prefs.getString("github_repo", "luoecrt-pixel/OpenAIApiChat")?.trim().orEmpty(),
+        githubBranches = prefs.getString("github_branches", "main")?.trim().orEmpty(),
+        webSearch = prefs.getBoolean("openrouter_web_search", false),
+        webFetch = prefs.getBoolean("openrouter_web_fetch", false),
+        parallel = prefs.getBoolean("parallel_tools", true),
+        cacheMode = prefs.getString("openrouter_cache_mode", "1h") ?: "1h",
+        route = OpenRouterClaudeRoute.fromPreference(prefs.getString("openrouter_claude_route", null)),
+        pdfEngine = prefs.getString("openrouter_pdf_engine", "native") ?: "native",
+        compatibleImages = prefs.getString("openrouter_image_mode", "original") == "compatible",
+        responseFormat = prefs.getString("openrouter_text_format", "text") ?: "text",
+        schema = prefs.getString("openrouter_json_schema", "").orEmpty()
+    )
+
 
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     lateinit var prefs: SharedPreferences
@@ -226,16 +170,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private lateinit var toolLabel: TextView
     private lateinit var title: TextView
     private lateinit var attachRow: LinearLayout
-    private var vsListArea: LinearLayout? = null
-    private var vsStatusLine: TextView? = null
-    private var vsDialog: AlertDialog? = null
-    private val vsUiGeneration = AtomicInteger(0)
-    private var pendingVectorStorePickerId: String? = null
-    private val vsControlClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(10, TimeUnit.SECONDS)
-        .callTimeout(12, TimeUnit.SECONDS)
-        .build()
+
+
     private lateinit var attachScroll: HorizontalScrollView
     private lateinit var effortBadge: TextView
     private lateinit var modelBadge: TextView
@@ -263,9 +199,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private lateinit var requestTelemetryHistory: LinearLayout
     private lateinit var requestTelemetryScroll: ScrollView
     private var requestTelemetryExpanded = false
-    private val localArtifactToolExecutor by lazy { LocalArtifactToolExecutor(this) }
 
-    @Volatile private var currentCall: Call? = null
+
     private val activeResponseState = ActiveResponseStateStore()
     private val requestGeneration: Long
         get() = activeResponseState.state.generation
@@ -280,7 +215,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var draftSaveRunnable: Runnable? = null
     private var restoringComposer = false
-    private val activeResumeChats = mutableSetOf<String>()
+
     private val toolStates = linkedMapOf<String, String>()
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     val pendingUploadUris = mutableListOf<Pair<String,String>>() // uri -> image|file|zip
@@ -289,17 +224,16 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     val pendingUploads = AtomicInteger(0)
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     var preparingZipAttachments = false
-    private val uploadCalls = ConcurrentHashMap<String, Call>()
-    private val activeGeneratedDownloads = ConcurrentHashMap.newKeySet<String>()
+
     private val uploadProgress = ConcurrentHashMap<String, Pair<Long, Int>>()
-    private val activePendingUploadKeys = ConcurrentHashMap.newKeySet<String>()
+
     private val composerMergeLock = Any()
+    private var artifactUiOwnership: java.io.Closeable? = null
     @Volatile private var activeZipOperation: String? = null
     private val cancelledUploads = ConcurrentHashMap.newKeySet<String>()
     private val openRouterModelModalities = ConcurrentHashMap<String, Set<String>>()
     private val openRouterModelModalitiesRetryAfter = ConcurrentHashMap<String, Long>()
     private val uploadCards = mutableMapOf<String, UploadCardViews>()
-    private val pendingLocalUploadPaths = ConcurrentHashMap<String,String>()
     private val chat = mutableListOf<JSONObject>()
     private val attachedFileIds = mutableListOf<String>()
     private val attachedFileNames = mutableListOf<String>()
@@ -331,7 +265,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private val pickImage = 5101
     private val pickVoice = 5102
     private val pickCamera = 5106
-    private val pickVectorStoreFile = 5103
+
     private val pickExportTxt = 5104
     private val pickSaveGenerated = 5105
     private var pendingExportPath: String? = null
@@ -344,6 +278,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     private var pendingSaveMime: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        artifactUiOwnership = LocalArtifactOwnership.lease()
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         pendingActivityResultCode = savedInstanceState?.getInt("pending_result_code", -1)?.takeIf { it >= 0 }
@@ -354,7 +289,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         pendingSaveSourcePath = savedInstanceState?.getString("pending_save_path")
         pendingSaveFilename = savedInstanceState?.getString("pending_save_name")
         pendingSaveMime = savedInstanceState?.getString("pending_save_mime")
-        pendingVectorStorePickerId = savedInstanceState?.getString("pending_vector_store_picker")
         pendingPickerChatId = savedInstanceState?.getString("pending_picker_chat")
         pendingPickerProvider = savedInstanceState?.getString("pending_picker_provider")
         perChatScrollAnchors.clear()
@@ -400,6 +334,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         chatDb = ChatDatabase(applicationContext)
         activeResponsePersistence = ChatDatabaseActiveResponsePersistence(chatDb)
         diagnostics = AstraDiagnostics(this)
+        if (!secure.discardLegacyOpenAiCredential()) {
+            diagnostics.log("legacy_credential_cleanup_failed", mapOf("provider" to "openai"))
+        }
         chatDb.migrateLegacyPrefs(prefs)
         ensureChatStore()
         buildUi()
@@ -408,7 +345,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         openNotificationChat(intent)
         executor.execute { cleanupOrphanOpenRouterAttachments() }
         executor.execute { exportSnapshots.cleanup() }
-        diagnostics.log("app_started", mapOf("version" to BuildConfig.VERSION_NAME, "git_sha" to BuildConfig.BUILD_GIT_SHA, "model" to (prefs.getString("model", "gpt-6-astra") ?: "gpt-6-astra")))
+        diagnostics.log("app_started", mapOf("version" to BuildConfig.VERSION_NAME, "git_sha" to BuildConfig.BUILD_GIT_SHA, "model" to normalizedModelId()))
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -428,7 +365,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         pendingSaveSourcePath?.let { outState.putString("pending_save_path", it) }
         pendingSaveFilename?.let { outState.putString("pending_save_name", it) }
         pendingSaveMime?.let { outState.putString("pending_save_mime", it) }
-        pendingVectorStorePickerId?.let { outState.putString("pending_vector_store_picker", it) }
         pendingPickerChatId?.let { outState.putString("pending_picker_chat", it) }
         pendingPickerProvider?.let { outState.putString("pending_picker_provider", it) }
         super.onSaveInstanceState(outState)
@@ -440,9 +376,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         scrollCallbacksStopped = false
         OpenRouterUiBridge.attach(this)
         recoverInterruptedOpenRouterRequests()
+        OpenRouterResponseRuntime.recoverLocalArtifacts(applicationContext)
         executor.execute { ResponseNotifications.restorePending(applicationContext) }
-        // A Worker may have completed while this Activity was stopped. Reconcile
-        // committed history before launching another resume, without losing a new draft.
         val currentId = currentChatId()
         val durable = try { chatDb.getChat(currentId) } catch (_: Exception) { null }
         val durableMessages = durable?.optJSONArray("messages")
@@ -452,12 +387,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             restoreCurrentChat()
             renderRequestTelemetry()
         }
-        BackgroundResponseWorkScheduler.cancelAll(applicationContext)
-        activeResumeCalls.values.forEach { it.cancel() }
-        activeResumeCalls.clear()
-        synchronized(activeResumeChats) { activeResumeChats.clear() }
-        resumePendingUploads()
-        resumeBackgroundResponses()
         refreshAttachChips()
         if (pendingScrollRestoreChatId == currentChatId()) {
             applyRestoredScrollState(currentChatId(), pendingScrollRestoreAnchor, scrollRestoreGeneration)
@@ -465,14 +394,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     }
 
     override fun onStop() {
-        if (pendingOpenRouterPreparation.getAndSet(null) != null ||
-            pendingOpenAiPreparation.getAndSet(null) != null) {
+        if (pendingOpenRouterPreparation.getAndSet(null) != null) {
             setBusy(false)
             status.text = "Подготовка остановлена — черновик сохранён"
         }
         cancelPendingGitHubConfirmation()
-        openAiLegacyConsentDialog?.dismiss()
-        openAiLegacyConsentDialog = null
         if (::scroll.isInitialized && scroll.height > 0 &&
             ::messageAdapter.isInitialized && messageAdapter.itemCount > 0 &&
             pendingScrollRestoreChatId != currentChatId()
@@ -484,23 +410,15 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         scrollRestoreGeneration++
         persistComposerStateNow()
         activityVisible = false
-        preIdCreateWatches.clear()
         val active = try { activeResponsePersistence.listActiveResponses() } catch (_: Exception) { emptyList() }
-        BackgroundResponseWorkScheduler.rescheduleAll(applicationContext, active)
-        activeResumeCalls.remove(currentChatId())?.cancel()
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         val currentActive = active.firstOrNull { it.optString("chat_id") == currentChatId() }
         val backgroundEnabled = currentActive?.optBoolean("background_enabled", true) == true
-        if (!backgroundEnabled) currentActive?.optString("request_id")?.let { OpenRouterResponseRuntime.cancel(it, "Фоновое выполнение отключено — соединение прервано") }
-        val responseIdKnown = currentActive?.let { JsonProtocol.string(it, "response_id").isNotBlank() } == true
-        val keepStreamUntilId = backgroundEnabled && !responseIdKnown
-        if (!keepStreamUntilId) {
-            currentCall?.cancel()
-        } else {
-            diagnostics.log("background_stream_kept_for_response_id", mapOf(
-                "chat_id" to currentChatId()
-            ))
+        if (!backgroundEnabled) {
+            currentActive?.optString("request_id")?.let {
+                OpenRouterResponseRuntime.cancel(it, "Фоновое выполнение отключено — соединение прервано")
+            }
         }
         super.onStop()
     }
@@ -515,27 +433,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         cancelPendingGitHubConfirmation()
         persistComposerStateNow()
         activeResponseState.nextGeneration()
-        preIdCreateWatches.clear()
-        activeResumeCalls.values.forEach { it.cancel() }
-        activeResumeCalls.clear()
-        // Only close the local HTTP stream. Background Responses keep running on the
-        // server when background=true; the next Activity instance will reconnect by polling.
-        currentCall?.cancel()
         draftSaveRunnable?.let(mainHandler::removeCallbacks)
         executor.shutdownNow()
         try { cancelOpenRouterRequest() } catch (_: Exception) {}
         try { openRouterModelPreflightCall.getAndSet(null)?.cancel() } catch (_: Exception) {}
         OpenRouterUiBridge.detach(this)
         try { if (!OpenRouterResponseRuntime.uses(openRouterClient)) openRouterClient.close() } catch (_: Exception) {}
-        try { resumableResponseClient.close() } catch (_: Exception) {}
-        // shutdownNow can leave a parsed/archived Create callback alive. It
-        // still owns its SQLite claim and compensating /cancel; close only
-        // after all Activity executor callbacks have exited, off the UI thread.
         val destroyedDatabase = chatDb
         ExecutorResourceCloser.closeAfterTermination(executor) {
             try { destroyedDatabase.close() } catch (_: Exception) {}
         }
         super.onDestroy()
+        artifactUiOwnership?.close()
+        artifactUiOwnership = null
+        OpenRouterResponseRuntime.cleanupLocalArtifacts(applicationContext)
     }
 
     private fun isRequestCurrent(chatId: String, generation: Long): Boolean =
@@ -601,20 +512,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    // ---------- UI ----------
     private fun migrateLegacySettingsPreferences() {
         val editor = prefs.edit()
         var changed = false
-        // Preserve any existing user choice (including false); only initialize when absent.
         if (!prefs.contains("background_responses")) {
             editor.putBoolean("background_responses", true)
             changed = true
         }
-        if (!prefs.getBoolean("openai_auto_compaction_opt_in_migrated_v25", false)) {
-            if (!prefs.contains("openai_auto_compaction_user_explicit")) {
-                editor.putBoolean("openai_auto_compaction", false)
-            }
-            editor.putBoolean("openai_auto_compaction_opt_in_migrated_v25", true)
+        if (prefs.getString("provider", null) != "openrouter") {
+            editor.putString("provider", "openrouter")
+                .putString("provider_label", ModelCatalog.source("openrouter").label)
+            changed = true
+        }
+        if (!ModelCatalog.isClaudeModel(prefs.getString("model", null))) {
+            editor.putString("model", ModelCatalog.source("openrouter").models.first().id)
             changed = true
         }
         if (changed) editor.apply()
@@ -754,7 +665,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 visibility = if (message.isBlank() || message in setOf(
                     "Готово", "Новый чат", "Модель отвечает…", "Модель в очереди…",
                     "Продолжается генерация…", "Ответ ещё не завершён",
-                    "Готовлю файлы и контекст…", "Проверяю локальные файлы и готовлю контекст OpenAI…"
+                    "Готовлю файлы и контекст…"
                 )) View.GONE else View.VISIBLE
             }
             text = "Готово"
@@ -1374,7 +1285,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val hasDraft = JsonProtocol.string(draft, "text").isNotEmpty() || attachedFilePaths.isNotEmpty() ||
             attachedOpenRouterAttachments.isNotEmpty() || pendingImagePath != null
         val inspectionHistory = if (hasDraft) history + draft else history
-        val pendingManifests = attachedOpenRouterAttachments.isNotEmpty()
         val blocked = when {
             pendingAttachmentChange.get() != null -> "Отправка ожидает обновления вложения."
             preparingZipAttachments || pendingUploadUris.any { it.second == "zip" } -> "Перед отправкой требуется подготовить ZIP."
@@ -1390,18 +1300,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 val accounts = chatDb.listRequestAccounting(sourceChat)
                 val events = chatDb.listRequestEvents(sourceChat, 100)
                 val lastRequest = ContextLastRequestPolicy.selectLatestCompletedRequest(accounts, events)
-                val key = if (configuration.provider == "openai") secure.getApiKey() else secure.getOpenRouterApiKey()
-                val localCandidates = !configuration.openAi.fileAnalysis &&
-                    ContextRequestPolicy.localToolCandidates(inspectionHistory, localArtifacts)
-                val tools = if (configuration.provider == "openrouter") ContextRequestPolicy.openRouterTools(
-                    configuration.github, configuration.webSearch, configuration.webFetch)
-                else ContextToolSchemas.openAi(configuration.openAi.web, configuration.openAi.fileSearch,
-                    configuration.openAi.vectorStore, configuration.openAi.codeInterpreter,
-                    configuration.openAi.containerMemory, emptyList(), configuration.openAi.imageGeneration).apply {
-                    if (localCandidates) OpenAiLocalFileToolBridge.schemas().let { a ->
-                        for (i in 0 until a.length()) put(a.get(i))
-                    }
-                }
+                val key = secure.getOpenRouterApiKey()
+                val localCandidates = ContextRequestPolicy.localToolCandidates(inspectionHistory, localArtifacts)
+                val tools = ContextRequestPolicy.openRouterTools(
+                    configuration.github, configuration.webSearch, configuration.webFetch
+                )
                 val names = mutableListOf<String>()
                 inspectionHistory.forEach { message ->
                     message.optJSONArray("file_names")?.let { a -> for (i in 0 until a.length())
@@ -1413,9 +1316,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 names.addAll(localArtifacts.mapNotNull { JsonProtocol.nonBlank(it, "filename") })
                 var prefix: Boolean? = null
                 var prefixReason: String? = null
-                val format = if (configuration.provider == "openrouter")
-                    OpenRouterStructuredOutputPolicy.format(configuration.responseFormat, configuration.schema) else null
-                if (configuration.provider == "openrouter") {
+                val format = OpenRouterStructuredOutputPolicy.format(configuration.responseFormat, configuration.schema)
                     val durable = chatDb.getChat(sourceChat)?.optJSONArray("messages")
                     val durableRows = durable?.let { rows -> (0 until rows.length()).mapNotNull { rows.optJSONObject(it) } }.orEmpty()
                     val exactHistory = capturedHistory.validatedDurableHistory(durableRows)
@@ -1437,26 +1338,34 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                         OpenRouterContextSnapshot.build(exactHistory, OpenRouterContextSnapshot.systemContent(configuration.instructions,
                             configuration.github, configuration.githubRepo, configuration.githubBranches), byMessage,
                             protocolPrefix = { _, matches -> prefix = matches })
-                    } catch (_: java.io.IOException) {
+                } catch (_: IOException) {
                         prefixReason = "Не все вложения доступны для сравнения префикса."
                     }
-                }
-                val visibleTools = ContextStatusPolicy.toolNames(tools).toMutableList()
-                if (configuration.provider == "openai" && configuration.openAi.fileAnalysis &&
-                    !configuration.openAi.codeInterpreter)
-                    visibleTools.add("Code Interpreter — только если подготовка обнаружит контейнерные файлы")
-                val snapshot = ContextStatusPolicy.build(configuration.provider, configuration.model, history,
-                    configuration.openAi.previousResponseId,
-                    if (configuration.provider == "openai") OpenAiInstructionChainPolicy.fingerprint(configuration.instructions,
-                        key, configuration.model) else "", pendingManifests,
-                    if (configuration.provider == "openrouter") OpenRouterProtocolCodec.binding(configuration.model, tools, key,
-                        format, configuration.route) else null, configuration.route, configuration.cacheMode, names,
-                    visibleTools, null, null, System.currentTimeMillis(), prefix, prefixReason, lastRequest).let { base ->
-                    base.copy(messages = inspectionHistory.size,
+                val visibleTools = ContextStatusPolicy.toolNames(tools)
+                val snapshot = ContextStatusPolicy.build(
+                    model = configuration.model,
+                    history = history,
+                    expectedOpenRouterBinding = OpenRouterProtocolCodec.binding(
+                        configuration.model, tools, key, format, configuration.route
+                    ),
+                    route = configuration.route,
+                    cacheMode = configuration.cacheMode,
+                    attachmentNames = names,
+                    tools = visibleTools,
+                    accounting = null,
+                    lastResponseAtMillis = null,
+                    nowMillis = System.currentTimeMillis(),
+                    openRouterPrefixMatches = prefix,
+                    openRouterPrefixReason = prefixReason,
+                    lastRequest = lastRequest
+                ).let { base ->
+                    base.copy(
+                        messages = inspectionHistory.size,
                         textCharacters = inspectionHistory.sumOf { JsonProtocol.string(it, "text").length.toLong() },
                         explanation = listOf(base.explanation, blocked,
                             if (localCandidates) "Локальные инструменты будут доступны после успешной проверки файлов." else "")
-                            .filter { it.isNotBlank() }.joinToString(" "))
+                            .filter { it.isNotBlank() }.joinToString(" ")
+                    )
                 }
                 runOnUiThread {
                     if (openDialog && serial == contextInspectionSerial) contextDialogPending = false
@@ -1529,7 +1438,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val localRequestId = event.optString("local_request_id").ifBlank { event.optString("request_id") }
         if (localRequestId.isNotBlank()) {
             val sourceMessage = JSONObject()
-            OpenAiRawSseArchive.attachToMessage(sourceMessage, filesDir, eventChatId, localRequestId)
+            LegacyOpenAiCheckpoint.attachRawSourceToMessage(sourceMessage, filesDir, eventChatId, localRequestId)
             sourceMessage.optJSONArray("annotations")?.let { sources ->
                 wrapper.addView(fileActionButton("Сохранённые исходные данные") {
                     if (currentChatId() != eventChatId ||
@@ -1661,31 +1570,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     internal fun deleteChat(id: String) {
         val active=try{activeResponsePersistence.getActiveResponse(id)}catch(_:Exception){null}
-        val responseId=active?.optString("response_id").takeIf{!it.isNullOrBlank() && it!="null"}
         val requestId=active?.optString("request_id").takeIf{!it.isNullOrBlank() && it!="null"}
-        val backgroundEnabled=active?.optBoolean("background_enabled", true) == true
-        val cancelCredential = captureOpenAiRequestCredential(id, active)
         val localPaths=linkedSetOf<String>().apply{
             try{addAll(chatDb.listLocalFilePaths(id))}catch(_:Exception){}
             addAll(listComposerLocalFilePaths(id))
         }
         if(currentChatId()==id){
             activeResponseState.nextGeneration()
-            currentCall?.cancel()
             cancelOpenRouterRequest()
             openRouterModelPreflightCall.getAndSet(null)?.cancel()
             cancelPendingGitHubConfirmation()
         }
-        requestId?.let {
-            OpenAiCreateCallOwners.call(id, it)?.cancel()
-            OpenRouterResponseRuntime.cancel(it, "Чат удалён")
-        }
+        requestId?.let { OpenRouterResponseRuntime.cancel(it, "Чат удалён") }
         OpenRouterResponseRuntime.cancelForChat(id, "Чат удалён")
-        activeResumeCalls.remove(id)?.cancel()
-        synchronized(activeResumeChats){activeResumeChats.remove(id)}
-        BackgroundResponseWorkScheduler.cancel(applicationContext, id, requestId)
         activeResponsePersistence.clearActiveResponse(id, expectedRequestId = requestId)
-        if(responseId!=null && backgroundEnabled)cancelRemoteResponse(id,responseId,cancelCredential)
         perChatScrollAnchors.remove(id)
         userScrollLockedChats.remove(id)
         synchronized(composerMergeLock) {
@@ -1731,17 +1629,13 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         refreshChatDrawer()
     }
 
-    private fun normalizedProviderId(): String =
-        prefs.getString("provider", "openai")?.trim().takeUnless { it.isNullOrBlank() } ?: "openai"
+    private fun normalizedProviderId(): String = "openrouter"
 
-    private fun normalizedModelId(): String =
-        prefs.getString("model", ModelCatalog.source(normalizedProviderId()).models.first().id)
-            ?.trim()?.removePrefix("~").takeUnless { it.isNullOrBlank() }
-            ?: ModelCatalog.source(normalizedProviderId()).models.first().id
+    private fun normalizedModelId(): String = ModelCatalog.normalizedClaudeModel(prefs.getString("model", null))
 
     private fun updateModelBadge() {
         if (!::modelBadge.isInitialized) return
-        val source = ModelCatalog.source(normalizedProviderId())
+        val source = ModelCatalog.source("openrouter")
         val modelLabel = ModelCatalog.displayName(source.id, normalizedModelId())
         modelBadge.text = "${source.label} · ${modelLabel} ▾"
         modelBadge.contentDescription = "Источник API: ${source.label}. Модель: ${modelLabel}. Выбрать модель"
@@ -1757,74 +1651,19 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     }
 
     private fun showModelPicker() {
-        val sources = ModelCatalog.sources
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(4), dp(18), dp(6))
-        }
-        val provider = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                sources.map { it.label }
-            )
-            setSelection(sources.indexOfFirst { it.id == normalizedProviderId() }.coerceAtLeast(0))
-        }
-        val model = Spinner(this)
-        val modelIds = mutableListOf<String>()
-
-        fun refreshModels(providerId: String, preferredModel: String?, preserveUnknown: Boolean) {
-            val source = ModelCatalog.source(providerId)
-            val normalized = preferredModel?.trim()?.removePrefix("~").orEmpty()
+        val source = ModelCatalog.source("openrouter")
+        val normalized = normalizedModelId()
             val choices = source.models.toMutableList()
-            if (preserveUnknown && normalized.isNotBlank() && choices.none { it.id == normalized }) {
+        if (normalized.isNotBlank() && choices.none { it.id == normalized }) {
                 choices.add(0, ModelOption(normalized, "Текущая: $normalized"))
             }
-            modelIds.clear()
-            modelIds.addAll(choices.map { it.id })
-            model.adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                choices.map { it.label }
-            )
-            val selected = choices.indexOfFirst { it.id == normalized }.takeIf { it >= 0 } ?: 0
-            model.setSelection(selected)
-        }
-
-        refreshModels(normalizedProviderId(), normalizedModelId(), preserveUnknown = true)
-        provider.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val source = sources[position]
-                refreshModels(source.id,
-                    if (source.id == normalizedProviderId()) normalizedModelId() else null,
-                    preserveUnknown = source.id == normalizedProviderId())
-            }
-        }
-
-        box.addView(TextView(this).apply {
-            text = "Источник API"
-            textSize = 12f
-            setTextColor(currentTheme().textSecondary)
-            setPadding(0, dp(4), 0, dp(4))
-        })
-        box.addView(provider)
-        box.addView(TextView(this).apply {
-            text = "Модель"
-            textSize = 12f
-            setTextColor(currentTheme().textSecondary)
-            setPadding(0, dp(14), 0, dp(4))
-        })
-        box.addView(model)
+        val labels = choices.map { it.label }.toTypedArray()
+        val selected = choices.indexOfFirst { it.id == normalized }.coerceAtLeast(0)
 
         AppThemeViews.dialog(this, currentTheme())
-            .setTitle("Источник и модель")
-            .setView(box)
-            .setNegativeButton("Отмена", null)
-            .setPositiveButton("Применить") { _, _ ->
-                val source = sources[provider.selectedItemPosition.coerceAtLeast(0)]
-                val selectedModel = modelIds.getOrNull(model.selectedItemPosition)
-                    ?: source.models.first().id
+            .setTitle("Модель (${source.label})")
+            .setSingleChoiceItems(labels, selected) { dialog, position ->
+                val selectedModel = choices.getOrElse(position) { source.models.first() }.id
                 prefs.edit()
                     .putString("provider", source.id)
                     .putString("provider_label", source.label)
@@ -1832,7 +1671,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                     .apply()
                 updateModelBadge()
                 status.text = "Модель для следующего запроса выбрана"
+                dialog.dismiss()
             }
+            .setNegativeButton("Отмена", null)
             .show()
     }
 
@@ -1859,10 +1700,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
 
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     fun showResponseSettings() {
-        val provider = normalizedProviderId()
         val model = normalizedModelId()
-        val openAi = provider == "openai"
-        val supportsMode = ModelRequestPolicy.supportsReasoningMode(provider, model)
         val theme = currentTheme()
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1885,11 +1723,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 setTextColor(theme.textSecondary)
                 setPadding(0, dp(10), 0, dp(4))
             })
-            val input = Spinner(this)
-            input.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
-            input.setSelection(values.indexOf(prefs.getString(key, default)).coerceAtLeast(0))
-            box.addView(input)
-            return input
+            val sp = Spinner(this)
+            sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
+            sp.setSelection(values.indexOf(prefs.getString(key, default)).coerceAtLeast(0))
+            box.addView(sp)
+            return sp
         }
         fun chk(label: String, pref: String, def: Boolean = false) = CheckBox(this).apply {
             text = label
@@ -1897,24 +1735,17 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             isChecked = prefs.getBoolean(pref, def)
         }
 
-        sectionHeader(if (openAi) "Мышление и формат (OpenAI)" else "Мышление и формат (OpenRouter / Claude)")
+        sectionHeader("Мышление и формат (OpenRouter / Claude)")
         val efforts = arrayOf("auto","low","medium","high","xhigh","max")
         val effort = spinner("Усилие мышления", efforts, "reasoning", "high")
-        if (provider == "openrouter") {
-            box.addView(TextView(this).apply {
-                text = "auto: приложение выбирает усилие по запросу; xhigh/max не понижаются."
-                setTextColor(theme.textSecondary)
-                textSize = 11.5f
-            })
-        }
-        val modes = arrayOf("standard","pro")
-        val mode = if (supportsMode) spinner("Режим ответа (standard/pro)", modes, "reasoning_mode", "standard") else null
-        val summaries = arrayOf("auto","concise","detailed","null")
-        val summary = if (openAi) spinner("Краткий ход рассуждений", summaries, "reasoning_summary", "auto") else null
+        box.addView(TextView(this).apply {
+            text = "auto: приложение выбирает усилие по запросу; xhigh/max не понижаются."
+            setTextColor(theme.textSecondary)
+            textSize = 11.5f
+        })
         val verbosities = arrayOf("low","medium","high")
         val verbosity = spinner("Подробность ответа", verbosities, "verbosity", "medium")
-        val canSetVerbosity = provider != "openrouter" ||
-            OpenRouterReasoningPolicy.supportsResponseVerbosity(model)
+        val canSetVerbosity = OpenRouterReasoningPolicy.supportsResponseVerbosity(model)
         verbosity.isEnabled = canSetVerbosity
         if (!canSetVerbosity) box.addView(TextView(this).apply {
             text = "Claude: verbosity отключена, иначе OpenRouter может переопределить выбранное усилие."
@@ -1941,46 +1772,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val scientificPreview = chk("Офлайн-превью формул и диаграмм", "response_scientific_preview", true)
         box.addView(scientificPreview)
         val formats = arrayOf("text","json_object","json_schema")
-        val formatKey = if (openAi) "text_format" else "openrouter_text_format"
-        val schemaKey = if (openAi) "json_schema" else "openrouter_json_schema"
-        val format = spinner("Формат ответа", formats, formatKey, "text")
+        val format = spinner("Формат ответа", formats, "openrouter_text_format", "text")
         val schema = EditText(this).apply {
             hint = "JSON Schema (только для json_schema)"
             setTextColor(theme.textPrimary)
-            setText(prefs.getString(schemaKey, "").orEmpty())
+            setText(prefs.getString("openrouter_json_schema", "").orEmpty())
             minLines = 2
         }
         box.addView(schema)
 
-        sectionHeader(if (openAi) "Инструменты и контекст OpenAI" else "Инструменты, маршрут и кэш OpenRouter")
-        val web = if (openAi) chk("Web Search (OpenAI)", "web", false).also { box.addView(it) } else null
-        val fileSearch = if (openAi) chk("File Search (Vector Store)", "file_search", false).also { box.addView(it) } else null
-        val vectorInput = if (openAi) EditText(this).apply {
-            hint = "Vector Store ID"
-            setTextColor(theme.textPrimary)
-            setSingleLine(true)
-            setText(prefs.getString("vector_store", "").orEmpty())
-        }.also {
-            box.addView(it)
-            box.addView(button("📁 Управление файлами Vector Store") { showVectorStoreManager() })
-        } else null
-        val codeInterpreter = if (openAi) chk("Code Interpreter (облачный Python OpenAI)", "code_interpreter", false).also { box.addView(it) } else null
-        val fileAnalysis = if (openAi) chk("Анализ прикреплённых файлов через Python (платный контейнер)", "file_analysis_tools", false).also { box.addView(it) } else null
-        val containerLimits = arrayOf("1g","4g","16g","64g")
-        val containerMemorySpinner = if (openAi) spinner("Память контейнера Code Interpreter (1g по умолчанию)", containerLimits, "openai_container_memory", "1g") else null
-        val imageGen = if (openAi) chk("Image Generation (OpenAI)", "image_generation", false).also { box.addView(it) } else null
-        val autoCompaction = if (openAi) chk("Автосжатие контекста на сервере OpenAI (opt-in; сокращает старый контекст)", "openai_auto_compaction", false).also { box.addView(it) } else null
-        val cacheKeyInput = if (openAi) EditText(this).apply {
-            hint = "Prompt cache key (необязательно)"
-            setTextColor(theme.textPrimary)
-            setSingleLine(true)
-            setText(prefs.getString("cache_key", "").orEmpty())
-        }.also { box.addView(it) } else null
-
-        val openRouterWebSearch = if (!openAi) chk("OpenRouter: Web Search", "openrouter_web_search", false).also { box.addView(it) } else null
-        val openRouterWebFetch = if (!openAi) chk("OpenRouter: Web Fetch", "openrouter_web_fetch", false).also { box.addView(it) } else null
-        val githubTools = if (!openAi) chk("Разрешить GitHub-инструменты", "github_tools", false).also { box.addView(it) } else null
-        val claudeRoute = if (!openAi) Spinner(this).apply {
+        sectionHeader("Инструменты, маршрут и кэш OpenRouter")
+        val openRouterWebSearch = chk("OpenRouter: Web Search", "openrouter_web_search", false).also { box.addView(it) }
+        val openRouterWebFetch = chk("OpenRouter: Web Fetch", "openrouter_web_fetch", false).also { box.addView(it) }
+        val githubTools = chk("Разрешить GitHub-инструменты", "github_tools", false).also { box.addView(it) }
+        val claudeRoute = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
                 arrayOf("Автоматический: с резервными провайдерами", "Прямой Anthropic: без резервного провайдера"))
             setSelection(if (OpenRouterClaudeRoute.fromPreference(prefs.getString("openrouter_claude_route", null)) == OpenRouterClaudeRoute.ANTHROPIC) 1 else 0)
@@ -1992,10 +1797,10 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 setPadding(0, dp(10), 0, dp(4))
             })
             box.addView(it)
-        } else null
-        val cacheMode = if (!openAi) spinner("Кэш промпта Claude (1h / 5m / off)", arrayOf("1h", "5m", "off"), "openrouter_cache_mode", "1h") else null
-        val pdfEngine = if (!openAi) spinner("Движок PDF OpenRouter", arrayOf("native", "auto", "cloudflare-ai", "mistral-ocr"), "openrouter_pdf_engine", "native") else null
-        val imageMode = if (!openAi) Spinner(this).apply {
+        }
+        val cacheMode = spinner("Кэш промпта Claude (1h / 5m / off)", arrayOf("1h", "5m", "off"), "openrouter_cache_mode", "1h")
+        val pdfEngine = spinner("Движок PDF OpenRouter", arrayOf("native", "auto", "cloudflare-ai", "mistral-ocr"), "openrouter_pdf_engine", "native")
+        val imageMode = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
                 arrayOf("Исходное изображение", "Совместимая копия JPEG"))
             setSelection(if (prefs.getString("openrouter_image_mode", "original") == "compatible") 1 else 0)
@@ -2007,7 +1812,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 setPadding(0, dp(10), 0, dp(4))
             })
             box.addView(it)
-        } else null
+        }
 
         val parallelTools = chk("Parallel tool calls", "parallel_tools", true)
         box.addView(parallelTools)
@@ -2034,7 +1839,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             .setView(ScrollView(this).apply { addView(box) })
             .setNegativeButton("Отмена", null)
             .setPositiveButton("Сохранить") { _, _ ->
-                val editor = prefs.edit()
+                prefs.edit()
                     .putString("reasoning", efforts[effort.selectedItemPosition])
                     .putString("verbosity", verbosities[verbosity.selectedItemPosition])
                     .putString("max_output", max.text.toString().trim())
@@ -2043,30 +1848,16 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                     .putBoolean("parallel_tools", parallelTools.isChecked)
                     .putString("system_prompt", systemPromptInput.text.toString())
                     .putString("instructions", developerInstructionsInput.text.toString())
-                if (mode != null) editor.putString("reasoning_mode", modes[mode.selectedItemPosition])
-                if (summary != null) editor.putString("reasoning_summary", summaries[summary.selectedItemPosition])
-                if (containerMemorySpinner != null) editor.putString("openai_container_memory", containerLimits[containerMemorySpinner.selectedItemPosition])
-                if (web != null) editor.putBoolean("web", web.isChecked)
-                if (fileSearch != null) editor.putBoolean("file_search", fileSearch.isChecked)
-                if (vectorInput != null) editor.putString("vector_store", vectorInput.text.toString().trim())
-                if (codeInterpreter != null) editor.putBoolean("code_interpreter", codeInterpreter.isChecked)
-                if (fileAnalysis != null) editor.putBoolean("file_analysis_tools", fileAnalysis.isChecked)
-                if (imageGen != null) editor.putBoolean("image_generation", imageGen.isChecked)
-                if (autoCompaction != null) {
-                    editor.putBoolean("openai_auto_compaction", autoCompaction.isChecked)
-                    editor.putBoolean("openai_auto_compaction_user_explicit", true)
-                }
-                if (cacheKeyInput != null) editor.putString("cache_key", cacheKeyInput.text.toString().trim())
-                if (openRouterWebSearch != null) editor.putBoolean("openrouter_web_search", openRouterWebSearch.isChecked)
-                if (openRouterWebFetch != null) editor.putBoolean("openrouter_web_fetch", openRouterWebFetch.isChecked)
-                if (githubTools != null) editor.putBoolean("github_tools", githubTools.isChecked)
-                if (claudeRoute != null) editor.putString("openrouter_claude_route", if (claudeRoute.selectedItemPosition == 1) "anthropic" else "auto")
-                if (cacheMode != null) editor.putString("openrouter_cache_mode", cacheMode.selectedItem.toString())
-                if (pdfEngine != null) editor.putString("openrouter_pdf_engine", pdfEngine.selectedItem.toString())
-                if (imageMode != null) editor.putString("openrouter_image_mode", if (imageMode.selectedItemPosition == 1) "compatible" else "original")
-                editor.putString(formatKey, formats[format.selectedItemPosition])
-                editor.putString(schemaKey, schema.text.toString())
-                editor.apply()
+                    .putBoolean("openrouter_web_search", openRouterWebSearch.isChecked)
+                    .putBoolean("openrouter_web_fetch", openRouterWebFetch.isChecked)
+                    .putBoolean("github_tools", githubTools.isChecked)
+                    .putString("openrouter_claude_route", if (claudeRoute.selectedItemPosition == 1) "anthropic" else "auto")
+                    .putString("openrouter_cache_mode", cacheMode.selectedItem.toString())
+                    .putString("openrouter_pdf_engine", pdfEngine.selectedItem.toString())
+                    .putString("openrouter_image_mode", if (imageMode.selectedItemPosition == 1) "compatible" else "original")
+                    .putString("openrouter_text_format", formats[format.selectedItemPosition])
+                    .putString("openrouter_json_schema", schema.text.toString())
+                    .apply()
                 updateEffortBadge()
                 renderRequestTelemetry()
                 status.text = "Настройки модели сохранены для следующего запроса"
@@ -2210,8 +2001,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             box.addView(view)
         }
 
-        section("Подключение (API ключи)")
-        val key = field("OpenAI API key", secure.getApiKey(), true); spaced(key)
+        section("Подключение OpenRouter")
         val openRouterKey = field("OpenRouter API key", secure.getOpenRouterApiKey(), true); spaced(openRouterKey)
 
         section("Оформление и уведомления")
@@ -2253,10 +2043,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         spaced(button("📁 Локальные файлы") { showLocalFiles() }.apply {
             setTextColor(accent); background=rounded(buttonBg)
         })
-        spaced(button("Сбросить ссылки повторных загрузок OpenAI") {
-            OpenAiFileUploadCache(getSharedPreferences("openai_file_upload_cache", Context.MODE_PRIVATE)).clear()
-            Toast.makeText(this, "Локальные ссылки сброшены. Исходники сохранены.", Toast.LENGTH_LONG).show()
-        })
         spaced(button("Поддерживаемые файлы и способ обработки") {
             AppThemeViews.dialog(this, currentTheme()).setTitle("Форматы файлов").setMessage(
                 "OpenRouter, текстовые/научные файлы через инструменты приложения:\n" + TextFileFormatPolicy.extensions.sorted().joinToString(", ") +
@@ -2286,10 +2072,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             .setView(ScrollView(this).apply{addView(box)})
             .setNegativeButton("Отмена",null)
             .setPositiveButton("Сохранить") { _,_ ->
-                val openAiKeySaved = secure.setApiKey(key.text.toString().trim())
                 val openRouterKeySaved = secure.setOpenRouterApiKey(openRouterKey.text.toString().trim())
                 val githubTokenSaved = secure.setGitHubToken(githubToken.text.toString().trim())
-                val allSecretsSaved = openAiKeySaved && openRouterKeySaved && githubTokenSaved
+                val allSecretsSaved = openRouterKeySaved && githubTokenSaved
                 val selectedTheme = themeIds.getOrElse(themeSpinner.selectedItemPosition) { "dark" }
                 prefs.edit()
                     .putString("app_theme", selectedTheme)
@@ -2304,7 +2089,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 if (notifications.isChecked) requestAnswerNotificationPermission()
                 if (!allSecretsSaved) {
                     diagnostics.log("secure_store_save_failed", mapOf(
-                        "openai_saved" to openAiKeySaved,
                         "openrouter_saved" to openRouterKeySaved,
                         "github_saved" to githubTokenSaved
                     ))
@@ -2320,7 +2104,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     // ---------- Chat ----------
     private fun attachmentOwners() = PreparedAttachmentFiles.Owners(
         chatDb.listAllLocalFilePaths().toSet() + LocalAttachmentReferences.allComposerPaths(prefs.all),
-        OpenRouterResponseRuntime.localFilePaths() + chatDb.listActiveOpenAiToolAttachmentPaths())
+        OpenRouterResponseRuntime.localFilePaths() + chatDb.listLegacyCheckpointAttachmentPaths())
     private fun releasePreparedFiles(lease: PreparedAttachmentFiles.Lease) {
         try {
             executor.execute {
@@ -2337,7 +2121,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             if (!dir.isDirectory) return
             val referenced = linkedSetOf<String>()
             referenced.addAll(chatDb.listAllLocalFilePaths())
-            referenced.addAll(chatDb.listActiveOpenAiToolAttachmentPaths())
+            referenced.addAll(chatDb.listLegacyCheckpointAttachmentPaths())
             referenced.addAll(OpenRouterResponseRuntime.localFilePaths())
             referenced.addAll(LocalAttachmentReferences.allComposerPaths(prefs.all))
             val now = System.currentTimeMillis()
@@ -2369,7 +2153,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val remoteFiles = message.optJSONArray("file_ids")?.length() ?: 0
         val localFiles = message.optJSONArray("file_paths")?.length() ?: 0
         if (remoteFiles > localFiles) {
-            throw IOException("В истории OpenAI есть файл без локальных байтов. " +
+            throw IOException("В истории есть файл без локальных байтов. " +
                 "Восстановите исходное вложение перед отправкой в OpenRouter.")
         }
         val remoteImageId = JsonProtocol.string(message, "image_file_id")
@@ -2378,7 +2162,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             (message.optJSONArray("attachments")?.let { manifest ->
                 (0 until manifest.length()).any { manifest.optJSONObject(it)?.optString("kind") == "image" }
             } != true)) {
-            throw IOException("В истории OpenAI есть фото без локальных байтов. " +
+            throw IOException("В истории есть фото без локальных байтов. " +
                 "Восстановите исходное фото перед отправкой в OpenRouter.")
         }
         val manifest = message.optJSONArray("attachments")
@@ -2533,6 +2317,19 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         currentGitHubToolOwner.set(chatId to activeResponseState.state.generation)
         return try { confirmGitHubWrite(name, arguments) } finally { currentGitHubToolOwner.remove() }
     }
+    override fun historyReconciled(chatId: String, requestId: String) {
+        if (!isViewing(chatId) || chatDb.getActiveResponse(chatId) != null) return
+        val rows = chatDb.getChat(chatId)?.optJSONArray("messages") ?: return
+        if ((0 until rows.length()).none { index -> rows.optJSONObject(index)?.let {
+                JsonProtocol.nonBlank(it, "request_id") == requestId && JsonProtocol.nonBlank(it, "provider") == "openrouter"
+            } == true }) return
+        val current = JSONArray().apply { chat.forEach { put(it) } }
+        if (rows.toString() == current.toString()) return
+        persistComposerStateNow()
+        restoreCurrentChat()
+        renderRequestTelemetry()
+    }
+
     override fun responseChanged(chatId: String, requestId: String) {
         if (!isViewing(chatId)) return
         val active = chatDb.getActiveResponse(chatId)
@@ -2579,20 +2376,28 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); openNotificationChat(intent) }
 
     private fun recoverInterruptedOpenRouterRequests() {
-        chatDb.listActiveResponses().forEach { a ->
-            val id = a.optString("request_id"); val chatId = a.optString("chat_id")
-            val account = chatDb.listRequestAccounting(chatId).firstOrNull { it.optString("local_request_id") == id }
-            if (account?.optString("provider") == "openrouter" && !OpenRouterResponseRuntime.contains(id)) {
-                val error = "Соединение прервано после остановки процесса Android. Частичный ответ сохранён; повторная платная отправка не выполнялась."
-                val m = JSONObject().put("role", "assistant").put("provider", "openrouter").put("request_id", id)
-                    .put("requested_model", account.opt("requested_model")).put("status", "disconnected").put("error", error)
-                    .put("text", JsonProtocol.string(a, "text"))
-                chatDb.getOpenRouterCheckpoint(chatId, id)?.let { m.put("openrouter_protocol", OpenRouterProtocolCodec.withVisibleTail(it, m)) }
-                if (chatDb.finalizeCurrentChatIfActiveRequest(chatId, "", null, null, listOf(m), id)) {
-                    chatDb.recordRequestAccounting(chatId = chatId, localRequestId = id, status = "disconnected", error = error)
-                    chatDb.sealOpenRouterRounds(chatId, id)
-                    ResponseNotifications.finished(applicationContext, chatId, id, false)
-                }
+        chatDb.listActiveResponses().forEach { active ->
+            val requestId = JsonProtocol.nonBlank(active, "request_id") ?: return@forEach
+            val chatId = JsonProtocol.nonBlank(active, "chat_id") ?: return@forEach
+            if (chatDb.recoverLegacyOpenAiRequestLocally(chatId, requestId)) return@forEach
+            val account = chatDb.listRequestAccounting(chatId)
+                .firstOrNull { it.optString("local_request_id") == requestId }
+            if (account?.optString("provider") != "openrouter" ||
+                OpenRouterResponseRuntime.contains(requestId)) return@forEach
+            val error = "Соединение прервано после остановки процесса Android. Частичный ответ сохранён; повторная платная отправка не выполнялась."
+            val message = JSONObject().put("role", "assistant").put("provider", "openrouter")
+                .put("request_id", requestId).put("requested_model", account.opt("requested_model"))
+                .put("status", "disconnected").put("error", error)
+                .put("text", JsonProtocol.string(active, "text"))
+            chatDb.getOpenRouterCheckpoint(chatId, requestId)?.let {
+                message.put("openrouter_protocol", OpenRouterProtocolCodec.withVisibleTail(it, message))
+            }
+            if (chatDb.finalizeCurrentChatIfActiveRequest(chatId, "", null, null, listOf(message), requestId,
+                    expectedProvider = "openrouter")) {
+                chatDb.recordRequestAccounting(chatId = chatId, localRequestId = requestId,
+                    status = "disconnected", error = error)
+                chatDb.sealOpenRouterRounds(chatId, requestId)
+                ResponseNotifications.finished(applicationContext, chatId, requestId, false)
             }
         }
     }
@@ -2679,7 +2484,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         persistComposerStateNow()
         activeResponseState.nextGeneration()
         cancelPendingGitHubConfirmation()
-        currentCall?.cancel()
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         persistCurrentChat()
@@ -2713,14 +2517,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         persistComposerStateNow()
         activeResponseState.nextGeneration()
         cancelPendingGitHubConfirmation()
-        currentCall?.cancel()
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         persistCurrentChat()
         prefs.edit().putString("current_chat",id).apply()
         restoreCurrentChat()
-        resumePendingUploads()
-        resumeBackgroundResponses()
         requestTelemetryExpanded = false
         renderRequestTelemetry()
         refreshChatDrawer()
@@ -2755,55 +2556,10 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
          n>=1_000L -> "%.1fK".format(n/1_000.0)
          else -> n.toString()
      }
-    private fun estimateCost(inputTokens:Long, cachedTokens:Long, cacheWriteTokens:Long, outputTokens:Long):Double{
-        // Astra standard tier: baseline $10/M input, $1/M cached input,
-        // $12.50/M cache-write input and $50/M output. Above 272K input tokens
-        // the documented long-context multiplier changes the effective rates.
-        val longContext = inputTokens > 272_000
-        val inMultiplier = if(longContext) 2.0 else 1.0
-        val outMultiplier = if(longContext) 1.5 else 1.0
-        val inRate=10.0*inMultiplier
-        val cachedRate=1.0*inMultiplier
-        val cacheWriteRate=12.50*inMultiplier
-        val outRate=50.0*outMultiplier
-        val uncached=(inputTokens-cachedTokens-cacheWriteTokens).coerceAtLeast(0)
-        return (uncached*inRate + cachedTokens*cachedRate + cacheWriteTokens*cacheWriteRate + outputTokens*outRate) / 1_000_000.0
-    }
 
-
-    private fun captureOpenAiRequestCredential(chatId: String, active: JSONObject?): String? {
-        val requestId = active?.let { JsonProtocol.nonBlank(it, "request_id") } ?: return null
-        val binding = chatDb.getOpenAiRequestFingerprint(chatId, requestId)
-        val original = OpenAiCreateCallOwners.call(chatId, requestId)
-            ?: activeResumeCalls[chatId]?.takeIf {
-                it.request().url.pathSegments.lastOrNull() == JsonProtocol.nonBlank(active, "response_id")
-            }
-        val key = original?.request()?.header("Authorization")
-            ?.takeIf { it.startsWith("Bearer ") }?.removePrefix("Bearer ") ?: secure.getApiKey()
-        return key.takeIf { OpenAiInstructionChainPolicy.matchesCredential(binding, it) }
-    }
-
-    private fun cancelRemoteResponse(chatId:String,responseId:String,key:String?){
-        if (key.isNullOrBlank() || !Regex("resp_[A-Za-z0-9_-]+").matches(responseId)) return
-        executor.execute{
-            try{
-                val req=Request.Builder()
-                    .url("https://api.openai.com/v1/responses/$responseId/cancel")
-                    .addHeader("Authorization","Bearer $key")
-                    .post("{}".toRequestBody("application/json".toMediaType()))
-                    .build()
-                pollingClient.newCall(req).execute().use{resp->
-                    diagnostics.log("background_response_cancel",mapOf("chat_id" to chatId,"response_id" to responseId,"status" to resp.code))
-                }
-            }catch(e:Exception){
-                diagnostics.log("background_response_cancel_failed",mapOf("chat_id" to chatId,"response_id" to responseId,"error" to (e.message?:e.toString()).take(300)))
-            }
-        }
-    }
 
     private fun stopCurrentResponse(){
-        if (pendingOpenRouterPreparation.getAndSet(null) != null ||
-            pendingOpenAiPreparation.getAndSet(null) != null) {
+        if (pendingOpenRouterPreparation.getAndSet(null) != null) {
             activeResponseState.markUserStop()
             cancelOpenRouterRequest()
             setBusy(false)
@@ -2812,27 +2568,16 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             return
         }
         val chatId=currentChatId()
-        val generation=activeResponseState.markUserStop()
+        activeResponseState.markUserStop()
         val active=try{activeResponsePersistence.getActiveResponse(chatId)}catch(_:Exception){null}
-        val originalCredential = captureOpenAiRequestCredential(chatId, active)
-        val originalCreate = try {
-            activeResponsePersistence.getActiveResponse(chatId)?.let {
-                OpenAiCreateCallOwners.call(chatId, JsonProtocol.string(it, "request_id"))
-            }
-        } catch (_: Exception) { null }
-        originalCreate?.cancel()
-        currentCall?.cancel()
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         cancelPendingGitHubConfirmation()
-        activeResumeCalls.remove(chatId)?.cancel()
-        val responseId=active?.optString("response_id").takeIf{!it.isNullOrBlank() && it!="null"}
         val activeRequestId=active?.optString("request_id").takeIf{!it.isNullOrBlank() && it!="null"}
             ?: chat.lastOrNull { it.optString("role") == "user" }?.let { JsonProtocol.nonBlank(it, "request_id") }
         val stopped = activeRequestId?.let { chatDb.stopActiveRequestOnce(chatId, it, removeUserMessage = !activeRequestRegenerate) } ?: false
         activeRequestId?.let { OpenRouterResponseRuntime.cancel(it, "Остановлено пользователем") }
         if (activeRequestId != null && !stopped) {
-            // A terminal transaction already won: Stop must not remove its committed bubble.
             restoreCurrentChat()
             status.text = "Ответ уже завершён"
             renderRequestTelemetry()
@@ -2841,19 +2586,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         if (activeRequestId == null) {
             activeResponsePersistence.clearActiveResponse(chatId, expectedRequestId = null)
         }
-        BackgroundResponseWorkScheduler.cancel(applicationContext, chatId, activeRequestId)
-        if (stopped && activeRequestId != null &&
-            chatDb.listRequestAccounting(chatId).any {
-                it.optString("local_request_id") == activeRequestId && it.optString("provider") == "openrouter"
-            }) {
+        if (stopped && activeRequestId != null) {
             chatDb.sealOpenRouterRounds(chatId, activeRequestId)
             reconcileOpenRouterGenerations(chatId, activeRequestId)
-        }
-        // OpenAI only permits /cancel for background=true Responses.
-        if (stopped && active?.optBoolean("background_enabled", false) == true &&
-            responseId != null && activeRequestId != null && originalCredential != null) {
-            cancelUnownedOpenAiResponse(chatId, activeRequestId, responseId,
-                originalCredential)
         }
         if(!activeRequestRegenerate){
             restoringComposer=true
@@ -3011,9 +2746,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         if (missing != null) throw IOException("Модель " + model + " не поддерживает вложения типа " + missing)
         return true
     }
-    private fun sendMessage(regenerate:Boolean) = sendMessageWithLegacyChoice(regenerate, false)
-
-    private fun sendMessageWithLegacyChoice(regenerate:Boolean, allowLegacyVisibleTextOnly:Boolean) {
+    private fun sendMessage(regenerate: Boolean) {
+        if (chatDb.getActiveResponse(currentChatId()) != null) {
+            status.text = "В чате сохранён незавершённый запрос. Остановите его перед новой отправкой."
+            return
+        }
         if (pendingAttachmentChange.get() != null) { status.text = "Дождитесь обновления вложения"; return }
         if (stop.visibility == View.VISIBLE || preparingZipAttachments || pendingUploads.get() > 0) {
             status.text = "Дождитесь завершения или остановите текущую операцию"
@@ -3024,41 +2761,25 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 ?: run { status.text = "В этом чате нечего повторять"; return }
         } else null
         val configuration = captureContextConfiguration()
-        val provider = configuration.provider
-        val openRouterResponseFormat = if (provider == "openrouter") try {
+        val openRouterResponseFormat = try {
             OpenRouterStructuredOutputPolicy.format(configuration.responseFormat, configuration.schema)
         } catch (_: Exception) {
-            status.text = "Сначала укажите корректный формат/JSON Schema в панели «Мышление и ответ»"; return
-        } else null
-        if (provider == "openai" && prefs.getString("text_format","text") == "json_schema") {
-            val schema = prefs.getString("json_schema","").orEmpty().trim()
-            if (schema.isBlank() || try { JSONObject(schema); false } catch (_: Exception) { true }) {
-                status.text = "Сначала укажите корректную JSON Schema в панели «Мышление и ответ»"
-                return
-            }
-        }
-        if (provider == "openrouter") {
-            cancelOpenRouterRequest()
-            cancelPendingGitHubConfirmation()
-        }
-        // Capture the credential, model and instructions once. Chain reuse,
-        // the actual wire request and persisted metadata share this snapshot.
-        val key = if (provider == "openrouter") secure.getOpenRouterApiKey() else secure.getApiKey()
-        if(key.isBlank()){showSettings();return}
-        val model = configuration.model
-        val openAiInstructions = configuration.instructions
-        val openAiInstructionFingerprint = OpenAiInstructionChainPolicy.fingerprint(openAiInstructions, key, model)
-        // previous_response_id inherits prior role-bearing input. Reuse is safe
-        // only for the immediate completed turn under identical instructions.
-        if (pendingUploadUris.any { it.second == "zip" } && !preparingZipAttachments) {
-            if (provider == "openrouter") preparePendingOpenRouterZipsThenSend(regenerate)
-            else preparePendingZipsThenSend(regenerate)
+            status.text = "Сначала укажите корректный формат/JSON Schema в панели «Мышление и ответ»"
             return
         }
-        if(pendingUploads.get()>0){ status.text="Дождитесь загрузки вложений…"; return }
-        if(preparingZipAttachments){ status.text="Готовлю ZIP-вложения…"; return }
+        cancelOpenRouterRequest()
+        cancelPendingGitHubConfirmation()
+        val key = secure.getOpenRouterApiKey()
+        if (key.isBlank()) { showSettings(); return }
+        val model = configuration.model
+        if (pendingUploadUris.any { it.second == "zip" } && !preparingZipAttachments) {
+            preparePendingOpenRouterZipsThenSend(regenerate)
+            return
+        }
+        if (pendingUploads.get() > 0) { status.text = "Дождитесь загрузки вложений…"; return }
+        if (preparingZipAttachments) { status.text = "Готовлю ZIP-вложения…"; return }
         val requestChatId = currentChatId()
-        if (provider == "openrouter") openRouterModelPreflightCall.getAndSet(null)?.cancel()
+        openRouterModelPreflightCall.getAndSet(null)?.cancel()
         val requestGeneration = activeResponseState.nextGeneration()
         val startedAt = SystemClock.elapsedRealtime()
         val requestWallStartedAt = System.currentTimeMillis()
@@ -3071,177 +2792,102 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val requestFileSizes = sourceToRepeat?.optJSONArray("file_sizes")?.let { a -> (0 until a.length()).map { a.optLong(it) } } ?: attachedFileSizes.toList()
         val requestFilePaths = sourceToRepeat?.optJSONArray("file_paths")?.let { a -> (0 until a.length()).map { JsonProtocol.string(a, it) } } ?: attachedFilePaths.toList()
         val requestFileMimes = sourceToRepeat?.optJSONArray("file_mimes")?.let { a -> (0 until a.length()).map { JsonProtocol.string(a, it) } } ?: attachedFileMimes.toList()
-        // Capture manifests, not files: legacy file_paths and image_path are classified
-        // by the worker against the cloned message before any composer mutation.
-        val requestOpenRouterAttachments = run {
-            if (sourceToRepeat != null) {
-                sourceToRepeat.optJSONArray("attachments")?.let { manifest ->
-                    (0 until manifest.length()).mapNotNull { i ->
-                        manifest.optJSONObject(i)?.let { OpenRouterLocalAttachment.fromJson(it) }
-                    }
-                }.orEmpty()
-            } else {
-                attachedOpenRouterAttachments.toList()
-            }
-        }
-        // Local OpenRouter manifests need a full typed local replay. A server
-        // chain must not be reused with a typed fallback (or instructions vanish).
-        val usableOpenAiChain = requestOpenRouterAttachments.isEmpty() &&
-            provider == "openai" &&
-            OpenAiInstructionChainPolicy.canReuse(
-                currentResponseId, chat, openAiInstructionFingerprint, regenerating = regenerate
-            )
-        val legacyMissingCount = if (provider == "openai" && !usableOpenAiChain)
-            OpenAiLocalContextEncoder.missingCompletedTypedOutput(chat) else 0
-        if (legacyMissingCount > 0 && !allowLegacyVisibleTextOnly) {
-            // No network or chat write has started. The older DB stored only
-            // visible words, not signed reasoning or tool output. Explicit
-            // consent is mandatory to continue with an honestly limited replay.
-            val dialog = AppThemeViews.dialog(this, currentTheme())
-                .setTitle("Старые ответы OpenAI — неполный контекст")
-                .setMessage("В истории $legacyMissingCount завершённых ответов OpenAI без " +
-                    "сохранённого Responses output. Их reasoning и результаты инструментов " +
-                    "восстановить нельзя. Продолжение передаст модели только видимый текст, " +
-                    "явно помеченный как неполный. Старый чат останется без изменений. " +
-                    "Продолжить в таком ограниченном режиме?")
-                .setNegativeButton("Отмена") { _, _ ->
-                    status.text = "Отправка отменена — старый чат и черновик сохранены"
+        val requestOpenRouterAttachments = if (sourceToRepeat != null) {
+            sourceToRepeat.optJSONArray("attachments")?.let { manifest ->
+                (0 until manifest.length()).mapNotNull { i ->
+                    manifest.optJSONObject(i)?.let { OpenRouterLocalAttachment.fromJson(it) }
                 }
-                .setPositiveButton("Только видимый текст") { _, _ ->
-                    if (currentChatId() == requestChatId && activityVisible)
-                        sendMessageWithLegacyChoice(regenerate, true)
-                }
-                .create()
-            openAiLegacyConsentDialog = dialog
-            dialog.setOnDismissListener {
-                if (openAiLegacyConsentDialog === dialog) openAiLegacyConsentDialog = null
-            }
-            dialog.show()
-            return
+            }.orEmpty()
+        } else {
+            attachedOpenRouterAttachments.toList()
         }
         val knownFileBytes = requestFileSizes.sumOf { it.coerceAtLeast(0L) }
-        val maxTotalInputFileBytes = 50L * 1024L * 1024L
-        if (provider != "openrouter" && knownFileBytes > maxTotalInputFileBytes) {
-            status.text = "Суммарный размер файлов больше " + formatBytes(maxTotalInputFileBytes) + " — уменьшите количество/размер вложений"
-            return
-        }
-        val requestImagePath = imagePath
-        val requestImageFileId = imageFileId
-        if(text.isBlank() && requestImageFileId==null &&
+        if (text.isBlank() && imageFileId == null &&
             requestFileIds.isEmpty() && requestFilePaths.isEmpty() &&
             imagePath == null && requestOpenRouterAttachments.isEmpty()) return
 
         val localRequestId = "local_" + UUID.randomUUID().toString()
-        val effortPref=prefs.getString("reasoning","high") ?: "high"
-        val hasAttachments = requestFileIds.isNotEmpty() || requestImageFileId != null ||
+        val effortPref = prefs.getString("reasoning", "high") ?: "high"
+        val hasAttachments = requestFileIds.isNotEmpty() || imageFileId != null ||
             requestFilePaths.isNotEmpty() || imagePath != null ||
             requestOpenRouterAttachments.isNotEmpty()
-        val autoSelected = effortPref=="auto"
+        val autoSelected = effortPref == "auto"
         val taskClass = classifyTask(text, hasAttachments)
-        val baselineAutoEffort = autoEffortHeuristic(text,hasAttachments)
-        val effort=if(autoSelected) chatDb.autoEffortHint(taskClass, baselineAutoEffort) else effortPref
-        val reasoningMode=prefs.getString("reasoning_mode","standard") ?: "standard"
-        val supportedReasoningMode = ModelRequestPolicy.supportedMode(provider, model, reasoningMode)
-        var configUpdateEffort:String? = null
-        val effectiveEffort:String
-        if(supportedReasoningMode == "standard"){
-            val baseline=baselineEffort
-            when {
-                baseline==null -> { baselineEffort=effort; effectiveEffort=effort }
-                baseline==effort -> effectiveEffort=baseline
-                else -> { effectiveEffort=baseline; configUpdateEffort=effort }
-            }
-        } else {
-            effectiveEffort=effort
-        }
-        val actualEffort = configUpdateEffort ?: effectiveEffort
+        val baselineAutoEffort = autoEffortHeuristic(text, hasAttachments)
+        val actualEffort = if (autoSelected) chatDb.autoEffortHint(taskClass, baselineAutoEffort) else effortPref
         updateEffortBadge(actualEffort)
-        val verbosity=prefs.getString("verbosity","medium") ?: "medium"
-        val summary=prefs.getString("reasoning_summary","auto") ?: "auto"
-        val maxOut=configuredMaxOutputTokens()
-        val backgroundEnabled = prefs.getBoolean("background_responses",true)
-        val preflightWarning = listOfNotNull(
-            buildPreflightWarning(text, knownFileBytes, maxOut, actualEffort),
-            if (reasoningMode == "pro" && provider == "openai" && supportedReasoningMode == null)
-                "Режим pro для модели не подтверждён — параметр режима не отправлен"
-            else null
-        ).joinToString(" · ").takeIf { it.isNotBlank() }
+        val verbosity = prefs.getString("verbosity", "medium") ?: "medium"
+        val maxOut = configuredMaxOutputTokens()
+        val backgroundEnabled = prefs.getBoolean("background_responses", true)
+        val preflightWarning = buildPreflightWarning(text, knownFileBytes, maxOut, actualEffort)
 
-        val sentUserMessage = JSONObject().put("role","user").put("text",text).put("request_id",localRequestId).apply {
+        val sentUserMessage = JSONObject().put("role", "user").put("text", text).put("request_id", localRequestId).apply {
             put("chat_id", requestChatId)
-            put("provider", provider)
-            if (provider == "openai") put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, openAiInstructionFingerprint)
+            put("provider", "openrouter")
             put("requested_model", model)
-            val fileIds=JSONArray(); requestFileIds.forEach{fileIds.put(it)}
-            val fileNames=JSONArray(); requestFileNames.forEach{fileNames.put(it)}
-            val fileSizes=JSONArray(); requestFileSizes.forEach{fileSizes.put(it)}
-            val filePaths=JSONArray(); requestFilePaths.forEach{filePaths.put(it)}
-            val fileMimes=JSONArray(); requestFileMimes.forEach{fileMimes.put(it)}
-            if(fileIds.length()>0) put("file_ids",fileIds)
-            if(fileNames.length()>0) put("file_names",fileNames)
-            if(fileSizes.length()>0) put("file_sizes",fileSizes)
-            if(filePaths.length()>0) put("file_paths",filePaths)
-            if(fileMimes.length()>0) put("file_mimes",fileMimes)
-            requestImagePath?.takeIf { provider == "openrouter" || File(it).isFile }
-                ?.let { path -> put("image_path", path) }
-            requestImageFileId?.let{fid->put("image_file_id",fid)}
-            (sourceToRepeat?.let { JsonProtocol.nonBlank(it, "image_name") } ?: pendingImageName)?.takeIf{it.isNotBlank()}?.let{put("image_name",it)}
-            (sourceToRepeat?.let { JsonProtocol.nonBlank(it, "image_mime") } ?: pendingImageMime)?.takeIf{it.isNotBlank()}?.let{put("image_mime",it)}
+            val fileIds = JSONArray(); requestFileIds.forEach { fileIds.put(it) }
+            val fileNames = JSONArray(); requestFileNames.forEach { fileNames.put(it) }
+            val fileSizes = JSONArray(); requestFileSizes.forEach { fileSizes.put(it) }
+            val filePaths = JSONArray(); requestFilePaths.forEach { filePaths.put(it) }
+            val fileMimes = JSONArray(); requestFileMimes.forEach { fileMimes.put(it) }
+            if (fileIds.length() > 0) put("file_ids", fileIds)
+            if (fileNames.length() > 0) put("file_names", fileNames)
+            if (fileSizes.length() > 0) put("file_sizes", fileSizes)
+            if (filePaths.length() > 0) put("file_paths", filePaths)
+            if (fileMimes.length() > 0) put("file_mimes", fileMimes)
+            imagePath?.let { put("image_path", it) }
+            imageFileId?.let { put("image_file_id", it) }
+            (sourceToRepeat?.let { JsonProtocol.nonBlank(it, "image_name") } ?: pendingImageName)?.takeIf { it.isNotBlank() }?.let { put("image_name", it) }
+            (sourceToRepeat?.let { JsonProtocol.nonBlank(it, "image_mime") } ?: pendingImageMime)?.takeIf { it.isNotBlank() }?.let { put("image_mime", it) }
             put("image_size", (sourceToRepeat?.optLong("image_size", 0L) ?: pendingImageSize).coerceAtLeast(0L))
             if (requestOpenRouterAttachments.isNotEmpty()) put("attachments", JSONArray().apply { requestOpenRouterAttachments.forEach { put(it.toJson()) } })
         }
 
-        if (provider == "openrouter") {
-            // Capture immutable JSON and settings on UI; all history I/O and Base64 run
-            // on the executor. Never dereference the current chat/prefs after navigation.
-            val capturedHistory = chat.map { JsonProtocol.objectCopy(it) } +
-                JsonProtocol.objectCopy(sentUserMessage)
-            val capturedSystemPrompt = configuration.instructions.systemPrompt
-            val capturedPresentation = configuration.instructions.presentationInstructions
-            val capturedDeveloperInstructions = configuration.instructions.developerInstructions
-            val capturedGithubEnabled = configuration.github
-            val capturedGithubRepo = configuration.githubRepo
-            val capturedGithubBranches = configuration.githubBranches
-            val capturedWebSearch = configuration.webSearch
-            val capturedWebFetch = configuration.webFetch
-            val capturedParallelTools = configuration.parallel
-            val capturedPdfEngine = configuration.pdfEngine
-            val capturedCacheMode = configuration.cacheMode
-            val capturedClaudeRoute = configuration.route
-            val capturedCompatibleImages = configuration.compatibleImages
-            val originalComposerText = input.text.toString()
-            val originalAttachmentIds = attachedOpenRouterAttachments.map { Triple(it.id, it.textPath, it.textEncoding) }
-            val originalFilePaths = attachedFilePaths.toList()
-            val originalImagePath = pendingImagePath
-            val originalUploadUris = pendingUploadUris.toList()
-            pendingOpenRouterPreparation.set(localRequestId)
-            setBusy(true)
-            status.text = "Готовлю файлы и контекст…"
-            val preparedFiles = PreparedAttachmentFiles.lease(this)
-            executor.execute {
-                val scope = preparedFiles.capture()
-                var handedToUi = false
-                try {
-                    // Test-only seam to hold a real Send at the serialization boundary.
-                    openRouterPreparationHook?.invoke()
-                    val prepared = prepareOpenRouterSnapshot(
-                        capturedHistory, capturedSystemPrompt, capturedDeveloperInstructions,
-                        capturedGithubEnabled, capturedGithubRepo, capturedGithubBranches, model, capturedCompatibleImages, capturedPresentation, capturedClaudeRoute
-                    )
-                    if (!validateOpenRouterModalities(key, model, prepared.attachments, requestChatId, requestGeneration)) return@execute
-                    if (!isRequestCurrent(requestChatId, requestGeneration) ||
-                        pendingOpenRouterPreparation.get() != localRequestId) return@execute
-                    handedToUi = true
-                    runOnUiThread {
-                        try {
+        val capturedHistory = chat.map { JsonProtocol.objectCopy(it) } + JsonProtocol.objectCopy(sentUserMessage)
+        val capturedSystemPrompt = configuration.instructions.systemPrompt
+        val capturedPresentation = configuration.instructions.presentationInstructions
+        val capturedDeveloperInstructions = configuration.instructions.developerInstructions
+        val capturedGithubEnabled = configuration.github
+        val capturedGithubRepo = configuration.githubRepo
+        val capturedGithubBranches = configuration.githubBranches
+        val capturedWebSearch = configuration.webSearch
+        val capturedWebFetch = configuration.webFetch
+        val capturedParallelTools = configuration.parallel
+        val capturedPdfEngine = configuration.pdfEngine
+        val capturedCacheMode = configuration.cacheMode
+        val capturedClaudeRoute = configuration.route
+        val capturedCompatibleImages = configuration.compatibleImages
+        val originalComposerText = input.text.toString()
+        val originalAttachmentIds = attachedOpenRouterAttachments.map { Triple(it.id, it.textPath, it.textEncoding) }
+        val originalFilePaths = attachedFilePaths.toList()
+        val originalImagePath = pendingImagePath
+        val originalUploadUris = pendingUploadUris.toList()
+        pendingOpenRouterPreparation.set(localRequestId)
+        setBusy(true)
+        status.text = "Готовлю файлы и контекст…"
+        val preparedFiles = PreparedAttachmentFiles.lease(this)
+        executor.execute {
+            val scope = preparedFiles.capture()
+            var handedToUi = false
+            try {
+                openRouterPreparationHook?.invoke()
+                val prepared = prepareOpenRouterSnapshot(
+                    capturedHistory, capturedSystemPrompt, capturedDeveloperInstructions,
+                    capturedGithubEnabled, capturedGithubRepo, capturedGithubBranches, model,
+                    capturedCompatibleImages, capturedPresentation, capturedClaudeRoute
+                )
+                if (!validateOpenRouterModalities(key, model, prepared.attachments, requestChatId, requestGeneration)) return@execute
+                if (!isRequestCurrent(requestChatId, requestGeneration) ||
+                    pendingOpenRouterPreparation.get() != localRequestId) return@execute
+                handedToUi = true
+                runOnUiThread {
+                    try {
                         if (!isRequestCurrent(requestChatId, requestGeneration) ||
                             !pendingOpenRouterPreparation.compareAndSet(localRequestId, null)) return@runOnUiThread
                         capturedHistory.last().optJSONArray("attachments")?.let { sentUserMessage.put("attachments", JsonProtocol.arrayCopy(it)) }
                         chat.add(sentUserMessage)
                         addBubble("Ты", text, true, message = sentUserMessage)
                         persistCurrentChat()
-                        // A new draft may have been entered while files were being encoded.
-                        // Never clear it (or its new attachments) with the old request.
                         if (!regenerate && input.text.toString() == originalComposerText &&
                             attachedOpenRouterAttachments.map { Triple(it.id, it.textPath, it.textEncoding) } == originalAttachmentIds &&
                             attachedFilePaths == originalFilePaths &&
@@ -3263,7 +2909,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                         )
                         chatDb.startRequestAccounting(
                             chatId = requestChatId, localRequestId = localRequestId,
-                            provider = provider, requestedModel = model,
+                            provider = "openrouter", requestedModel = model,
                             credentialSource = "openrouter_api_key"
                         )
                         status.text = if (preflightWarning.isNullOrBlank()) "Модель отвечает…"
@@ -3281,7 +2927,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                             "prompt_chars" to text.length,
                             "model" to model,
                             "requested_model" to model,
-                            "provider" to provider
+                            "provider" to "openrouter"
                         ))
                         currentResponseId = null
                         toolLabel.text = ""
@@ -3302,993 +2948,25 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                             cacheMode = capturedCacheMode, background = backgroundEnabled, pdfEngine = capturedPdfEngine,
                             responseFormat = openRouterResponseFormat, claudeRoute = capturedClaudeRoute
                         )
-                        } finally { releasePreparedFiles(preparedFiles) }
-                    }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        if (isRequestCurrent(requestChatId, requestGeneration) &&
-                            pendingOpenRouterPreparation.compareAndSet(localRequestId, null)) {
-                            status.text = "Ошибка подготовки вложений: " +
-                                (e.message ?: "невозможно прочитать файлы")
-                            setBusy(false)
-                            diagnostics.log("openrouter_preflight_failed", mapOf(
-                                "chat_id" to requestChatId,
-                                "request_id" to localRequestId,
-                                "stage" to "wire_prepare",
-                                "error_type" to e.javaClass.simpleName
-                            ))
-                            // Nothing was sent or persisted: the complete draft remains.
-                        }
-                    }
-                } finally { scope.close(); if (!handedToUi) releasePreparedFiles(preparedFiles) }
-            }
-            return
-        }
-
-        val composerBeforePreparation = input.text.toString()
-        val openRouterIdsBeforePreparation = attachedOpenRouterAttachments.map { Triple(it.id, it.textPath, it.textEncoding) }
-        val filePathsBeforePreparation = attachedFilePaths.toList()
-        val imagePathBeforePreparation = pendingImagePath
-        val pendingUrisBeforePreparation = pendingUploadUris.toList()
-        // Model, credential, instructions, effort, verbosity, maxOut and backgroundEnabled
-        // were already captured above on this UI turn. Capture every deferred option too.
-        val openAiOptions = configuration.openAi
-        val fileAnalysisEnabled = openAiOptions.fileAnalysis
-        val capturedFileHistory = chat.map { JsonProtocol.objectCopy(it) } + JsonProtocol.objectCopy(sentUserMessage)
-        fun commitPreparedOpenAi(typedInput: JSONArray?, containerFiles: Map<String, String> = emptyMap(), toolFiles: List<OpenRouterLocalAttachment> = emptyList()) {
-        // Repeat creates a new user request under current settings without touching a newer draft.
-        val shouldConsumeDraft = !regenerate &&
-            input.text.toString() == composerBeforePreparation &&
-            attachedOpenRouterAttachments.map { Triple(it.id, it.textPath, it.textEncoding) } == openRouterIdsBeforePreparation &&
-            attachedFilePaths == filePathsBeforePreparation &&
-            pendingImagePath == imagePathBeforePreparation &&
-            pendingUploadUris == pendingUrisBeforePreparation
-        chat.add(sentUserMessage)
-        addBubble("Ты",text,true, message=sentUserMessage)
-        persistCurrentChat()
-        if (shouldConsumeDraft) {
-            input.setText("")
-            clearComposerState(requestChatId)
-        }
-
-        lastUserText=text
-        activeRequestRegenerate=regenerate
-        activeResponsePersistence.setActiveResponse(
-            requestChatId,
-            responseId = null,
-            requestId = localRequestId,
-            text = "",
-            status = "starting",
-            startedAt = requestWallStartedAt,
-            effortPref = effortPref,
-            effectiveEffort = actualEffort,
-            autoSelected = autoSelected,
-            promptChars = text.length,
-            attachments = if (provider == "openrouter") requestOpenRouterAttachments.size else requestFileIds.size + if(requestImageFileId!=null) 1 else 0,
-            backgroundEnabled = backgroundEnabled
-        )
-        chatDb.startRequestAccounting(
-            chatId = requestChatId, localRequestId = localRequestId,
-            provider = provider, requestedModel = model,
-            credentialSource = if (provider == "openrouter") "openrouter_api_key" else "openai_api_key"
-        )
-        renderRequestTelemetry()
-        setBusy(true)
-        status.text=if(preflightWarning.isNullOrBlank()) "Модель отвечает…" else "⚠ $preflightWarning\nМодель отвечает…"
-        toolStates.clear()
-        renderToolActivity()
-        diagnostics.log("request_start", mapOf(
-            "chat_id" to requestChatId,
-            "generation" to requestGeneration,
-            "effort_pref" to effortPref,
-            "effective_effort" to actualEffort,
-            "auto" to autoSelected,
-            "task_class" to taskClass,
-            "auto_baseline" to baselineAutoEffort,
-            "auto_effective" to effort,
-            "attachments" to if (provider == "openrouter") requestOpenRouterAttachments.size else requestFileIds.size + if(requestImageFileId!=null) 1 else 0,
-            "prompt_chars" to text.length,
-            "model" to model,
-            "requested_model" to model,
-            "provider" to provider
-        ))
-
-        requestAnswerNotificationPermission()
-        val content=JSONArray()
-        if(text.isNotBlank()) content.put(JSONObject().put("type","input_text").put("text",text))
-        requestImageFileId?.let { content.put(JSONObject().put("type","input_image")
-            .put("file_id", requestImagePath?.let { path -> containerFiles[path] } ?: it)) }
-        requestFileIds.forEachIndexed { i, id ->
-            if (fileAnalysisEnabled && requestFilePaths.getOrNull(i)?.let { containerFiles.containsKey(it) } == true &&
-                TextFileFormatPolicy.extension(requestFileNames.getOrNull(i).orEmpty()) !in setOf("pdf", "doc", "docx", "ppt", "pptx")) {
-                content.put(JSONObject().put("type", "input_text").put("text", "Полный файл ${requestFileNames.getOrNull(i)} доступен в контейнере Code Interpreter: ${containerFiles.getValue(requestFilePaths[i])}. Выбирай частичное чтение или обработку всех строк по задаче."))
-            } else content.put(JSONObject().put("type", "input_file")
-                .put("file_id", requestFilePaths.getOrNull(i)?.let { path -> containerFiles[path] } ?: id))
-        }
-
-        // Keep the request-level effort stable in standard mode; Astra's configuration_update
-        // changes the conversation effort while preserving the original prompt prefix for caching.
-        val reasoningObj = ModelRequestPolicy.openAiReasoning(model, effectiveEffort, reasoningMode, summary)
-
-        val textObj=JSONObject().put("verbosity",verbosity)
-        val inputArr=typedInput ?: JSONArray()
-        if (typedInput == null && !usableOpenAiChain && chat.size > 1) {
-            chat.dropLast(1).forEach { message ->
-                val role = message.optString("role")
-                val messageText = JsonProtocol.string(message, "text").trim()
-                if ((role == "user" || role == "assistant") && messageText.isNotBlank()) {
-                    inputArr.put(JSONObject().put("role", role).put("content", messageText))
+                    } finally { releasePreparedFiles(preparedFiles) }
                 }
-            }
-        }
-        configUpdateEffort?.let{ newEffort->
-            inputArr.put(JSONObject().put("type","configuration_update").put("reasoning",JSONObject().put("effort",newEffort)))
-            runOnUiThread{
-                if(isRequestCurrent(requestChatId,requestGeneration)) toolLabel.text="⚙ мышление: $effectiveEffort → $newEffort (эта реплика)"
-            }
-        }
-        if (typedInput == null) inputArr.put(JSONObject().put("role","user").put("content",content))
-
-        val body=JSONObject()
-            .put("model",model)
-            .put("input",inputArr)
-            .put("stream",true)
-            .put("store",true)
-            .put("background",backgroundEnabled)
-            .put("reasoning",reasoningObj)
-            .put("parallel_tool_calls",openAiOptions.parallelTools)
-
-        maxOut?.let { body.put("max_output_tokens",it) }
-        // A reusable chain receives only the new user turn (possibly typed descriptors).
-        // A full replay always starts with the current system/developer roles.
-        val chainOnWire = usableOpenAiChain
-        if (!chainOnWire) openAiInstructions.applyToOpenAiRequest(body)
-        openAiOptions.cacheKey.takeIf{it.isNotBlank()}?.let { body.put("prompt_cache_key",it) }
-        // OpenAI currently disallows combining configuration_update with automatic compaction.
-        if (configUpdateEffort == null && openAiOptions.autoCompaction) {
-            ModelCatalog.compactionThreshold(model)?.let { threshold ->
-                body.put("context_management", JSONArray().put(JSONObject().put("type","compaction").put("compact_threshold",threshold)))
-            }
-        }
-        if (chainOnWire) {
-            openAiOptions.previousResponseId?.let { body.put("previous_response_id", it) }
-        }
-
-        when(openAiOptions.textFormat){
-            "json_object" -> textObj.put("format",JSONObject().put("type","json_object"))
-            "json_schema" -> {
-                val schemaText=openAiOptions.jsonSchema
-                if(schemaText.isNotBlank()){
-                    try {
-                        val schema=JSONObject(schemaText)
-                        textObj.put("format",JSONObject().put("type","json_schema").put("name","astra_response").put("strict",true).put("schema",schema))
-                    } catch(_:Exception){
-                        runOnUiThread{ if(isRequestCurrent(requestChatId,requestGeneration)) status.text="Ошибка: JSON Schema недействительна" }
-                    }
-                } else {
-                    runOnUiThread{ if(isRequestCurrent(requestChatId,requestGeneration)) status.text="Укажите JSON Schema в настройках для этого формата" }
-                }
-            }
-        }
-        body.put("text",textObj)
-
-        val webEnabled = openAiOptions.web
-        val nonVisualContainerFiles = containerFiles.filterKeys { path ->
-            TextFileFormatPolicy.extension(path) !in setOf("jpg", "jpeg", "png", "webp", "gif", "pdf")
-        }
-        val enableCodeInterpreter = openAiOptions.codeInterpreter || (fileAnalysisEnabled && nonVisualContainerFiles.isNotEmpty())
-        val wholeFileIds = (requestFileIds.mapIndexedNotNull { i, id ->
-            val path = requestFilePaths.getOrNull(i)
-            val mime = requestFileMimes.getOrNull(i).orEmpty()
-            if (mime.startsWith("image/")) null else (path?.let { nonVisualContainerFiles[it] ?: containerFiles[it] } ?: id)
-        } + nonVisualContainerFiles.values).filter { it.isNotBlank() }.distinct()
-        val tools = ContextToolSchemas.openAi(webEnabled, openAiOptions.fileSearch, openAiOptions.vectorStore,
-            enableCodeInterpreter, openAiOptions.containerMemory, wholeFileIds, openAiOptions.imageGeneration)
-        if(tools.length()>0) body.put("tools",tools)
-
-        val include=JSONArray()
-        // A reasoning summary is NOT the signed reasoning state. Request the
-        // provider's opaque encrypted_content so a local typed replay can
-        // preserve it without fabricating private reasoning.
-        include.put("reasoning.encrypted_content")
-        if(webEnabled) include.put("web_search_call.action.sources")
-        if(openAiOptions.fileSearch) include.put("file_search_call.results")
-        if(enableCodeInterpreter) include.put("code_interpreter_call.outputs")
-        include.put("computer_call_output.output.image_url")
-        body.put("include",include)
-        OpenAiLocalFileToolBridge.configure(chatDb, requestChatId, localRequestId, body, toolFiles)
-
-        if (shouldConsumeDraft) clearAttachedSelection()
-        toolLabel.text=""
-        refreshAttachChips()
-
-        val assistantItemId = addBubble(
-            "Astra",
-            "",
-            false,
-            itemId = ChatScrollPolicy.activeAssistantIdentity(localRequestId, null, chat.size)
-        )
-        activeAssistantItemId = assistantItemId
-        val req=Request.Builder()
-            .url("https://api.openai.com/v1/responses")
-            .addHeader("Authorization","Bearer $key")
-            .addHeader("Content-Type","application/json")
-            .post(StreamingJsonRequestBody(body, oneShot = true))
-            .build()
-
-        currentCall=client.newCall(req)
-        val call=currentCall!!
-        OpenAiCreateCallOwners.register(requestChatId, localRequestId, call)
-
-        executor.execute {
-            var requestId: String? = null
-            var newId: String? = null
-            var usage: JSONObject? = null
-            var fileCites = emptyList<JSONObject>()
-            var urlCites = emptyList<JSONObject>()
-            var completionState = "in_progress"
-            var completionError: String? = null
-            var completedResponse: JSONObject? = null
-            var responseState = ResponseEventState()
-            val toolItems=mutableListOf<String>()
-            var lastUiUpdate=0L
-            var lastActiveCheckpoint=0L
-            val destroyedCallbackCleanup = DestroyedActivityCallbackCleanup { executor.isShutdown }
-            var ownedCreateCall = call
-            var initialFileIo: FileBackedIoTelemetry.Snapshot? = null
-            var fileIoRecorded = false
-            fun captureInitialFileIo() {
-                // Optional counters must not replace the network outcome. Persist them before
-                // Activity hands its response to WorkManager, which cannot reconstruct wrappers.
-                try {
-                    val snapshot = FileBackedIoTelemetry.snapshot(body)
-                    if (!snapshot.hasSourceWork) return
-                    initialFileIo = snapshot
-                    if (!fileIoRecorded) {
-                        val compact = FileBackedIoTelemetry.mergeCompactTelemetry(fileIo = snapshot)
-                        if (compact != null) chatDb.recordRequestTelemetry(requestChatId, localRequestId, compact)
-                        diagnostics.log("openai_file_io", mapOf("chat_id" to requestChatId,
-                            "request_id" to localRequestId, "files" to snapshot.files,
-                            "source_read_passes" to snapshot.readPasses,
-                            "source_read_bytes" to snapshot.readBytes, "file_work_ms" to snapshot.workMs))
-                        fileIoRecorded = true
-                    }
-                } catch (_: Exception) { /* Diagnostics are best effort; usage is durable separately. */ }
-            }
-            try {
-                ResponseDeadlinePolicy.boundCall(call, requestWallStartedAt, System.currentTimeMillis())
-                call.execute().use { response ->
-                    captureInitialFileIo()
-                    requestId=response.header("x-request-id")
-                    activeResponsePersistence.updateActiveResponse(requestChatId, text = "", status = "in_progress", expectedRequestId = localRequestId)
-                    diagnostics.log("http_response", mapOf("request_id" to requestId, "status" to response.code, "chat_id" to requestChatId, "generation" to requestGeneration))
-                    if(!response.isSuccessful) throw IOException("HTTP ${response.code}: " +
-                        OpenAiFileFailure.fromHttp(applicationContext, BoundedResponseDecoder.readErrorBody(response.body), response.code))
-                    var rawSseArchive: OpenAiRawSseArchive? = null
-                    val reader=response.body?.byteStream()?.let { input ->
-                        val archived = OpenAiRawSseArchive.begin(
-                            input, applicationContext.filesDir, requestChatId, localRequestId
-                        )
-                        rawSseArchive = archived
-                        OpenAiSseUtf8Reader.open(OpenAiSseWireByteLimitStream(archived))
-                    } ?: throw IOException("Пустой ответ")
-                    val sequenceCursor = ResponseStreamSequenceCursor()
-
-                    fun handleSseEvent(ev:JSONObject): Boolean {
-                        openAiReceivedEventHook?.invoke(ev)
-                        // The hook intentionally retains shutdownNow's interrupt.
-                        // SQLite open retries and late-ID cancellation must finish
-                        // before that flag is restored in the task's finally.
-                        destroyedCallbackCleanup.enter()
-                        try {
-                            val sequenceNumber=ev.optLong("sequence_number",-1L)
-                            if(sequenceNumber>=0L){
-                                when(sequenceCursor.observe(sequenceNumber)){
-                                    ResponseStreamSequenceObservation.ACCEPTED -> Unit
-                                    ResponseStreamSequenceObservation.DUPLICATE -> {
-                                        diagnostics.log("sse_event_duplicate_or_out_of_order",mapOf(
-                                            "request_id" to requestId,
-                                            "sequence_number" to sequenceNumber,
-                                            "last_sequence_number" to sequenceCursor.lastSequenceNumber
-                                        ))
-                                        return false
-                                    }
-                                }
-                            }
-                            val responseDecision = ResponseEventReducer.reduce(responseState, ev,
-                                openAiAccumulatorLimitForTests)
-                            responseState = responseDecision.state
-                            responseState.responseId?.let { newId = it }
-                            responseState.terminalState?.let { completionState = it.wireStatus }
-                            responseState.completionError?.let { completionError = it }
-                            responseState.terminalResponse?.let { completedResponse = it }
-                            responseState.usage?.let { usage = it }
-                            OpenAiFileFailure.onEvent(applicationContext, ev)?.let { completionError = it }
-
-                            if (ev.optString("type") == "response.created" &&
-                                responseDecision.responseIdChanged &&
-                                !newId.isNullOrBlank()
-                            ) {
-                                if (backgroundEnabled &&
-                                    activeResponsePersistence.getActiveResponse(requestChatId)
-                                        ?.optString("request_id") != localRequestId) {
-                                    // Stop/Delete can win while already-received
-                                    // bytes are queued before response.created.
-                                    cancelUnownedOpenAiResponse(requestChatId, localRequestId, newId!!, key, inline = true)
-                                    throw IOException("Responses owner was stopped or replaced")
-                                }
-                                activeResponsePersistence.updateActiveResponse(
-                                    requestChatId,
-                                    responseId = newId,
-                                    status = "in_progress",
-                                    lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                                    expectedRequestId = localRequestId
-                                )
-                                if (!activityVisible && backgroundEnabled &&
-                                    activeResponsePersistence.getActiveResponse(requestChatId)
-                                        ?.optString("request_id") == localRequestId) {
-                                    // Persist recovery work before reading another frame.
-                                    // The Worker waits for the registered Create callback,
-                                    // retaining the original Send's started_at and CAS owner.
-                                    BackgroundResponseWorkScheduler.enqueueImmediate(
-                                        applicationContext, requestChatId, newId!!, localRequestId)
-                                }
-                                diagnostics.log("response_created", mapOf(
-                                    "request_id" to requestId,
-                                    "response_id" to newId,
-                                    "chat_id" to requestChatId
-                                ))
-                            }
-
-                            if (ev.optString("type") == "response.output_item.done") {
-                                // An already completed signed reasoning/tool item is
-                                // paid provider output. Persist it immediately even
-                                // if no visible text delta triggered the UI throttle.
-                                activeResponsePersistence.updateActiveResponse(
-                                    requestChatId, responseId = newId,
-                                    text = responseState.text, status = "in_progress",
-                                    lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                                    indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                                    expectedRequestId = localRequestId
-                                )
-                            }
-                            if (responseDecision.textChanged) {
-                                val now = SystemClock.elapsedRealtime()
-                                if (now - lastUiUpdate >= 50L) {
-                                    lastUiUpdate = now
-                                    postAssistantTextUpdate(
-                                        requestChatId,
-                                        requestGeneration,
-                                        assistantItemId,
-                                        responseState.text
-                                    )
-                                }
-                                if (now - lastActiveCheckpoint >= 750L) {
-                                    lastActiveCheckpoint = now
-                                    activeResponsePersistence.updateActiveResponse(
-                                        requestChatId,
-                                        responseId = newId,
-                                        text = responseState.text,
-                                        status = responseState.terminalState?.wireStatus ?: "in_progress",
-                                        lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                                        indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                                        expectedRequestId = localRequestId
-                                    )
-                                }
-                            }
-
-                            // Text throttling is independent from the terminal
-                            // commit. Even a text-free failed/cancelled/error frame
-                            // must leave a consistent checkpoint before finalization.
-                            if (responseState.terminalState != null) {
-                                activeResponsePersistence.updateActiveResponse(
-                                    requestChatId, responseId = newId,
-                                    text = responseState.text,
-                                    status = responseState.terminalState!!.wireStatus,
-                                    lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                                    indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                                    expectedRequestId = localRequestId
-                                )
-                            }
-
-                            if (responseDecision.reasoningChanged) {
-                                runOnUiThread {
-                                    if (isRequestCurrent(requestChatId, requestGeneration)) {
-                                        updateActiveReasoningSummary(responseState.reasoningSummary)
-                                    }
-                                }
-                            }
-
-                            when(ev.optString("type")){
-                                "response.reasoning_summary_text.done" -> {}
-                                "response.web_search_call.completed" -> { toolItems.add("🌐 Web Search"); updateToolState("web_search","completed",requestChatId,requestGeneration) }
-                                "response.file_search_call.completed" -> { toolItems.add("📚 File Search"); updateToolState("file_search","completed",requestChatId,requestGeneration) }
-                                "response.code_interpreter_call.completed" -> { toolItems.add("🐍 Code Interpreter"); updateToolState("code_interpreter","completed",requestChatId,requestGeneration) }
-                                "response.image_generation_call.completed" -> { toolItems.add("🎨 Image Generation"); updateToolState("image_generation","completed",requestChatId,requestGeneration) }
-                                "response.computer_call.completed" -> { toolItems.add("🖥 Computer Use"); updateToolState("computer","completed",requestChatId,requestGeneration) }
-                                "response.web_search_call.in_progress", "response.web_search_call.searching" -> updateToolState("web_search","running",requestChatId,requestGeneration)
-                                "response.file_search_call.in_progress" -> updateToolState("file_search","running",requestChatId,requestGeneration)
-                                "response.code_interpreter_call.in_progress" -> updateToolState("code_interpreter","running",requestChatId,requestGeneration)
-                                "response.image_generation_call.in_progress" -> updateToolState("image_generation","running",requestChatId,requestGeneration)
-                                "response.computer_call.in_progress" -> updateToolState("computer","running",requestChatId,requestGeneration)
-                                "response.web_search_call.failed" -> updateToolState("web_search","failed",requestChatId,requestGeneration)
-                                "response.file_search_call.failed" -> updateToolState("file_search","failed",requestChatId,requestGeneration)
-                                "response.code_interpreter_call.failed" -> updateToolState("code_interpreter","failed",requestChatId,requestGeneration)
-                                "response.image_generation_call.failed" -> updateToolState("image_generation","failed",requestChatId,requestGeneration)
-                                "response.computer_call.failed" -> updateToolState("computer","failed",requestChatId,requestGeneration)
-                                "response.completed" -> {
-                                    val r=responseState.terminalResponse
-                                    parseTools(r?.optJSONArray("output"),toolItems,requestChatId,requestGeneration)
-                                    newId?.let {
-                                        activeResponsePersistence.updateActiveResponse(
-                                            requestChatId,
-                                            responseId = it,
-                                            text = responseState.text,
-                                            status = "completed",
-                                            lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                                            indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                                            expectedRequestId = localRequestId
-                                        )
-                                    }
-                                    val annotations=extractAnnotations(r?.optJSONArray("output"))
-                                    fileCites=annotations.first
-                                    urlCites=annotations.second
-                                    diagnostics.log("response_completed", mapOf(
-                                        "request_id" to requestId,
-                                        "response_id" to newId,
-                                        "files" to fileCites.size,
-                                        "urls" to urlCites.size,
-                                        "latency_ms" to (SystemClock.elapsedRealtime()-startedAt)
-                                    ))
-                                }
-                            }
-                        } catch (parseError:Exception){
-                            if(parseError is ResponseStreamSequenceGapException){
-                                diagnostics.log("sse_event_sequence_gap", mapOf(
-                                    "request_id" to requestId,
-                                    "expected_sequence_number" to parseError.expectedSequenceNumber,
-                                    "received_sequence_number" to parseError.receivedSequenceNumber
-                                ))
-                                throw parseError
-                            }
-                            diagnostics.log("sse_event_processing_error", mapOf("message" to (parseError.message ?: "unknown"), "request_id" to requestId))
-                            throw parseError
-                        }
-                        return true
-                    }
-
-                    // Reader.close() propagates to the raw archive's fsync/close.
-                    // Closing only the OkHttp response would bypass that wrapper.
-                    val streamEnd = reader.use {
-                        OpenAiReceivedSseReader.read(reader, rawSseArchive) { ev -> handleSseEvent(ev) }
-                    }
-                    completionState = streamEnd.end.wireStatus
-                    streamEnd.errorMessage?.let { completionError = it }
-                    OpenAiFileFailure.recover(applicationContext, completedResponse?.optJSONObject("error"))?.let { completionError = it }
-                    // EOF / [DONE] without a Responses terminal is not completion.
-                    // Only an owned, already-created background response may resume.
-                    if (streamEnd.end == OpenAiStreamEnd.DISCONNECTED && backgroundEnabled && newId != null) {
-                        activeResponsePersistence.updateActiveResponse(
-                            requestChatId, responseId = newId, text = responseState.text,
-                            status = "in_progress", lastSequenceNumber = sequenceCursor.lastSequenceNumber,
-                            indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                            expectedRequestId = localRequestId
-                        )
-                        throw IOException("Responses SSE disconnected before terminal event")
-                    }
-                    destroyedCallbackCleanup.enter()
-                    // Extract artifacts/tools/summary from all received paid output,
-                    // even when the terminal envelope omits output_item.done items.
-                    var effectiveResponse = OpenAiEffectiveResponse.assemble(completedResponse, responseState)
-                    if (chatDb.getOpenAiToolCheckpoint(requestChatId, localRequestId) != null) {
-                        // A child ID is durable before its first GET. Retrying only that
-                        // reader never reissues the paid continuation POST, including in
-                        // foreground-only mode. The original Create is no longer its Call.
-                        fun ownsToolReader(): Boolean = activityVisible && !executor.isShutdown &&
-                            !ownedCreateCall.isCanceled() &&
-                            OpenAiCreateCallOwners.call(requestChatId, localRequestId) === ownedCreateCall &&
-                            chatDb.isActiveRequest(requestChatId, localRequestId)
-                        var toolRetryDelayMs = 1_500L
-                        while (true) {
-                            try {
-                                effectiveResponse = OpenAiLocalFileToolBridge.finish(applicationContext, chatDb,
-                                    requestChatId, localRequestId, effectiveResponse, client,
-                                    active = ::ownsToolReader,
-                                    onCall = { next ->
-                                        if (!ownsToolReader() || !OpenAiCreateCallOwners.replace(requestChatId, localRequestId, ownedCreateCall, next)) next.cancel()
-                                        else { ownedCreateCall = next; currentCall = next }
-                                        if (!activityVisible || !chatDb.isActiveRequest(requestChatId, localRequestId)) next.cancel()
-                                    },
-                                    onStatus = { progressText ->
-                                        runOnUiThread {
-                                            if (isRequestCurrent(requestChatId, requestGeneration) &&
-                                                chatDb.isActiveRequest(requestChatId, localRequestId)) {
-                                                toolLabel.text = progressText
-                                                status.text = progressText
-                                            }
-                                        }
-                                    })
-                                break
-                            } catch (error: ApiHttpException) {
-                                val pending = chatDb.getOpenAiToolCheckpoint(requestChatId, localRequestId)
-                                val childId = pending?.let { JsonProtocol.nonBlank(it, "response_id") }
-                                val currentChild = chatDb.getActiveResponse(requestChatId)
-                                val retryGet = pending?.optString("phase") == "waiting" && childId != null &&
-                                    currentChild != null && currentChild.optString("request_id") == localRequestId &&
-                                    currentChild.optString("response_id") == childId &&
-                                    ownedCreateCall.request().method == "GET" &&
-                                    ownedCreateCall.request().url.pathSegments.lastOrNull() == childId &&
-                                    BackgroundRecoveryPolicy.actionForHttpStatus(error.statusCode) == BackgroundRecoveryAction.RETRY
-                                if (!retryGet) throw error
-                                waitForOpenAiToolRetry(requestChatId, localRequestId,
-                                    BackgroundRecoveryPolicy.retryDelayMs(
-                                        BackgroundRecoveryPolicy.jitteredDelayMs(toolRetryDelayMs), error.retryAfterMs),
-                                    ::ownsToolReader)
-                                toolRetryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(toolRetryDelayMs)
-                            }
-                        }
-                        newId = effectiveResponse.optString("id").takeIf { it.isNotBlank() } ?: newId
-                        completionState = effectiveResponse.optString("status", completionState)
-                        usage = effectiveResponse.optJSONObject("usage")
-                        responseState = ResponseEventReducer.reduce(ResponseEventState(), JSONObject()
-                            .put("type", "response.$completionState").put("response", effectiveResponse)).state
-                        chatDb.updateActiveResponse(requestChatId, responseId = newId, text = responseState.text,
-                            status = completionState, lastSequenceNumber = 0L,
-                            indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState), expectedRequestId = localRequestId)
-                    }
-                    // Canonical response text must contain provider output only. Status
-                    // notices are UI metadata, never future model context.
-                    val finalText = responseState.text.ifBlank {
-                        OpenAiSseStreamReader.terminalOutputText(effectiveResponse)
-                    }
-                    val answerAnnotations=JSONArray()
-                    fileCites.forEach{ answerAnnotations.put(JSONObject(it.toString())) }
-                    urlCites.forEach{ answerAnnotations.put(JSONObject(it.toString())) }
-                    val parsedModel = AstraResponseModel.fromResponse(
-                        effectiveResponse,
-                        finalText,
-                        localRequestId,
-                        completionState,
-                        completionError
-                    )
-                    val streamedSummary=responseState.reasoningSummary.trim()
-                    val responseSummary=parsedModel.reasoningSummary?.takeIf{it.isNotBlank()}
-                        ?: extractReasoningSummary(effectiveResponse).takeIf{it.isNotBlank()}
-                        ?: streamedSummary.takeIf{it.isNotBlank()}
-                    val responseModel = parsedModel.copy(
-                        id = newId ?: parsedModel.id,
-                        annotations = if(parsedModel.annotations.length()>0) parsedModel.annotations else answerAnnotations,
-                        tools = (parsedModel.tools + toolItems).distinct(),
-                        usage = usage ?: parsedModel.usage,
-                        reasoningSummary = responseSummary
-                    )
-                    val assistantMessage=responseModel.toChatJson()
-                        .put("requested_model", model)
-                        .put("provider", "openai")
-                        .put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, openAiInstructionFingerprint)
-                    effectiveResponse.optJSONArray("output")?.let { output ->
-                        assistantMessage.put("openai_protocol_output", JSONArray(output.toString()))
-                    }
-                    responseModel.usage?.let { assistantMessage.put("usage", JSONObject(it.toString())) }
-                    val savedGeneratedImages = saveGeneratedImages(responseModel.generatedImageResults)
-                    if (savedGeneratedImages.length() > 0) assistantMessage.put("generated_images", savedGeneratedImages)
-                    if (completionState != "completed" || (0 until savedGeneratedImages.length()).any {
-                            savedGeneratedImages.optJSONObject(it)?.optString("state") != "READY"
-                        }) {
-                        OpenAiRawSseArchive.attachToMessage(
-                            assistantMessage, filesDir, requestChatId, localRequestId)
-                    }
-
-                    val latency=SystemClock.elapsedRealtime()-startedAt
-                    val usageObj=usage
-                    val inTok=usageObj?.optLong("input_tokens",0L) ?: 0L
-                    val outTok=usageObj?.optLong("output_tokens",0L) ?: 0L
-                    val cachedTok=usageObj?.optJSONObject("input_tokens_details")?.optLong("cached_tokens",0L) ?: 0L
-                    val cacheWriteTok=usageObj?.optJSONObject("input_tokens_details")?.optLong("cache_write_tokens",0L) ?: 0L
-                    val reasoningTok=usageObj?.optJSONObject("output_tokens_details")?.optLong("reasoning_tokens",0L) ?: 0L
-                    val estimatedCost=estimateCost(inTok,cachedTok,cacheWriteTok,outTok)
-                    val compactTelemetry = attachOpenAiCompletionMetadata(assistantMessage, effectiveResponse,
-                        requestChatId, localRequestId, initialFileIo)
-                    val finalized = chatDb.finalizeCurrentChatIfActiveRequest(
-                        requestChatId, "", newId.takeIf { completionState == "completed" },
-                        actualEffort, listOf(assistantMessage), localRequestId
-                    )
-                    if (!finalized) return@execute
-                    if (completionState == "completed" && (0 until savedGeneratedImages.length()).all {
-                            savedGeneratedImages.optJSONObject(it)?.optString("state") == "READY"
-                        }) {
-                        // Raw archive is redundant only after the complete
-                        // provider output and every generated artifact are
-                        // already durable under the winning SQLite claim.
-                        // Keep archives of overlapping Activity/Worker streams:
-                        // only this successfully committed connection is redundant.
-                        rawSseArchive?.deleteAfterDurableCommit()
-                    }
-                    ResponseNotifications.finished(applicationContext, requestChatId, localRequestId, completionState == "completed")
-                    recordOpenAiEffortMetricSafely { chatDb.recordEffortMetric(localRequestId, requestChatId, taskClass, effortPref, actualEffort, autoSelected, text.length, requestFileIds.size + if(requestImageFileId!=null) 1 else 0, latency, inTok, cachedTok, cacheWriteTok, outTok, reasoningTok, completionState=="completed", if(completionState=="completed") null else completionState.ifBlank{"incomplete"}, estimatedCost) }
-
-                    chatDb.recordRequestAccounting(
-                        chatId = requestChatId,
-                        localRequestId = localRequestId,
-                        status = completionState,
-                        responseId = newId,
-                        httpRequestId = requestId,
-                        usage = assistantMessage.optJSONObject("usage"),
-                        telemetrySummary = compactTelemetry
-                    )
-                    chatDb.recordRequestEvent(
-                        chatId = requestChatId,
-                        eventType = if (completionState == "completed") "request_completed" else "request_${completionState}",
-                        requestId = localRequestId,
-                        provider = "openai",
-                        requestedModel = model,
-                        responseModel = responseModel.model,
-                        modelMatch = ModelCatalog.match(model, responseModel.model),
-                        status = completionState,
-                        inputTokens = inTok,
-                        cachedTokens = cachedTok,
-                        cacheWriteTokens = cacheWriteTok,
-                        outputTokens = outTok,
-                        reasoningTokens = reasoningTok,
-                        estimatedCostUsd = estimatedCost,
-                        latencyMs = latency,
-                        toolSummary = responseModel.tools.distinct().joinToString(","),
-                        telemetrySummary = compactTelemetry
-                    )
-
-                    runOnUiThread{
-                        if(!isRequestCurrent(requestChatId,requestGeneration)) return@runOnUiThread
-                        if (completionState == "completed") currentResponseId = newId ?: currentResponseId
-                        baselineEffort=actualEffort
-                        chat.add(assistantMessage)
-                        refreshLocalEvidenceEligibility()
-                        activeResponsePersistence.clearActiveResponse(requestChatId, expectedRequestId = localRequestId)
-                        persistCurrentChat()
-
-                        val finalItemId = activeAssistantItemId ?: assistantItemId
-                        messageAdapter.replaceItem(
-                            finalItemId,
-                            ChatBubbleItem.create(
-                                id = finalItemId,
-                                label = AssistantModelLabel.text(assistantMessage),
-                                text = JsonProtocol.string(assistantMessage, "text"),
-                                user = false,
-                                annotations = assistantMessage.optJSONArray("annotations"),
-                                message = assistantMessage,
-                                chatIndex = chat.lastIndex,
-                                reasoningSummary = responseModel.reasoningSummary
-                            )
-                        )
-                        activeAssistantItemId = finalItemId
-                        scrollToLatest()
-                        status.text = when (completionState) {
-                            "completed" -> "Готово"
-                            "incomplete" -> "Ответ завершён не полностью"
-                            "cancelled" -> "Ответ отменён"
-                            "failed" -> "Ошибка ответа"
-                            else -> "Соединение прервалось — ответ неполный"
-                        }
-                        if(toolItems.isNotEmpty()) toolLabel.text=toolItems.distinct().joinToString("  ")
-                        renderRequestTelemetry()
+            } catch (e: Exception) {
+                runOnUiThread {
+                    if (isRequestCurrent(requestChatId, requestGeneration) &&
+                        pendingOpenRouterPreparation.compareAndSet(localRequestId, null)) {
+                        status.text = "Ошибка подготовки вложений: " +
+                            (e.message ?: "невозможно прочитать файлы")
                         setBusy(false)
-                        activeAssistantItemId=null
-                        currentCall=null
-                        activeRequestRegenerate=false
-                        if(status.text=="Модель отвечает…") status.text="Готово"
+                        diagnostics.log("openrouter_preflight_failed", mapOf(
+                            "chat_id" to requestChatId,
+                            "request_id" to localRequestId,
+                            "stage" to "wire_prepare",
+                            "error_type" to e.javaClass.simpleName
+                        ))
                     }
                 }
-            } catch(e:Exception) {
-                captureInitialFileIo()
-                destroyedCallbackCleanup.enter()
-                chatDb.getOpenAiToolCheckpoint(requestChatId, localRequestId)?.let { checkpoint ->
-                    if (checkpoint.optString("phase") in setOf("idle", "prepared", "waiting", "finished")) {
-                        newId = chatDb.getActiveResponse(requestChatId)?.optString("response_id")?.takeIf { it.isNotBlank() } ?: newId
-                        completionState = "in_progress"
-                    }
-                }
-                val cancelled=ownedCreateCall.isCanceled()
-                // stopCurrentResponse() invalidates this request generation and already restores
-                // the composer/chat UI. The worker must not replay those mutations after the stop.
-                val userStopped = activeResponseState.state.wasUserStopped(requestGeneration)
-                val canContinueInBackground = backgroundEnabled && newId != null &&
-                    (completionState == "in_progress" || completionState == "disconnected") && !userStopped &&
-                    !ResponsesStreamFailurePolicy.isUnrecoverable(e) &&
-                    activeResponsePersistence.getActiveResponse(requestChatId)?.optString("request_id") == localRequestId
-                val latency=SystemClock.elapsedRealtime()-startedAt
-                if(!canContinueInBackground && (!cancelled || userStopped)){
-                    recordOpenAiEffortMetricSafely { chatDb.recordEffortMetric(localRequestId, requestChatId, taskClass, effortPref, actualEffort, autoSelected, text.length, requestFileIds.size + if(requestImageFileId!=null) 1 else 0, latency, 0,0,0,0,0, false, if(cancelled) "cancelled" else e.javaClass.simpleName) }
-                }
-                var durablePartial: JSONObject? = null
-                if (!canContinueInBackground && !userStopped) {
-                    val toolCheckpoint = chatDb.getOpenAiToolCheckpoint(requestChatId, localRequestId)
-                    val failureStatus = if (toolCheckpoint != null && toolCheckpoint.optString("phase") != "finished") "failed"
-                        else responseState.terminalState?.wireStatus
-                            ?: if (completionState == "disconnected" || cancelled) "disconnected" else "failed"
-                    val durableToolTerminal = toolCheckpoint?.takeIf { it.optString("phase") == "finished" }
-                        ?.let(OpenAiLocalFileToolBridge::durableResponse)
-                    val effectiveResponse = durableToolTerminal
-                        ?: OpenAiEffectiveResponse.assemble(completedResponse, responseState)
-                    OpenAiLocalFileToolBridge.attachReceivedPrefix(chatDb, requestChatId, localRequestId, effectiveResponse)
-                    val parsedPartial = AstraResponseModel.fromResponse(
-                        effectiveResponse,
-                        if (durableToolTerminal != null) OpenAiSseStreamReader.terminalOutputText(effectiveResponse)
-                        else responseState.text.ifBlank { OpenAiSseStreamReader.terminalOutputText(effectiveResponse) },
-                        localRequestId, failureStatus, (e.message ?: failureStatus).take(1200)
-                    )
-                    val partialModel = parsedPartial.copy(
-                        id = newId ?: parsedPartial.id,
-                        tools = (parsedPartial.tools + toolItems).distinct(),
-                        reasoningSummary = parsedPartial.reasoningSummary?.takeIf { it.isNotBlank() }
-                            ?: responseState.reasoningSummary.takeIf { it.isNotBlank() }
-                    )
-                    val assistant = partialModel.toChatJson()
-                        .put("incomplete", true)
-                        .put("provider", "openai")
-                        .put("requested_model", model)
-                        .put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, openAiInstructionFingerprint)
-                    effectiveResponse.optJSONArray("output")?.let {
-                        assistant.put("openai_protocol_output", JSONArray(it.toString()))
-                    }
-                    partialModel.usage?.let { assistant.put("usage", JSONObject(it.toString())) }
-                    val savedPartialImages = saveGeneratedImages(partialModel.generatedImageResults)
-                    if (savedPartialImages.length() > 0) assistant.put("generated_images", savedPartialImages)
-                    OpenAiRawSseArchive.attachToMessage(assistant, filesDir, requestChatId, localRequestId)
-                    val compactTelemetry = attachOpenAiCompletionMetadata(assistant, effectiveResponse,
-                        requestChatId, localRequestId, initialFileIo)
-                    val claimed = chatDb.finalizeCurrentChatIfActiveRequest(
-                        requestChatId, "", null, null, listOf(assistant), localRequestId
-                    )
-                    if (claimed) {
-                        durablePartial = assistant
-                        ResponseNotifications.finished(applicationContext, requestChatId, localRequestId, false)
-                        chatDb.recordRequestAccounting(
-                            chatId = requestChatId, localRequestId = localRequestId,
-                            status = failureStatus, responseId = newId,
-                            httpRequestId = requestId, usage = assistant.optJSONObject("usage"),
-                            error = (e.message ?: e.toString()).take(1200),
-                            telemetrySummary = compactTelemetry
-                        )
-                        chatDb.recordRequestEvent(
-                            chatId = requestChatId, eventType = "request_failed",
-                            requestId = localRequestId, provider = "openai",
-                            requestedModel = model, responseModel = null,
-                            modelMatch = ModelCatalog.Match.UNKNOWN,
-                            status = failureStatus, latencyMs = latency,
-                            error = (e.message ?: e.toString()).take(1200),
-                            telemetrySummary = compactTelemetry
-                        )
-                    }
-                }
-                diagnostics.log(
-                    when {
-                        canContinueInBackground -> "stream_disconnected_background_continues"
-                        cancelled && userStopped -> "request_cancelled"
-                        cancelled -> "stream_disconnected"
-                        else -> "request_failed"
-                    },
-                    mapOf("request_id" to requestId, "response_id" to newId, "chat_id" to requestChatId, "generation" to requestGeneration, "latency_ms" to latency, "error" to (e.message ?: e.toString()).take(512))
-                )
-                if (userStopped) {
-                    return@execute
-                }
-                if(canContinueInBackground){
-                    val active=try{activeResponsePersistence.getActiveResponse(requestChatId)}catch(_:Exception){null}
-                    if(!activityVisible && newId!=null){
-                        BackgroundResponseWorkScheduler.enqueueImmediate(
-                            applicationContext,
-                            requestChatId,
-                            newId!!,
-                            localRequestId
-                        )
-                    } else if(activityVisible && active!=null){
-                        runOnUiThread{
-                            if(isRequestCurrent(requestChatId,requestGeneration)){
-                                currentCall=null
-                                status.text="Соединение прервалось — генерация продолжается…"
-                                activeAssistantItemId?.let { id ->
-                                    val partial=responseState.text
-                                    if(partial.isNotBlank()) messageAdapter.updateText(id, partial)
-                                }
-                                setBusy(true)
-                            }
-                        }
-                        if(active!=null){
-                            // The primary reader has exited its response.use
-                            // before this catch handoff. Release its registry
-                            // lease before entering the replacement GET reader.
-                            OpenAiCreateCallOwners.release(requestChatId, localRequestId, ownedCreateCall)
-                            streamBackgroundResponse(
-                                active,
-                                BackgroundResponseUiSnapshot(
-                                    chatId = requestChatId,
-                                    generation = requestGeneration,
-                                    assistantItemId = assistantItemId
-                                )
-                            )
-                        }
-                    }
-                    return@execute
-                }
-                runOnUiThread{
-                    if(!isRequestCurrent(requestChatId,requestGeneration)) {
-                        if (activityVisible && !isDestroyed) renderRequestTelemetry()
-                        return@runOnUiThread
-                    }
-                    setBusy(false)
-                    activeAssistantItemId=null
-                    renderRequestTelemetry()
-                    currentCall=null
-                    durablePartial?.let { saved ->
-                        chat.add(saved)
-                        refreshLocalEvidenceEligibility()
-                        val item = activeAssistantItemId ?: assistantItemId
-                        messageAdapter.replaceItem(
-                            item,
-                            ChatBubbleItem.create(
-                                id = item,
-                                label = AssistantModelLabel.text(saved),
-                                text = JsonProtocol.string(saved, "text"),
-                                user = false,
-                                message = saved,
-                                chatIndex = chat.lastIndex
-                            )
-                        )
-                        status.text = "Ответ сохранён как неполный · " + saved.optString("status")
-                    }
-                    if(cancelled && userStopped){
-                        activeResponsePersistence.clearActiveResponse(requestChatId, expectedRequestId = localRequestId)
-                        if(chat.isNotEmpty() && chat.lastOrNull()?.optString("role")=="user" && !regenerate){
-                            chat.removeAt(chat.lastIndex)
-                            persistCurrentChat()
-                        }
-                        messageAdapter.removeLast(if(regenerate) 1 else 2)
-                        if(!regenerate){
-                            input.setText(text); input.setSelection(input.text.length)
-                        }
-                        attachedFileIds.clear(); attachedFileIds.addAll(requestFileIds)
-                        attachedFileNames.clear(); attachedFileNames.addAll(requestFileNames)
-                        attachedFileSizes.clear(); attachedFileSizes.addAll(requestFileSizes)
-                        attachedFilePaths.clear(); attachedFilePaths.addAll(requestFilePaths)
-                        attachedFileMimes.clear(); attachedFileMimes.addAll(requestFileMimes)
-                        while(attachedFilePaths.size<attachedFileIds.size)attachedFilePaths.add("")
-                        while(attachedFileMimes.size<attachedFileIds.size)attachedFileMimes.add("")
-                        pendingImagePath=requestImagePath
-                        pendingImageName=JsonProtocol.string(sentUserMessage, "image_name").takeIf{it.isNotBlank()}
-                        pendingImageMime=JsonProtocol.string(sentUserMessage, "image_mime").takeIf{it.isNotBlank()}
-                        pendingImageSize=sentUserMessage.optLong("image_size",0L)
-                        refreshAttachChips()
-                        persistComposerStateNow()
-                        status.text="Остановлено — сообщение и вложения возвращены в поле ввода"
-                    } else {
-                        activeResponsePersistence.clearActiveResponse(requestChatId, expectedRequestId = localRequestId)
-                        if (durablePartial == null) {
-                            val friendly = friendlyApiError(e.message)
-                            status.text="Ошибка"
-                            addBubble("Ошибка",friendly,false)
-                        }
-                    }
-                }
-            } finally {
-                OpenAiCreateCallOwners.release(requestChatId, localRequestId, ownedCreateCall)
-                destroyedCallbackCleanup.close()
-            }
+            } finally { scope.close(); if (!handedToUi) releasePreparedFiles(preparedFiles) }
         }
-        }
-
-        // A non-chain request must replay every available local turn as typed
-        // input, not just text-only prior messages. The encoder checks original
-        // attachment bytes and fails explicitly rather than silently dropping them.
-        val chatOwnedLocalArtifacts = try {
-            chatDb.listLocalFiles(requestChatId)
-        } catch (_: Exception) {
-            emptyList()
-        }
-        val localToolsEnabled = !fileAnalysisEnabled && ContextRequestPolicy.localToolCandidates(capturedFileHistory, chatOwnedLocalArtifacts)
-        val typedHistoryNeeded = (!usableOpenAiChain && chat.isNotEmpty()) ||
-            requestOpenRouterAttachments.isNotEmpty() || localToolsEnabled
-        val hasFilesForAnalysis = capturedFileHistory.any { m ->
-            if (m.optString("role") != "user") false
-            else {
-                val hasIds = (m.optJSONArray("file_ids")?.length() ?: 0) > 0
-                val atts = m.optJSONArray("attachments")
-                val hasNonImageAtts = atts != null && (0 until atts.length()).any { idx ->
-                    val kind = atts.optJSONObject(idx)?.optString("kind").orEmpty()
-                    kind.isNotBlank() && kind != "image"
-                }
-                hasIds || hasNonImageAtts
-            }
-        }
-        if (typedHistoryNeeded || (fileAnalysisEnabled && hasFilesForAnalysis)) {
-            val historySnapshot = capturedFileHistory
-            pendingOpenAiPreparation.set(localRequestId)
-            setBusy(true)
-            status.text = "Проверяю локальные файлы и готовлю контекст OpenAI…"
-            val preparedFiles = PreparedAttachmentFiles.lease(this)
-            executor.execute {
-                val scope = preparedFiles.capture()
-                var handedToUi = false
-                try {
-                    openAiPreparationHook?.invoke()
-                    historySnapshot.filter { JsonProtocol.string(it, "role") == "user" }.forEach { message ->
-                        chatDb.cachedAttachmentManifest(requestChatId, message)?.let { message.put("attachments", it) }
-                    }
-                    OpenAiLocalContextEncoder.materialize(historySnapshot, fileAnalysisEnabled, this@MainActivity) { before, after ->
-                        chatDb.updateMessageAttachments(requestChatId, before, after, false)
-                    }
-                    val containerFiles = if (fileAnalysisEnabled && hasFilesForAnalysis) OpenAiFileAnalysis.prepare(historySnapshot,
-                        { isRequestCurrent(requestChatId, requestGeneration) && pendingOpenAiPreparation.get() == localRequestId },
-                        { file, filename, mime ->
-                            val ownerActive = { isRequestCurrent(requestChatId, requestGeneration) && pendingOpenAiPreparation.get() == localRequestId }
-                            if (mime.startsWith("image/")) uploadImageFile(file.path, filename, credential = key, mimeOverride = mime, active = ownerActive)
-                            else uploadLocalUserFile(file, filename, mime, credential = key, active = ownerActive).id
-                        }) else emptyMap()
-                    val prepared = if (typedHistoryNeeded) OpenAiLocalContextEncoder.encode(
-                        if (usableOpenAiChain) historySnapshot.takeLast(1) else historySnapshot,
-                        containerFiles, allowLegacyVisibleTextOnly, this@MainActivity, localFileTools = localToolsEnabled
-                    ) { before, after ->
-                        chatDb.updateMessageAttachments(requestChatId, before, after, false)
-                    } else null
-                    val preparedToolAttachments = if (localToolsEnabled) {
-                        OpenAiLocalFileToolBridge.attachments(historySnapshot, chatOwnedLocalArtifacts, requestChatId, this@MainActivity, chatDb)
-                    } else emptyList()
-                    if (localToolsEnabled && prepared != null) {
-                        val parts = prepared.optJSONObject(prepared.length() - 1)?.optJSONArray("content")
-                        val alreadyEncodedIds = OpenAiLocalFileToolBridge.attachments(
-                            if (usableOpenAiChain) historySnapshot.takeLast(1) else historySnapshot
-                        ).map { it.id }.toSet()
-                        preparedToolAttachments.filter { it.id !in alreadyEncodedIds }.forEach { file ->
-                            parts?.put(JSONObject().put("type", "input_text").put("text", LocalFileTools.descriptor(file)
-                                .put("reading", "Use search_attached_file, read_attached_file or read_attached_table with this file_id.").toString()))
-                        }
-                    }
-                    handedToUi = true
-                    runOnUiThread {
-                        try {
-                        if (isRequestCurrent(requestChatId, requestGeneration) &&
-                            pendingOpenAiPreparation.compareAndSet(localRequestId, null)) {
-                            historySnapshot.last().optJSONArray("attachments")?.let { sentUserMessage.put("attachments", JsonProtocol.arrayCopy(it)) }
-                            commitPreparedOpenAi(prepared, containerFiles, preparedToolAttachments)
-                        }
-                        } finally { releasePreparedFiles(preparedFiles) }
-                    }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        if (isRequestCurrent(requestChatId, requestGeneration) &&
-                            pendingOpenAiPreparation.compareAndSet(localRequestId, null)) {
-                            setBusy(false)
-                            status.text = "Не отправлено: " +
-                                (e.message ?: "недоступны локальные вложения") +
-                                ". Черновик и исходные файлы сохранены."
-                            diagnostics.log("openai_context_preflight_failed", mapOf(
-                                "chat_id" to requestChatId,
-                                "request_id" to localRequestId,
-                                "error_type" to e.javaClass.simpleName
-                            ))
-                        }
-                    }
-                } finally { scope.close(); if (!handedToUi) releasePreparedFiles(preparedFiles) }
-            }
-        } else {
-            commitPreparedOpenAi(null)
-        }
-
-    }
-
-    private fun JSONArray.toJsonArray(): JSONArray = JSONArray(toString())
-
-    private fun friendlyApiError(raw:String?):String{
-        val text=raw.orEmpty()
-        if(text.isBlank()) return "Неизвестная ошибка API"
-        val jsonStart=text.indexOf('{')
-        if(jsonStart>=0){
-            try{
-                val obj=JSONObject(text.substring(jsonStart))
-                val err=obj.optJSONObject("error")
-                val msg=err?.optString("message")?.takeIf{it.isNotBlank()}
-                if(msg!=null) return msg
-            }catch(_:Exception){}
-        }
-        return text.lineSequence().firstOrNull()?.take(500) ?: "Ошибка запроса"
     }
 
 
@@ -4320,102 +2998,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         else->key
     }
 
-    private fun updateToolState(key:String,state:String, chatId:String?=null, generation:Long?=null){
-        if(chatId!=null && generation!=null && !isRequestCurrent(chatId,generation)) return
-        toolStates[key]=state
-        runOnUiThread {
-            if(chatId==null || generation==null || isRequestCurrent(chatId,generation)) renderToolActivity()
-        }
-    }
-
-    private fun recordOpenAiEffortMetricSafely(write: () -> Unit) {
-        try {
-            openAiEffortMetricHook?.invoke()
-            write()
-        } catch (error: Exception) {
-            // Effort telemetry is optional. It must not crash the exception path
-            // before the paid partial/source and request accounting are saved.
-            diagnostics.log("openai_effort_metric_failed", mapOf("error_type" to error.javaClass.simpleName))
-        }
-    }
-
-    private fun watchOriginalCreateAfterRecreate(chatId: String, requestId: String) {
-        val token = Any()
-        if (preIdCreateWatches.putIfAbsent(chatId, token) != null) return
-        val generation = activeResponseState.state.generation
-        val assistantItem = activeAssistantItemId
-        executor.execute {
-            try {
-                // onDestroy closed the old socket, but parsed/archived bytes can
-                // still be finishing their owned transaction. Observe its exit;
-                // never create a response or touch the old Activity's views.
-                while (OpenAiCreateCallOwners.isRegistered(chatId, requestId) &&
-                    activityVisible && !executor.isShutdown &&
-                    activeResponseState.state.generation == generation &&
-                    preIdCreateWatches[chatId] === token) {
-                    Thread.sleep(50L)
-                }
-                if (preIdCreateWatches[chatId] === token) {
-                    reconcileOriginalCreateUi(chatId, requestId, generation, assistantItem)
-                }
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            } finally {
-                preIdCreateWatches.remove(chatId, token)
-            }
-        }
-    }
-
-    private fun reconcileOriginalCreateUi(
-        chatId: String, requestId: String, generation: Long, assistantItem: String?
-    ) {
-        runOnUiThread {
-            if (!isRequestCurrent(chatId, generation) || activeAssistantItemId != assistantItem) return@runOnUiThread
-            val active = activeResponsePersistence.getActiveResponse(chatId)
-            if (active != null && JsonProtocol.string(active, "request_id") != requestId) return@runOnUiThread
-            persistComposerStateNow()
-            restoreCurrentChat()
-            renderRequestTelemetry()
-            if (active != null && JsonProtocol.string(active, "response_id").isNotBlank()) {
-                resumeBackgroundResponses()
-            }
-        }
-    }
-
-    private fun cancelUnownedOpenAiResponse(
-        chatId: String, requestId: String, responseId: String, credential: String,
-        inline: Boolean = false
-    ) {
-        // The original credential stays in memory; never persist it. Late-ID
-        // cancellation runs on the existing IO thread, even after onDestroy.
-        val cancel = Runnable {
-            // onDestroy interrupted Create, not this compensating /cancel.
-            // Okio would otherwise reject reading the already-paid usage body.
-            // Preserve cancellation for the caller after this bounded operation.
-            val createWasInterrupted = inline && Thread.interrupted()
-            try {
-                if (credential.isBlank()) return@Runnable
-                ChatDatabase(applicationContext).use { db ->
-                    db.captureStoppedOpenAiResponseId(chatId, requestId, responseId)
-                    val result = OpenAiCancelReconciler(pollingClient).reconcile(responseId, credential) { snapshot ->
-                        db.reconcileStoppedOpenAiResponse(chatId, requestId, responseId, snapshot)
-                    }
-                    diagnostics.log("background_response_cancel_reconciled", mapOf(
-                        "chat_id" to chatId, "response_id" to responseId,
-                        "cancel_http_status" to result.cancelStatus,
-                        "retrieve_count" to result.retrievals,
-                        "provider_status" to result.terminalStatus, "usage_present" to result.hasUsage,
-                        "decoder_diagnostic" to result.decoderDiagnostic))
-                }
-            } catch (error: Exception) {
-                diagnostics.log("background_response_cancel_failed", mapOf(
-                    "chat_id" to chatId, "response_id" to responseId, "error_type" to error.javaClass.simpleName))
-            } finally {
-                if (createWasInterrupted) Thread.currentThread().interrupt()
-            }
-        }
-        if (inline) cancel.run() else executor.execute(cancel)
-    }
 
     private fun renderToolActivity(){
         if(!::toolLabel.isInitialized)return
@@ -4427,728 +3009,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         toolLabel.text=text
     }
 
-    private fun handleToolEventType(type:String, chatId:String?=null, generation:Long?=null){
-        val m=Regex("^response\\.([a-z_]+)_call\\.(.+)$").find(type) ?: return
-        val key=when(m.groupValues[1]){
-            "web_search"->"web_search"
-            "file_search"->"file_search"
-            "code_interpreter"->"code_interpreter"
-            "image_generation"->"image_generation"
-            "computer"->"computer"
-            else->return
-        }
-        val state=m.groupValues[2]
-        when {
-            state.contains("in_progress") || state.contains("running") || state.contains("searching") || state.contains("queued") -> updateToolState(key,"running",chatId,generation)
-            state.contains("completed") -> updateToolState(key,"completed",chatId,generation)
-            state.contains("failed") -> updateToolState(key,"failed",chatId,generation)
-        }
-    }
-
-
-    private fun resumeBackgroundResponses(){
-        val active=try{activeResponsePersistence.listActiveResponses()}catch(_:Exception){emptyList()}
-        active.forEach { a ->
-            val chatId=a.optString("chat_id")
-            val requestId=a.optString("request_id").takeIf{it.isNotBlank() && it!="null"}
-            val responseId=a.optString("response_id").takeIf{it.isNotBlank() && it!="null"}
-            if (requestId != null && chatDb.listRequestAccounting(chatId).any { it.optString("local_request_id") == requestId && it.optString("provider") == "openrouter" }) return@forEach
-            // A closed socket may still own parsed bytes and its final SQLite
-            // transaction. Neither foreground cleanup nor another resume may
-            // discard that owner while the original callback is finishing.
-            if (requestId != null && OpenAiCreateCallOwners.isRegistered(chatId, requestId)) {
-                if (chatId == currentChatId() &&
-                    (currentCall == null || OpenAiCreateCallOwners.call(chatId, requestId) !== currentCall)) {
-                    watchOriginalCreateAfterRecreate(chatId, requestId)
-                }
-                return@forEach
-            }
-            if (!a.optBoolean("background_enabled", true)) {
-                if (requestId == null) return@forEach
-                val generation = activeResponseState.state.generation
-                val assistantItem = activeAssistantItemId
-                executor.execute {
-                    val resumeLease = OpenAiCreateCallOwners.acquireResume(chatId, requestId) ?: return@execute
-                    try {
-                        val current = activeResponsePersistence.getActiveResponse(chatId) ?: return@execute
-                        if (JsonProtocol.string(current, "request_id") != requestId ||
-                            OpenAiCreateCallOwners.isRegistered(chatId, requestId)) return@execute
-                        val terminal = try {
-                            OpenAiLocalFileToolBridge.durableTerminal(chatDb, chatId, requestId, ResponseIndexedCheckpoint.restore(current).terminalResponse)
-                        } catch (error: UnrecoverableResponsesCheckpointException) {
-                            failUnrecoverableBackgroundCheckpoint(chatId,
-                                JsonProtocol.string(current, "response_id"), requestId, error, null)
-                            return@execute
-                        }
-                        if (terminal != null) {
-                            // Received terminal output needs local finalization,
-                            // even when network/background recovery is disabled.
-                            finalizeBackgroundResponse(current, terminal, null)
-                        } else {
-                            BackgroundRequestFailureRecorder.persist(chatDb, chatId, requestId,
-                                JsonProtocol.string(current, "response_id"), "disconnected",
-                                "Original connection closed; background recovery is disabled", filesDir)
-                        }
-                    } finally {
-                        OpenAiCreateCallOwners.releaseResume(chatId, requestId, resumeLease)
-                        reconcileOriginalCreateUi(chatId, requestId, generation, assistantItem)
-                    }
-                }
-                diagnostics.log("background_recovery_disabled", mapOf(
-                    "chat_id" to chatId,
-                    "request_id" to requestId,
-                    "response_id" to responseId
-                ))
-                return@forEach
-            }
-            if(responseId==null){
-                val startedAt=a.optLong("started_at",0L)
-                val age=System.currentTimeMillis()-startedAt
-                if(requestId!=null && startedAt>0L && age>120_000L &&
-                    !OpenAiCreateCallOwners.isRegistered(chatId, requestId)){
-                    val generation = activeResponseState.state.generation
-                    val assistantItem = activeAssistantItemId
-                    if (BackgroundRequestFailureRecorder.persist(chatDb, chatId, requestId, "",
-                            "unknown", "Original connection lost before response ID", filesDir)) {
-                        reconcileOriginalCreateUi(chatId, requestId, generation, assistantItem)
-                    }
-                    diagnostics.log("background_response_orphaned",mapOf("chat_id" to chatId,"request_id" to requestId,"age_ms" to age))
-                }
-                if (requestId != null && chatId == currentChatId() &&
-                    (currentCall == null || OpenAiCreateCallOwners.call(chatId, requestId) !== currentCall)) {
-                    watchOriginalCreateAfterRecreate(chatId, requestId)
-                }
-                return@forEach
-            }
-            val uiSnapshot = if (chatId == currentChatId()) {
-                activeAssistantItemId?.let { itemId ->
-                    BackgroundResponseUiSnapshot(
-                        chatId = chatId,
-                        generation = activeResponseState.state.generation,
-                        assistantItemId = itemId
-                    )
-                }
-            } else {
-                null
-            }
-            synchronized(activeResumeChats){
-                if(!activeResumeChats.add(chatId)) return@forEach
-            }
-            if(chatId==currentChatId()) {
-                activeAssistantItemId?.let { id ->
-                    if(JsonProtocol.string(a, "text").isNotBlank()) messageAdapter.updateText(id, JsonProtocol.string(a, "text"))
-                }
-                runOnUiThread{
-                    status.text="Продолжается генерация…"
-                    toolStates.clear()
-                    renderToolActivity()
-                }
-            }
-            executor.execute{
-                try{
-                    streamBackgroundResponse(a, uiSnapshot)
-                }finally{
-                    synchronized(activeResumeChats){activeResumeChats.remove(chatId)}
-                }
-            }
-        }
-    }
-
-    private fun streamBackgroundResponse(active: JSONObject, uiSnapshot: BackgroundResponseUiSnapshot?) {
-        val chatId = active.optString("chat_id")
-        var responseId = active.optString("response_id")
-        val requestId = active.optString("request_id").takeIf { it.isNotBlank() && it != "null" } ?: return
-        if (chatId.isBlank() || responseId.isBlank()) return
-
-        val requestStartedAt = active.optLong("started_at", -1L)
-        var retryDelayMs = 1_500L
-        var resumeLease: Any? = null
-
-        try {
-        while (!executor.isShutdown) {
-            if (!activityVisible) {
-                BackgroundResponseWorkScheduler.enqueueImmediate(applicationContext, chatId, responseId, requestId)
-                return
-            }
-
-            val current = try { activeResponsePersistence.getActiveResponse(chatId) } catch (_: Exception) { null }
-            if (current?.optString("request_id") != requestId) return
-            if (OpenAiCreateCallOwners.isRegistered(chatId, requestId)) return
-            if (resumeLease == null) {
-                resumeLease = OpenAiCreateCallOwners.acquireResume(chatId, requestId)
-                if (resumeLease == null) {
-                    try { Thread.sleep(100L) } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt(); return
-                    }
-                    continue
-                }
-            }
-            if (!current.optBoolean("background_enabled", true)) {
-                activeResponsePersistence.clearActiveResponse(chatId, expectedRequestId = requestId)
-                return
-            }
-            responseId = current.optString("response_id").ifBlank { responseId }
-            val cursor = current.optLong("last_sequence_number", -1L)
-            var responseState = try {
-                ResponseIndexedCheckpoint.restore(current)
-            } catch (e: UnrecoverableResponsesCheckpointException) {
-                failUnrecoverableBackgroundCheckpoint(chatId, responseId, requestId, e, uiSnapshot)
-                return
-            }
-            // A paid terminal event was checkpointed but the app crashed before
-            // the one-shot final commit. Finalize locally; never resume or
-            // regenerate an already completed provider response.
-            val durableTerminal = OpenAiLocalFileToolBridge.durableTerminal(chatDb, chatId, requestId, responseState.terminalResponse)
-            if (durableTerminal != null) {
-                try {
-                    finalizeBackgroundResponse(current, durableTerminal, uiSnapshot)
-                } catch (error: IOException) {
-                    val retryHttp = error !is ApiHttpException ||
-                        BackgroundRecoveryPolicy.actionForHttpStatus(error.statusCode) == BackgroundRecoveryAction.RETRY
-                    if (!ResponsesStreamFailurePolicy.isUnrecoverable(error) && retryHttp &&
-                        chatDb.getOpenAiToolCheckpoint(chatId, requestId)?.optString("phase") == "waiting") {
-                        try { Thread.sleep(BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs)) }
-                        catch (_: InterruptedException) { Thread.currentThread().interrupt(); return }
-                        retryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(retryDelayMs)
-                        continue
-                    }
-                    finishBackgroundRecovery(chatId, error.message.orEmpty(), requestId, uiSnapshot)
-                }
-                return
-            }
-            if (ResponseDeadlinePolicy.remainingMillis(requestStartedAt, System.currentTimeMillis()) <= 0L) {
-                finishBackgroundRecovery(chatId, "Истёк сквозной лимит ответа (5 часов)", requestId, uiSnapshot)
-                return
-            }
-            var lastSequence = cursor
-            var lastCheckpointAt = SystemClock.elapsedRealtime()
-
-            try {
-                val result = resumableResponseClient.stream(
-                    responseId = responseId,
-                    startingAfter = cursor,
-                    ownerChatId = chatId,
-                    ownerRequestId = requestId,
-                    onCallCreated = { call -> activeResumeCalls[chatId] = call },
-                    startedAtEpochMs = requestStartedAt
-                ) { event ->
-                    val sequence = event.optLong("sequence_number", -1L)
-                    if (sequence >= 0L) {
-                        lastSequence = sequence
-                    }
-
-                    val responseDecision = ResponseEventReducer.reduce(responseState, event)
-                    responseState = responseDecision.state
-
-                    if (responseDecision.textChanged) {
-                        uiSnapshot?.let { snapshot ->
-                            runOnUiThread {
-                                val currentUiOwnership = BackgroundResponseUiOwnershipState(
-                                    chatId = currentChatId(),
-                                    generation = activeResponseState.state.generation,
-                                    assistantItemId = activeAssistantItemId,
-                                    activityVisible = activityVisible,
-                                    finishing = isFinishing
-                                )
-                                if (BackgroundResponseUiOwnershipPolicy.shouldApply(snapshot, currentUiOwnership)) {
-                                    messageAdapter.updateText(snapshot.assistantItemId, responseState.text)
-                                    scrollToLatest()
-                                }
-                            }
-                        }
-                    }
-
-                    if (responseDecision.reasoningChanged) {
-                        uiSnapshot?.let { snapshot ->
-                            runOnUiThread {
-                                val currentUiOwnership = BackgroundResponseUiOwnershipState(
-                                    chatId = currentChatId(),
-                                    generation = activeResponseState.state.generation,
-                                    assistantItemId = activeAssistantItemId,
-                                    activityVisible = activityVisible,
-                                    finishing = isFinishing
-                                )
-                                if (BackgroundResponseUiOwnershipPolicy.shouldApply(snapshot, currentUiOwnership)) {
-                                    updateActiveReasoningSummary(
-                                        assistantItemId = snapshot.assistantItemId,
-                                        summary = responseState.reasoningSummary
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    when (event.optString("type")) {
-                        "response.output_text.delta" -> Unit
-                        "response.reasoning_summary_text.delta" -> Unit
-                    }
-
-                    uiSnapshot?.let { snapshot ->
-                        when (event.optString("type")) {
-                            "response.web_search_call.in_progress",
-                            "response.web_search_call.searching" -> updateToolState("web_search", "running", chatId, snapshot.generation)
-                            "response.web_search_call.completed" -> updateToolState("web_search", "completed", chatId, snapshot.generation)
-                            "response.web_search_call.failed" -> updateToolState("web_search", "failed", chatId, snapshot.generation)
-                            "response.file_search_call.in_progress" -> updateToolState("file_search", "running", chatId, snapshot.generation)
-                            "response.file_search_call.completed" -> updateToolState("file_search", "completed", chatId, snapshot.generation)
-                            "response.file_search_call.failed" -> updateToolState("file_search", "failed", chatId, snapshot.generation)
-                            "response.code_interpreter_call.in_progress" -> updateToolState("code_interpreter", "running", chatId, snapshot.generation)
-                            "response.code_interpreter_call.completed" -> updateToolState("code_interpreter", "completed", chatId, snapshot.generation)
-                            "response.code_interpreter_call.failed" -> updateToolState("code_interpreter", "failed", chatId, snapshot.generation)
-                            "response.image_generation_call.in_progress" -> updateToolState("image_generation", "running", chatId, snapshot.generation)
-                            "response.image_generation_call.completed" -> updateToolState("image_generation", "completed", chatId, snapshot.generation)
-                            "response.image_generation_call.failed" -> updateToolState("image_generation", "failed", chatId, snapshot.generation)
-                            "response.computer_call.in_progress" -> updateToolState("computer", "running", chatId, snapshot.generation)
-                            "response.computer_call.completed" -> updateToolState("computer", "completed", chatId, snapshot.generation)
-                            "response.computer_call.failed" -> updateToolState("computer", "failed", chatId, snapshot.generation)
-                        }
-                    }
-
-                    val now = SystemClock.elapsedRealtime()
-                    val checkpoint = ResponseCheckpointPolicy.decide(
-                        state = responseState,
-                        responseId = responseId,
-                        lastSequenceNumber = lastSequence,
-                        nowElapsedMs = now,
-                        lastCheckpointElapsedMs = lastCheckpointAt,
-                        checkpointIntervalMs = 500L
-                    )
-                    if (checkpoint.shouldPersist ||
-                        event.optString("type") == "response.output_item.done") {
-                        lastCheckpointAt = now
-                        activeResponsePersistence.updateActiveResponse(
-                            chatId,
-                            responseId = checkpoint.responseId,
-                            text = checkpoint.text,
-                            status = checkpoint.status,
-                            lastSequenceNumber = checkpoint.lastSequenceNumber,
-                            indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                            expectedRequestId = requestId
-                        )
-                    }
-                }
-
-                activeResumeCalls.remove(chatId)
-                val latest = try { activeResponsePersistence.getActiveResponse(chatId) } catch (_: Exception) { null }
-                if (latest?.optString("request_id") != requestId) return
-
-                if (result.terminalResponse != null) {
-                    activeResponsePersistence.updateActiveResponse(
-                        chatId,
-                        responseId = responseId,
-                        text = responseState.text,
-                        status = responseState.terminalState?.wireStatus ?: "failed",
-                        lastSequenceNumber = maxOf(lastSequence, result.lastSequenceNumber),
-                        indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                        expectedRequestId = requestId
-                    )
-                    finalizeBackgroundResponse(
-                        activeResponsePersistence.getActiveResponse(chatId) ?: active,
-                        result.terminalResponse!!,
-                        uiSnapshot
-                    )
-                    return
-                }
-
-                activeResponsePersistence.updateActiveResponse(
-                    chatId,
-                    responseId = responseId,
-                    text = responseState.text,
-                    status = "in_progress",
-                    lastSequenceNumber = maxOf(lastSequence, result.lastSequenceNumber),
-                    indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState),
-                    expectedRequestId = requestId
-                )
-
-                if (ResponseDeadlinePolicy.remainingMillis(requestStartedAt, System.currentTimeMillis()) <= 0L) {
-                    finishBackgroundRecovery(
-                        chatId,
-                        "Фоновое восстановление приостановлено — попробуйте открыть приложение позже",
-                        requestId, uiSnapshot
-                    )
-                    return
-                }
-
-                if (!sleepBackgroundRetry(BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs))) return
-                retryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(retryDelayMs)
-            } catch (e: UnrecoverableResponsesStreamException) {
-                activeResumeCalls.remove(chatId)
-                failUnrecoverableBackgroundStream(chatId, responseId, requestId, e, uiSnapshot)
-                return
-            } catch (e: UnrecoverableResponsesCheckpointException) {
-                activeResumeCalls.remove(chatId)
-                failUnrecoverableBackgroundCheckpoint(chatId, responseId, requestId, e, uiSnapshot)
-                return
-            } catch (e: ResponseStreamSequenceGapException) {
-                activeResumeCalls.remove(chatId)
-                diagnostics.log("background_resume_sequence_gap", mapOf(
-                    "chat_id" to chatId,
-                    "response_id" to responseId,
-                    "request_id" to requestId,
-                    "expected_sequence_number" to e.expectedSequenceNumber,
-                    "received_sequence_number" to e.receivedSequenceNumber
-                ))
-                if (!sleepBackgroundRetry(BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs))) return
-                retryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(retryDelayMs)
-            } catch (e: ApiHttpException) {
-                activeResumeCalls.remove(chatId)
-                when (e.statusCode) {
-                    401, 403 -> {
-                        diagnostics.log("background_resume_auth_failed", mapOf(
-                            "chat_id" to chatId,
-                            "response_id" to responseId,
-                            "status" to e.statusCode
-                        ))
-                        finishBackgroundRecovery(chatId, "Не удалось восстановить ответ: проверьте API-ключ", requestId, uiSnapshot)
-                        return
-                    }
-                    404, 410 -> {
-                        diagnostics.log("background_resume_response_gone", mapOf(
-                            "chat_id" to chatId,
-                            "response_id" to responseId,
-                            "status" to e.statusCode
-                        ))
-                        finishBackgroundRecovery(chatId, "Фоновый ответ больше недоступен", requestId, uiSnapshot)
-                        return
-                    }
-                    429 -> {
-                        val waitMs = e.retryAfterMs?.coerceIn(1_000L, 300_000L)
-                            ?: BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs.coerceAtMost(60_000L))
-                        diagnostics.log("background_resume_rate_limited", mapOf(
-                            "chat_id" to chatId,
-                            "response_id" to responseId,
-                            "retry_after_ms" to waitMs
-                        ))
-                        if (!sleepBackgroundRetry(waitMs)) return
-                    }
-                    in 500..599 -> {
-                        diagnostics.log("background_resume_server_error", mapOf(
-                            "chat_id" to chatId,
-                            "response_id" to responseId,
-                            "status" to e.statusCode
-                        ))
-                        if (!sleepBackgroundRetry(BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs))) return
-                    }
-                    else -> {
-                        finishBackgroundRecovery(chatId, "Не удалось восстановить ответ (HTTP " + e.statusCode + ")", requestId, uiSnapshot)
-                        return
-                    }
-                }
-                retryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(retryDelayMs)
-            } catch (e: Exception) {
-                activeResumeCalls.remove(chatId)
-                if (ResponsesStreamFailurePolicy.isUnrecoverable(e)) {
-                    failUnrecoverableBackgroundStream(chatId, responseId, requestId,
-                        UnrecoverableResponsesStreamException(e.message.orEmpty(), e), uiSnapshot)
-                    return
-                }
-                if (!activityVisible) {
-                    BackgroundResponseWorkScheduler.enqueueImmediate(applicationContext, chatId, responseId, requestId)
-                    return
-                }
-                diagnostics.log("background_resume_stream_failed", mapOf(
-                    "chat_id" to chatId,
-                    "response_id" to responseId,
-                    "error" to (e.message ?: e.toString()).take(400)
-                ))
-                if (ResponseDeadlinePolicy.remainingMillis(requestStartedAt, System.currentTimeMillis()) <= 0L) {
-                    finishBackgroundRecovery(
-                        chatId,
-                        "Фоновое восстановление приостановлено — попробуйте открыть приложение позже",
-                        requestId, uiSnapshot
-                    )
-                    return
-                }
-                if (!sleepBackgroundRetry(BackgroundRecoveryPolicy.jitteredDelayMs(retryDelayMs))) return
-                retryDelayMs = BackgroundRecoveryPolicy.nextDelayMs(retryDelayMs)
-            }
-        }
-        } finally {
-            resumeLease?.let { OpenAiCreateCallOwners.releaseResume(chatId, requestId, it) }
-        }
-    }
-
-
-    private fun failUnrecoverableBackgroundStream(
-        chatId: String, responseId: String, requestId: String,
-        cause: UnrecoverableResponsesStreamException,
-        uiSnapshot: BackgroundResponseUiSnapshot?
-    ) {
-        val persisted = BackgroundRequestFailureRecorder.persist(
-            chatDb, chatId, requestId, responseId, "failed", cause.message.orEmpty(), filesDir
-        )
-        if (persisted) renderOwnedBackgroundRecoveryFailure(uiSnapshot,
-            "Ответ обработан не полностью. Полученные исходные данные можно сохранить из карточки файла.")
-    }
-
-    private fun failUnrecoverableBackgroundCheckpoint(
-        chatId: String,
-        responseId: String,
-        requestId: String,
-        cause: UnrecoverableResponsesCheckpointException,
-        uiSnapshot: BackgroundResponseUiSnapshot?
-    ) {
-        diagnostics.log("background_checkpoint_unrecoverable", mapOf(
-            "chat_id" to chatId,
-            "request_id" to requestId,
-            "response_id" to responseId,
-            "error" to cause.message.orEmpty().take(300)
-        ))
-        // A one-shot owned failure preserves all locally received partial text
-        // in the chat. It does not perform a new provider Create or retry the
-        // same non-reconstructable SSE cursor.
-        val persisted = BackgroundRequestFailureRecorder.persist(
-            chatDb, chatId, requestId, responseId, "failed",
-            "unrecoverable_checkpoint: " + cause.message.orEmpty(), filesDir
-        )
-        if (persisted) renderOwnedBackgroundRecoveryFailure(uiSnapshot,
-            "Не удалось безопасно восстановить ответ; полученный текст сохранён")
-    }
-
-    /** Retry waiting is still owned by this Activity, its current child Call and the DB request. */
-    private fun waitForOpenAiToolRetry(
-        chatId: String, requestId: String, delayMs: Long, stillOwned: () -> Boolean
-    ) {
-        val waitUntil = SystemClock.elapsedRealtime() + delayMs.coerceAtLeast(0L)
-        while (true) {
-            if (!activityVisible || executor.isShutdown || Thread.currentThread().isInterrupted || !stillOwned())
-                throw CancellationException("Чтение ответа инструментов остановлено")
-            val active = chatDb.getActiveResponse(chatId)
-            if (active?.optString("request_id") != requestId) throw CancellationException("Владелец ответа изменён")
-            val remaining = ResponseDeadlinePolicy.remainingMillis(active.optLong("started_at"), System.currentTimeMillis())
-            if (remaining <= 0L) throw UnrecoverableResponsesStreamException("Истёк сквозной лимит ответа (5 часов)")
-            val delayRemaining = waitUntil - SystemClock.elapsedRealtime()
-            if (delayRemaining <= 0L) return
-            // Small slices stop backoff promptly on Stop/Delete/onStop, even if Retry-After is long.
-            try { Thread.sleep(minOf(100L, delayRemaining, remaining)) }
-            catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                throw CancellationException("Ожидание чтения ответа прервано")
-            }
-        }
-    }
-
-    private fun sleepBackgroundRetry(delayMs:Long):Boolean {
-        val actual = delayMs.coerceIn(1_000L, 300_000L)
-        return try {
-            Thread.sleep(actual)
-            true
-        } catch (_:InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-    }
-
-    private fun finishBackgroundRecovery(
-        chatId: String, message: String, requestId: String?,
-        uiSnapshot: BackgroundResponseUiSnapshot?
-    ) {
-        val owner = requestId?.takeIf { it.isNotBlank() && it != "null" } ?: return
-        val active = activeResponsePersistence.getActiveResponse(chatId) ?: return
-        if (active.optString("request_id") != owner) return
-        val latency = (System.currentTimeMillis() -
-            active.optLong("started_at", System.currentTimeMillis())).coerceAtLeast(0L)
-        // Preserve the received text, signed items and raw source in the same
-        // request-aware one-shot transaction before releasing its checkpoint.
-        if (BackgroundRequestFailureRecorder.persist(
-                chatDb, chatId, owner, JsonProtocol.string(active, "response_id"),
-                "failed", message, filesDir, latency
-            )) {
-            ResponseNotifications.finished(applicationContext, chatId, owner, false)
-            renderOwnedBackgroundRecoveryFailure(uiSnapshot, message)
-        }
-    }
-
-    private fun renderOwnedBackgroundRecoveryFailure(
-        uiSnapshot: BackgroundResponseUiSnapshot?, message: String
-    ) {
-        if (uiSnapshot == null) return
-        runOnUiThread {
-            if (!activeResponseState.state.isCurrent(
-                    uiSnapshot, currentChatId(), activeAssistantItemId, activityVisible, isFinishing)) return@runOnUiThread
-            activeAssistantItemId = null
-            currentCall = null
-            restoreCurrentChat()
-            setBusy(false)
-            status.text = message
-        }
-    }
-
-    private fun extractResponseText(response:JSONObject?):String =
-        OpenAiSseStreamReader.terminalOutputText(response)
-
-    /** Carry the aggregate marker alongside usage so finalization never treats a total as one round. */
-    private fun attachOpenAiCompletionMetadata(
-        assistant: JSONObject, response: JSONObject, chatId: String, requestId: String,
-        fileIo: FileBackedIoTelemetry.Snapshot? = null
-    ): JSONObject? {
-        val checkpoint = chatDb.getOpenAiToolCheckpoint(chatId, requestId)
-        val ledger = OpenAiUsageLedger.resolve(checkpoint, response)
-        OpenAiUsageLedger.attach(assistant, ledger)
-        val compact = FileBackedIoTelemetry.mergeCompactTelemetry(
-            toolTelemetry = OpenAiLocalFileToolBridge.extractTelemetrySummary(checkpoint),
-            fileIo = fileIo,
-            costDetails = OpenRouterUsageSnapshot.extractCostDetails(assistant.optJSONObject("usage")))
-            ?: JSONObject()
-        compact.put(OpenAiUsageLedger.FIELD, ledger)
-        val merged = FileBackedIoTelemetry.mergeTelemetryJson(
-            assistant.optJSONObject("telemetry_summary")?.toString(), compact)
-        return merged?.let { JSONObject(it).also { summary -> assistant.put("telemetry_summary", summary) } }
-    }
-
-    private fun finalizeBackgroundResponse(
-        active: JSONObject, response: JSONObject, uiSnapshot: BackgroundResponseUiSnapshot?
-    ) {
-        val chatId=active.optString("chat_id")
-        var responseId=active.optString("response_id")
-        val recovered = ResponseIndexedCheckpoint.restore(active)
-        val initialResponse = OpenAiEffectiveResponse.assemble(response, recovered)
-        val requestOwner = active.optString("request_id")
-        val effectiveResponse = OpenAiLocalFileToolBridge.finish(applicationContext, chatDb, chatId, requestOwner,
-            initialResponse, client, active = { activityVisible && !executor.isShutdown &&
-                activeResumeCalls[chatId]?.isCanceled() != true && chatDb.isActiveRequest(chatId, requestOwner) },
-            onCall = { next ->
-                activeResumeCalls[chatId] = next
-                if (!activityVisible || executor.isShutdown || !chatDb.isActiveRequest(chatId, requestOwner)) next.cancel()
-            },
-            onStatus = { progressText ->
-                runOnUiThread {
-                    if (uiSnapshot != null && activeResponseState.state.isCurrent(
-                            uiSnapshot, currentChatId(), activeAssistantItemId, activityVisible, isFinishing) &&
-                        chatDb.isActiveRequest(chatId, requestOwner)) {
-                        toolLabel.text = progressText
-                        status.text = progressText
-                    }
-                }
-            })
-        responseId = effectiveResponse.optString("id").ifBlank { responseId }
-        val state=effectiveResponse.optString("status").ifBlank{active.optString("status")}
-        val fallbackText=JsonProtocol.string(active, "text")
-        val text=if (effectiveResponse === initialResponse) fallbackText.ifBlank{extractResponseText(effectiveResponse)} else extractResponseText(effectiveResponse)
-        val requestId=active.optString("request_id").takeIf{it.isNotBlank() && it!="null"} ?: return
-        val parsedModel=AstraResponseModel.fromResponse(effectiveResponse,text,requestId,state,
-            OpenAiFileFailure.recover(applicationContext, effectiveResponse.optJSONObject("error"))
-                ?: effectiveResponse.optJSONObject("error")?.optString("message")
-                ?: effectiveResponse.optJSONObject("incomplete_details")?.optString("reason"))
-        val model=parsedModel.copy(reasoningSummary = parsedModel.reasoningSummary?.takeIf { it.isNotBlank() }
-            ?: recovered.reasoningSummary.takeIf { it.isNotBlank() })
-        val savedImages=saveGeneratedImages(model.generatedImageResults)
-        val assistant=model.toChatJson().apply{
-            put("provider", "openai")
-            effectiveResponse.optJSONArray("output")?.let { put("openai_protocol_output", JSONArray(it.toString())) }
-            model.usage?.let { put("usage", JSONObject(it.toString())) }
-            if(savedImages.length()>0)put("generated_images",savedImages)
-            if (state != "completed" || (0 until savedImages.length()).any {
-                    savedImages.optJSONObject(it)?.optString("state") != "READY"
-                }) {
-                OpenAiRawSseArchive.attachToMessage(this, filesDir, chatId, requestId)
-            }
-        }
-        val compactTelemetry = attachOpenAiCompletionMetadata(assistant, effectiveResponse, chatId, requestId)
-        val chatObj=chatDb.getChat(chatId) ?: return
-        val arr=chatObj.optJSONArray("messages") ?: JSONArray()
-        var already=false
-        for(i in 0 until arr.length()){
-            val m=arr.optJSONObject(i) ?: continue
-            if(m.optString("response_id")==responseId){already=true;break}
-        }
-        val msgs=jsonArrayToMutableList(arr)
-        if(!already) msgs.add(assistant)
-        val effortPref=active.optString("effort_pref").ifBlank{"high"}
-        val effectiveEffort=active.optString("effective_effort").ifBlank{"high"}
-        val startedAt=active.optLong("started_at",System.currentTimeMillis())
-        val latency=(System.currentTimeMillis()-startedAt).coerceAtLeast(0L)
-        val usage=model.usage
-        val inTok=usage?.optLong("input_tokens",0L) ?: 0L
-        val outTok=usage?.optLong("output_tokens",0L) ?: 0L
-        val cachedTok=usage?.optJSONObject("input_tokens_details")?.optLong("cached_tokens",0L) ?: 0L
-        val cacheWriteTok=usage?.optJSONObject("input_tokens_details")?.optLong("cache_write_tokens",0L) ?: 0L
-        val reasoningTok=usage?.optJSONObject("output_tokens_details")?.optLong("reasoning_tokens",0L) ?: 0L
-        val success=state=="completed"
-        val cost=estimateCost(inTok,cachedTok,cacheWriteTok,outTok)
-        val requestMeta = msgs.firstOrNull { it.optString("request_id") == requestId }
-        val requestedModel = requestMeta?.optString("requested_model").orEmpty().ifBlank {
-            requestMeta?.optString("model").orEmpty()
-        }.ifBlank { null }
-        assistant.put("requested_model", requestedModel ?: JSONObject.NULL)
-        requestMeta?.optString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD)
-            ?.takeIf { it.isNotBlank() }
-            ?.let { assistant.put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, it) }
-        val committed = chatDb.finalizeCurrentChatIfActiveRequest(
-            chatId,
-            chatObj.optString("title","Новый чат"),
-            responseId.takeIf{state == "completed" && it.isNotBlank()},
-            effectiveEffort,
-            msgs,
-            requestId
-        )
-        if (!committed) {
-            diagnostics.log("background_stale_finalization_ignored", mapOf(
-                "chat_id" to chatId,
-                "response_id" to responseId,
-                "request_id" to requestId
-            ))
-            return
-        }
-        ResponseNotifications.finished(applicationContext, chatId, requestId, success)
-        recordOpenAiEffortMetricSafely { chatDb.recordEffortMetric(
-            requestId,chatId,"resumed",
-            effortPref,effectiveEffort,active.optBoolean("auto_selected",false),
-            active.optInt("prompt_chars",0),active.optInt("attachments",0),
-            latency,inTok,cachedTok,cacheWriteTok,outTok,reasoningTok,success,
-            if(success)null else state.ifBlank{"background_failed"},cost
-        ) }
-        chatDb.recordRequestAccounting(
-            chatId = chatId, localRequestId = requestId,
-            status = state, responseId = responseId, usage = assistant.optJSONObject("usage"),
-            telemetrySummary = compactTelemetry
-        )
-        chatDb.recordRequestEvent(
-            chatId = chatId,
-            eventType = if (success) "request_completed" else "request_${state}",
-            requestId = requestId,
-            provider = requestMeta?.optString("provider").orEmpty().ifBlank { "openai" },
-            requestedModel = requestedModel,
-            responseModel = model.model,
-            modelMatch = ModelCatalog.match(requestedModel, model.model),
-            status = state,
-            inputTokens = inTok,
-            cachedTokens = cachedTok,
-            cacheWriteTokens = cacheWriteTok,
-            outputTokens = outTok,
-            reasoningTokens = reasoningTok,
-            estimatedCostUsd = cost,
-            latencyMs = latency,
-            toolSummary = model.tools.distinct().joinToString(","),
-            telemetrySummary = compactTelemetry
-        )
-        diagnostics.log("background_response_finalized",mapOf(
-            "chat_id" to chatId,
-            "response_id" to responseId,
-            "status" to state,
-            "latency_ms" to latency,
-            "estimated_cost_usd" to "%.6f".format(cost)
-        ))
-        runOnUiThread{
-            if (uiSnapshot != null && activeResponseState.state.isCurrent(
-                    uiSnapshot, currentChatId(), activeAssistantItemId, activityVisible, isFinishing) &&
-                activeResponsePersistence.getActiveResponse(chatId) == null) {
-                persistComposerStateNow()
-                activeResponseState.nextGeneration()
-                currentResponseId=responseId.takeIf{success && it.isNotBlank()}
-                baselineEffort=effectiveEffort
-                activeAssistantItemId=null
-                restoreCurrentChat()
-                setBusy(false)
-                status.text=when{
-                    state=="completed" -> "Готово"
-                    state=="incomplete" -> "Ответ завершён не полностью"
-                    state=="cancelled" -> "Ответ отменён"
-                    else -> "Ошибка фонового ответа"
-                }
-            }
-        }
-    }
 
     private fun attachReasoningSummaryPanel(card:LinearLayout, summary:String, initiallyExpanded:Boolean=false):TextView {
          val box=LinearLayout(this).apply{
@@ -5179,77 +3039,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
          return body
      }
 
-     private fun updateActiveReasoningSummary(summary:String){
-         activeAssistantItemId?.let { id ->
-             updateActiveReasoningSummary(id, summary)
-         }
-     }
-
-     private fun updateActiveReasoningSummary(assistantItemId:String, summary:String){
-         messageAdapter.updateReasoningSummary(assistantItemId, summary.trim())
-     }
-
-     private fun extractReasoningSummary(response:JSONObject?):String{
-         val output=response?.optJSONArray("output") ?: return ""
-         val parts=StringBuilder()
-         for(i in 0 until output.length()){
-             val item=output.optJSONObject(i) ?: continue
-             if(item.optString("type")!="reasoning")continue
-             val summary=item.optJSONArray("summary")
-             if(summary!=null){
-                 for(j in 0 until summary.length()){
-                     val s=summary.optJSONObject(j) ?: continue
-                     if(s.optString("type")=="summary_text"){
-                         val t=JsonProtocol.string(s, "text").trim()
-                         if(t.isNotBlank()){
-                             if(parts.isNotEmpty())parts.append("\n\n")
-                             parts.append(t)
-                         }
-                     }
-                 }
-             }
-         }
-         return parts.toString()
-     }
-
-    private fun parseTools(output:JSONArray?, items:MutableList<String>, chatId:String?=null, generation:Long?=null) {
-        if(output==null)return
-        for(i in 0 until output.length()){
-            val o=output.optJSONObject(i)?:continue
-            when(o.optString("type")){
-                "web_search_call" -> { items.add("🌐 Web Search"); updateToolState("web_search","completed",chatId,generation) }
-                "file_search_call" -> { items.add("📚 File Search"); updateToolState("file_search","completed",chatId,generation) }
-                "code_interpreter_call" -> { items.add("🐍 Code Interpreter"); updateToolState("code_interpreter","completed",chatId,generation) }
-                "image_generation_call" -> { items.add("🎨 Image Generation"); updateToolState("image_generation","completed",chatId,generation) }
-                "computer_call" -> { items.add("🖥 Computer Use"); updateToolState("computer","completed",chatId,generation) }
-            }
-        }
-    }
-
-    private fun extractAnnotations(output:JSONArray?): Pair<List<JSONObject>,List<JSONObject>> {
-        val files=mutableListOf<JSONObject>()
-        val urls=mutableListOf<JSONObject>()
-        if(output==null) return files to urls
-        for(i in 0 until output.length()){
-            val item=output.optJSONObject(i) ?: continue
-            if(item.optString("type")!="message") continue
-            val contentArr=item.optJSONArray("content") ?: continue
-            for(j in 0 until contentArr.length()){
-                val c=contentArr.optJSONObject(j) ?: continue
-                if(c.optString("type")!="output_text") continue
-                val annotations=c.optJSONArray("annotations") ?: continue
-                for(k in 0 until annotations.length()){
-                    val raw=annotations.optJSONObject(k) ?: continue
-                    val a=JSONObject(raw.toString())
-                    when(a.optString("type")){
-                        "container_file_citation", "file_citation" -> files.add(a)
-                        "url_citation" -> urls.add(a)
-                    }
-                }
-            }
-        }
-        return files to urls
-    }
 
     private fun renderAnnotations(
         annotations:JSONArray,
@@ -5350,58 +3139,20 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             background=rounded(currentTheme().cardBg,10)
         }
         parent.addView(box,LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(6)})
-        renderFileCardState(box,annotation,message,chatId,generation,filename)
+        box.addView(TextView(this).apply {
+            text = "📄 $filename"
+            textSize = 14f; setTextColor(currentTheme().textPrimary); setTypeface(null, Typeface.BOLD)
+        })
+        box.addView(TextView(this).apply {
+            text = if (annotationType in setOf("container_file_citation", "file_citation"))
+                "Локальная копия недоступна. Загрузка из прямого OpenAI API отключена."
+                else "Локальная копия файла недоступна"
+            textSize = 11.5f; setTextColor(currentTheme().textSecondary)
+            setPadding(0, dp(3), 0, dp(4))
+        })
 
-        val canDownload = fileId.isNotBlank() && (containerId.isNotBlank() || annotationType == "file_citation")
-        val shouldAutoDownload = canDownload && annotationType == "container_file_citation" && state !in setOf("FAILED","EXPIRED")
-        if(shouldAutoDownload) {
-            downloadCitedFile(annotation,box,message,chatId,generation)
-        } else if(annotationType == "file_citation" && state == "PENDING" && canDownload) {
-            val row=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL}
-            row.addView(fileActionButton("Скачать"){
-                annotation.put("state","DOWNLOADING").remove("error")
-                persistCurrentChatFor(chatId)
-                renderFileCardState(box,annotation,message,chatId,generation,filename)
-                downloadCitedFile(annotation,box,message,chatId,generation)
-            })
-            box.addView(row)
-        } else if(state=="FAILED") {
-            addFileRetryButton(box,annotation,message,chatId,generation,filename)
-        }
     }
 
-    private fun renderFileCardState(
-        box:LinearLayout,
-        annotation:JSONObject,
-        message:JSONObject,
-        chatId:String,
-        generation:Long,
-        filename:String
-    ){
-        box.removeAllViews()
-        val state=annotation.optString("state").ifBlank{"DOWNLOADING"}
-        val size=annotation.optLong("size_bytes",0L)
-        val mime=annotation.optString("mime_type").ifBlank{mimeForFilename(filename)}
-        val icon=when(state){"READY"->"✅";"FAILED"->"⚠️";"EXPIRED"->"⌛";else->"📄"}
-        val titleRow=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL}
-        val titleView=TextView(this).apply{
-            text="$icon $filename"
-            textSize=14f;setTextColor(currentTheme().textPrimary);setTypeface(null,Typeface.BOLD)
-        }
-        titleRow.addView(titleView,LinearLayout.LayoutParams(0,-2,1f))
-        box.addView(titleRow)
-        val details=TextView(this).apply{
-            text=when(state){
-                "READY" -> "$mime · ${formatBytes(size)}"
-                "FAILED" -> "Ошибка: ${annotation.optString("error").ifBlank{"неизвестная ошибка"}.take(180)}"
-                "EXPIRED" -> if(annotation.optString("type") == "file_citation") "Исходный файл больше недоступен" else "Файл контейнера больше недоступен"
-                "PENDING" -> if(annotation.optString("type") == "file_citation") "Файл найден в хранилище · нажмите «Скачать»" else "Подготовка…"
-                else -> "Скачивание…"
-            }
-            textSize=11.5f;setTextColor(currentTheme().textSecondary);setPadding(0,dp(3),0,dp(4))
-        }
-        box.addView(details)
-    }
 
     private fun populateReadyFileCard(box:LinearLayout,annotation:JSONObject,filename:String,path:String){
         box.removeAllViews()
@@ -5453,17 +3204,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    private fun addFileRetryButton(box:LinearLayout,annotation:JSONObject,message:JSONObject,chatId:String,generation:Long,filename:String){
-        val row=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL}
-        row.addView(fileActionButton("Повторить"){
-            annotation.put("state","DOWNLOADING").remove("error")
-            persistCurrentChatFor(chatId)
-            renderFileCardState(box,annotation,message,chatId,generation,filename)
-            downloadCitedFile(annotation,box,message,chatId,generation)
-        })
-        box.addView(row)
-    }
-
 
     private fun fileActionButton(label:String,onClick:()->Unit)=TextView(this).apply{
         text=label;textSize=12.5f;setTextColor(currentTheme().accent)
@@ -5474,97 +3214,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         setOnClickListener{onClick()}
     }
 
-    private fun downloadCitedFile(annotation:JSONObject,box:LinearLayout,message:JSONObject,chatId:String,generation:Long){
-        val annotationType = annotation.optString("type").trim()
-        val containerId=annotation.optString("container_id").trim()
-        val fileId=JsonProtocol.string(annotation, "file_id").trim()
-        val filename=safeDisplayName(JsonProtocol.string(annotation, "filename").ifBlank{"file"})
-        if(fileId.isBlank() || (containerId.isBlank() && annotationType != "file_citation")) return
-        val downloadIdentity = listOf(chatId, annotationType, containerId, fileId).joinToString("|")
-        if (!activeGeneratedDownloads.add(downloadIdentity)) return
-        annotation.put("state","DOWNLOADING")
-        chatDb.updateGeneratedFileState(chatId,fileId,"DOWNLOADING", annotationType=annotationType)
-        if(currentChatId()==chatId) persistCurrentChatFor(chatId)
-        renderFileCardState(box,annotation,message,chatId,generation,filename)
-        diagnostics.log("file_download_start",mapOf("chat_id" to chatId,"type" to annotationType,"container_id" to containerId,"file_id" to fileId,"filename" to filename))
-        val key=secure.getApiKey()
-        executor.execute{
-            try{
-                val contentUrl = if (annotationType == "file_citation") {
-                    "https://api.openai.com/v1/files/$fileId/content"
-                } else {
-                    "https://api.openai.com/v1/containers/$containerId/files/$fileId/content"
-                }
-                val req=Request.Builder()
-                    .url(contentUrl)
-                    .addHeader("Authorization","Bearer $key").get().build()
-                client.newCall(req).execute().use{resp->
-                    if(!resp.isSuccessful) throw FileDownloadException(resp.code)
-                    val body=resp.body ?: throw IOException("Пустой ответ")
-                    val expected=body.contentLength()
-                    val maxBytes=512L*1024L*1024L
-                    if(expected>maxBytes) throw IOException("Файл слишком большой для мобильного клиента (>${formatBytes(maxBytes)})")
-                    val dir=File(filesDir,"generated").apply{mkdirs()}
-                    val destination=File(dir,"${System.currentTimeMillis()}_${safeFileName(filename)}")
-                    body.byteStream().use{input->destination.outputStream().use{output->
-                        val buffer=ByteArray(64*1024)
-                        var total=0L
-                        while(true){
-                            val n=input.read(buffer)
-                            if(n<0) break
-                            total+=n
-                            if(total>maxBytes){destination.delete();throw IOException("Файл слишком большой для мобильного клиента (>${formatBytes(maxBytes)})")}
-                            output.write(buffer,0,n)
-                        }
-                    }}
-                    val mime=resp.header("Content-Type")?.substringBefore(';')?.trim().takeIf{!it.isNullOrBlank()} ?: mimeForFilename(filename)
-                    chatDb.updateGeneratedFileState(chatId,fileId,"READY",destination.absolutePath,mime,destination.length(), annotationType=annotationType)
-                    runOnUiThread{
-                        if(!isRequestCurrent(chatId,generation)){ return@runOnUiThread }
-                        annotation.put("state","READY")
-                            .put("local_path",destination.absolutePath)
-                            .put("mime_type",mime)
-                            .put("size_bytes",destination.length())
-                        persistCurrentChatFor(chatId)
-                        populateReadyFileCard(box,annotation,filename,destination.absolutePath)
-                        diagnostics.log("file_download_ready",mapOf("container_id" to containerId,"file_id" to fileId,"bytes" to destination.length()))
-                    }
-                }
-            }catch(e:FileDownloadException){
-                val expired=e.code==404 || e.code==410
-                chatDb.updateGeneratedFileState(chatId,fileId,if(expired)"EXPIRED" else "FAILED",error="HTTP ${e.code}", annotationType=annotationType)
-                runOnUiThread{
-                    if(!isRequestCurrent(chatId,generation))return@runOnUiThread
-                    annotation.put("state",if(expired)"EXPIRED" else "FAILED").put("error","HTTP ${e.code}")
-                    persistCurrentChatFor(chatId)
-                    renderFileCardState(box,annotation,message,chatId,generation,filename)
-                    if(!expired) addFileRetryButton(box,annotation,message,chatId,generation,filename)
-                    diagnostics.log("file_download_failed",mapOf("container_id" to containerId,"file_id" to fileId,"status" to e.code))
-                }
-            }catch(e:Exception){
-                val friendly=friendlyApiError(e.message)
-                chatDb.updateGeneratedFileState(chatId,fileId,"FAILED",error=friendly, annotationType=annotationType)
-                runOnUiThread{
-                    if(!isRequestCurrent(chatId,generation))return@runOnUiThread
-                    annotation.put("state","FAILED").put("error",friendly)
-                    persistCurrentChatFor(chatId)
-                    renderFileCardState(box,annotation,message,chatId,generation,filename)
-                    addFileRetryButton(box,annotation,message,chatId,generation,filename)
-                    diagnostics.log("file_download_failed",mapOf("container_id" to containerId,"file_id" to fileId,"error" to (e.message ?: e.toString()).take(300)))
-                }
-            } finally {
-                activeGeneratedDownloads.remove(downloadIdentity)
-            }
-        }
-    }
-
-    private class FileDownloadException(val code:Int):IOException("HTTP $code")
-
-    private fun saveGeneratedImages(results:List<String>):JSONArray =
-        GeneratedImageStore.save(filesDir, results) { index, failure ->
-            diagnostics.log("generated_image_failed", mapOf(
-                "error" to failure.message.orEmpty().take(300), "index" to index))
-        }
 
     private fun renderGeneratedImages(message:JSONObject,parent:LinearLayout){
         val arr=message.optJSONArray("generated_images") ?: return
@@ -5911,7 +3560,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             }
             pendingCameraPath = captured.absolutePath
             pendingCameraChatId = currentChatId()
-            pendingCameraProvider = prefs.getString("provider", "openai")
+            pendingCameraProvider = "openrouter"
             launchActivityForResult(intent, pickCamera)
             if (pendingActivityResultCode != pickCamera) {
                 pendingCameraPath = null
@@ -5928,12 +3577,10 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    /** The camera activity can return after the user switched chats or this Activity was recreated. */
-    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+        @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     fun completePendingCameraCapture(resultCode: Int) {
         val capturedPath = pendingCameraPath
         val sourceChatId = pendingCameraChatId
-        val sourceProvider = pendingCameraProvider ?: prefs.getString("provider", "openai")
         pendingCameraPath = null
         pendingCameraChatId = null
         pendingCameraProvider = null
@@ -5956,8 +3603,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             return
         }
 
-        if (sourceProvider == "openrouter") {
-            // Classify the private camera file for the source draft, never the current composer.
             executor.execute {
                 try {
                     val attachment = OpenRouterAttachmentStore.classifyLocalFile(this, file, file.name, "image/jpeg")
@@ -5970,45 +3615,11 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                     ))
                 }
             }
-        } else {
-            // OpenAI's file_id is created only when the user reopens the source draft.
-            // Persist both local path (orphan cleanup protection) and a resumable upload URI.
-            if (savePendingCameraImageToComposer(sourceChatId, file, uri)) {
-                status.text = "Фото сохранено в исходном чате — загрузится при его открытии"
-            } else {
-                status.text = "Не удалось сохранить фото в исходном чате"
             }
-        }
-    }
 
-    private fun savePendingCameraImageToComposer(chatId: String, file: File, uri: Uri): Boolean {
-        if (chatId.isBlank()) return false
-        return try {
-            val key = composerPrefsKey(chatId)
-            val state = try { JSONObject(prefs.getString(key, null).orEmpty()) } catch (_: Exception) { JSONObject() }
-            val pending = state.optJSONArray("pending_uploads") ?: JSONArray()
-            val rawUri = uri.toString()
-            val found = (0 until pending.length()).any { i ->
-                val item = pending.optJSONObject(i)
-                item?.optString("uri") == rawUri && item.optString("kind") == "image"
-            }
-            if (!found) pending.put(JSONObject().put("uri", rawUri).put("kind", "image"))
-            state.put("image_path", file.absolutePath)
-                .remove("image_file_id")
-            state.put("image_name", file.name)
-                .put("image_mime", "image/jpeg")
-                .put("image_size", file.length())
-                .put("pending_uploads", pending)
-                .put("saved_at", System.currentTimeMillis())
-            prefs.edit().putString(key, state.toString()).commit()
-        } catch (e: Exception) {
-            diagnostics.log("camera_source_draft_save_failed", mapOf("chat_id" to chatId, "error" to e.javaClass.simpleName))
-            false
-        }
-    }
 
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-    fun setPendingCameraCaptureForTesting(path: String, chatId: String, provider: String) {
+    fun setPendingCameraCaptureForTesting(path: String, chatId: String, provider: String = "openrouter") {
         pendingCameraPath = path
         pendingCameraChatId = chatId
         pendingCameraProvider = provider
@@ -6050,269 +3661,16 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             status.text="На устройстве не найден сервис распознавания речи"
         }
     }
-    // ---------- vector store management ----------
-    private fun vectorStoreId():String? = prefs.getString("vector_store","")?.trim()?.takeIf{it.isNotBlank()}
 
 
-    private data class VectorStoreListResult(
-        val entries: List<Pair<String, String>>,
-        val hasMore: Boolean,
-        val unresolvedNames: Int
-    )
-
-    private fun showVectorStoreManager() {
-        vsDialog?.dismiss()
-        val generation = vsUiGeneration.incrementAndGet()
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(10), dp(20), dp(10))
-        }
-        val statusLine = TextView(this).apply { text = "Загрузка…"; setTextColor(Color.GRAY); textSize = 12f }
-        val listArea = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        container.addView(statusLine)
-        container.addView(listArea)
-        vsListArea = listArea
-        vsStatusLine = statusLine
-        val dialog = AppThemeViews.dialog(this, currentTheme())
-            .setTitle("Файлы Vector Store")
-            .setView(ScrollView(this).apply { addView(container) })
-            .setPositiveButton("+ Добавить файл", null)
-            .setNegativeButton("Закрыть", null)
-            .create()
-        vsDialog = dialog
-        dialog.setOnDismissListener {
-            if (vsDialog === dialog) {
-                vsUiGeneration.incrementAndGet()
-                vsDialog = null
-                vsListArea = null
-                vsStatusLine = null
-            }
-        }
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val existing = vectorStoreId()
-                if (existing != null) {
-                    pickFileForVectorStore()
-                } else {
-                    statusLine.text = "Создаю Vector Store…"
-                    executor.execute {
-                        try {
-                            val newId = createVectorStore("Astra Files")
-                            runOnUiThread {
-                                if (vsUiGeneration.get() != generation || !dialog.isShowing) {
-                                    diagnostics.log("vector_store_late_create", mapOf("store_id" to newId))
-                                    return@runOnUiThread
-                                }
-                                prefs.edit().putString("vector_store", newId).apply()
-                                pickFileForVectorStore()
-                            }
-                        } catch (e: Exception) {
-                            runOnUiThread {
-                                if (vsUiGeneration.get() == generation && dialog.isShowing) {
-                                    statusLine.text = "Ошибка создания: " + (e.message ?: "неизвестная")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        dialog.show()
-        val vsId = vectorStoreId()
-        if (vsId == null) statusLine.text = "Vector Store ещё не создан — нажмите «Добавить файл»"
-        else renderVectorStoreList(vsId)
-    }
-
-    private fun renderVectorStoreList(vsId:String){
-        runOnUiThread{
-            vsStatusLine?.text="Загрузка списка файлов…"
-            val generation = vsUiGeneration.get()
-            val statusLine = vsStatusLine ?: return@runOnUiThread
-            val area = vsListArea ?: return@runOnUiThread
-            statusLine.text = "Загрузка списка файлов…"
-            executor.execute {
-                try {
-                    val listed = listVectorStoreFiles(vsId)
-                    runOnUiThread {
-                        if (!VectorStoreUiOwnershipPolicy.mayCommit(
-                                generation, vsUiGeneration.get(), vsId, vectorStoreId(),
-                                vsDialog?.isShowing == true
-                            ) || vsListArea !== area) return@runOnUiThread
-                        area.removeAllViews()
-                        if (listed.entries.isEmpty()) area.addView(TextView(this).apply {
-                            text = "Файлов пока нет"; setTextColor(Color.GRAY); textSize = 13f
-                        })
-                        listed.entries.forEach { (fid, name) ->
-                            val row = LinearLayout(this).apply {
-                                orientation = LinearLayout.HORIZONTAL
-                                gravity = Gravity.CENTER_VERTICAL
-                                setPadding(0, dp(6), 0, dp(6))
-                            }
-                            row.addView(TextView(this).apply {
-                                text = name; textSize = 14f; setTextColor(currentTheme().textPrimary)
-                            }, LinearLayout.LayoutParams(0, -2, 1f))
-                            row.addView(TextView(this).apply {
-                                text = "✕"; setTextColor(currentTheme().errorText)
-                                setPadding(dp(12), dp(6), dp(6), dp(6))
-                                setOnClickListener {
-                                    executor.execute {
-                                        try {
-                                            removeFileFromVectorStore(vsId, fid)
-                                            runOnUiThread {
-                                                if (vsUiGeneration.get() == generation &&
-                                                    vsDialog?.isShowing == true && vectorStoreId() == vsId)
-                                                    renderVectorStoreList(vsId)
-                                            }
-                                        } catch (e: Exception) {
-                                            runOnUiThread {
-                                                if (vsUiGeneration.get() == generation && vsDialog?.isShowing == true)
-                                                    statusLine.text = "Удаление не удалось: " + (e.message ?: "неизвестная")
-                                            }
-                                        }
-                                    }
-                                }
-                            })
-                            area.addView(row)
-                        }
-                        val incomplete = if (listed.hasMore) " · показаны первые " +
-                            listed.entries.size + " (список неполный)" else ""
-                        val unnamed = if (listed.unresolvedNames > 0) " · часть имён недоступна: " +
-                            listed.unresolvedNames else ""
-                        statusLine.text = "Vector Store: " + vsId + incomplete + unnamed
-                    }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        if (vsUiGeneration.get() == generation && vsDialog?.isShowing == true)
-                            statusLine.text = "Ошибка загрузки: " + (e.message ?: "неизвестная")
-                    }
-                }
-            }
-        }
-    }
-
-    private fun pickFileForVectorStore(){
-        pendingVectorStorePickerId = vectorStoreId()
-        if (pendingVectorStorePickerId == null) {
-            vsStatusLine?.text = "Сначала выберите Vector Store"
-            return
-        }
-        val i=Intent(Intent.ACTION_OPEN_DOCUMENT).apply{addCategory(Intent.CATEGORY_OPENABLE);type="*/*"}
-        launchActivityForResult(i, pickVectorStoreFile)
-    }
-
-    private fun listVectorStoreFiles(vsId: String): VectorStoreListResult {
-        val key = secure.getApiKey()
-        if (key.isBlank()) throw IOException("OpenAI API key не настроен")
-        val ids = mutableListOf<String>()
-        var after: String? = null
-        var more = true
-        var pageNumber = 0
-        while (more && pageNumber < VectorStorePagePolicy.MAX_PAGES) {
-            if (Thread.currentThread().isInterrupted) throw IOException("Загрузка списка отменена")
-            val base = "https://api.openai.com/v1/vector_stores/" +
-                Uri.encode(vsId) + "/files?limit=" + VectorStorePagePolicy.PAGE_SIZE
-            val requestUrl = if (after == null) base else base + "&after=" + Uri.encode(after)
-            val request = Request.Builder().url(requestUrl)
-                .addHeader("Authorization", "Bearer " + key).get().build()
-            val page = vsControlClient.newCall(request).execute().use { response ->
-                val raw = if (response.isSuccessful) BoundedResponseDecoder.readBody(response.body)
-                    else BoundedResponseDecoder.readErrorBody(response.body)
-                if (!response.isSuccessful) throw IOException("Vector Store HTTP ${response.code}: $raw")
-                VectorStorePagePolicy.parse(JSONObject(raw))
-            }
-            ids.addAll(page.ids)
-            pageNumber++
-            if (page.hasMore && (page.nextAfter.isNullOrBlank() || page.nextAfter == after))
-                throw IOException("Vector Store pagination cursor did not advance")
-            after = page.nextAfter
-            more = page.hasMore
-        }
-        var unresolvedNames = 0
-        val entries = ids.mapIndexed { index, id ->
-            val displayName = if (index < VectorStorePagePolicy.MAX_FILENAME_LOOKUPS) {
-                try { fetchFileName(id) } catch (_: Exception) { unresolvedNames++; id }
-            } else { unresolvedNames++; id }
-            id to displayName
-        }
-        return VectorStoreListResult(entries, more, unresolvedNames)
-    }
-
-    private fun fetchFileName(fileId:String):String{
-        val key=secure.getApiKey()
-        val req=Request.Builder().url("https://api.openai.com/v1/files/$fileId")
-            .addHeader("Authorization","Bearer $key").get().build()
-        vsControlClient.newCall(req).execute().use{resp->
-            val raw=if(resp.isSuccessful) BoundedResponseDecoder.readBody(resp.body)
-                else BoundedResponseDecoder.readErrorBody(resp.body)
-            if(!resp.isSuccessful)throw IOException("HTTP ${resp.code}: $raw")
-            return JSONObject(raw).optString("filename",fileId)
-        }
-    }
-    private fun createVectorStore(name:String):String{
-        val key=secure.getApiKey()
-        val reqBody=JSONObject().put("name",name).toString().toRequestBody("application/json".toMediaType())
-        val req=Request.Builder().url("https://api.openai.com/v1/vector_stores")
-            .addHeader("Authorization","Bearer $key").post(reqBody).build()
-        vsControlClient.newCall(req).execute().use{resp->
-            val raw=if(resp.isSuccessful) BoundedResponseDecoder.readBody(resp.body)
-                else BoundedResponseDecoder.readErrorBody(resp.body)
-            if(!resp.isSuccessful)throw IOException("HTTP ${resp.code}: $raw")
-            return JSONObject(raw).getString("id")
-        }
-    }
-    private fun attachFileToVectorStore(vsId:String, fileId:String){
-        val key=secure.getApiKey()
-        val reqBody=JSONObject().put("file_id",fileId).toString().toRequestBody("application/json".toMediaType())
-        val req=Request.Builder().url("https://api.openai.com/v1/vector_stores/$vsId/files")
-            .addHeader("Authorization","Bearer $key").post(reqBody).build()
-        vsControlClient.newCall(req).execute().use{resp->
-            if(!resp.isSuccessful)throw IOException("HTTP ${resp.code}: ${BoundedResponseDecoder.readErrorBody(resp.body)}")
-        }
-    }
-    private fun removeFileFromVectorStore(vsId:String, fileId:String){
-        val key=secure.getApiKey()
-        val req=Request.Builder().url("https://api.openai.com/v1/vector_stores/$vsId/files/$fileId")
-            .addHeader("Authorization","Bearer $key").delete().build()
-        vsControlClient.newCall(req).execute().use{resp->
-            if(!resp.isSuccessful)throw IOException("HTTP ${resp.code}: ${BoundedResponseDecoder.readErrorBody(resp.body)}")
-        }
-    }
-    private fun uploadFileForVectorStore(uri:Uri):Pair<String,String>{
-        val key=secure.getApiKey()
-        val temp=File(cacheDir,"upload_${System.nanoTime()}")
-        val input=contentResolver.openInputStream(uri) ?: throw IOException("Не удалось открыть файл")
-        try {
-            input.use { source ->
-                BoundedAttachmentCopy.copy(source, temp, maxBytes = 50L * 1024 * 1024)
-            }
-            val mime=contentResolver.getType(uri) ?: "application/octet-stream"
-            val name=queryName(uri) ?: "attachment"
-            val body=MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("purpose","assistants")
-            .addFormDataPart("file",name,temp.asRequestBody(mime.toMediaType()))
-            .build()
-            val req=Request.Builder().url("https://api.openai.com/v1/files").addHeader("Authorization","Bearer $key").post(body).build()
-            client.newCall(req).execute().use { resp ->
-                val raw = if (resp.isSuccessful) BoundedResponseDecoder.readBody(resp.body)
-                    else BoundedResponseDecoder.readErrorBody(resp.body)
-                if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $raw")
-                return JSONObject(raw).getString("id") to name
-            }
-        } finally {
-            temp.delete()
-        }
-    }
-
-    private fun prepareOpenRouterAttachment(uri: Uri, pickerSourceChatId: String,
-        pickerProvider: String = pendingPickerProvider ?: normalizedProviderId()) {
+    private fun prepareOpenRouterAttachment(uri: Uri, pickerSourceChatId: String) {
         val name = OpenRouterAttachmentStore.queryName(this, uri) ?: uri.lastPathSegment ?: "attachment"
         val uploadChatId = pickerSourceChatId
         val uploadGeneration = activeResponseState.state.generation
         beginUpload(uploadChatId, uploadGeneration)
         attachmentPreparationTail = attachmentPreparationTail.handleAsync({ _, _ ->
             try {
-                val local = OpenRouterAttachmentStore.copyAndClassify(this, uri, name, openRouterAttachmentInputStreamSource,
-                    allowOpenAiContainer = pickerProvider == "openai")
+                val local = OpenRouterAttachmentStore.copyAndClassify(this, uri, name, openRouterAttachmentInputStreamSource)
                 val prepared = if (local.kind == "zip") {
                     OpenRouterAttachmentStore.extractZipFile(this, File(local.path), local.name) { message ->
                         diagnostics.log("openrouter_zip", mapOf("filename" to local.name, "message" to message.take(300)))
@@ -6373,7 +3731,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
     fun handleActivityResult(r:Int,c:Int,d:Intent?){
         if(c!=RESULT_OK || d==null) {
-            if (r == pickVectorStoreFile) pendingVectorStorePickerId = null
             if (r == pickExportTxt) {
                 exportSnapshots.delete(pendingExportPath)
                 pendingExportPath = null
@@ -6396,7 +3753,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                         ?: throw IOException("Не удалось открыть файл для записи")
                     snapshot.inputStream().use { input -> out.use { output -> input.copyTo(output, 64*1024) } }
                     runOnUiThread { if (activityVisible && !isFinishing && !isDestroyed) status.text="Экспорт сохранён" }
-                } catch(e:Exception) {
+                } catch (_: Exception) {
                     runOnUiThread { if (activityVisible && !isFinishing && !isDestroyed) status.text="Не удалось сохранить экспорт" }
                 } finally { exportSnapshots.delete(source) }
             }
@@ -6430,42 +3787,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             }
             return
         }
-        if(r==pickVectorStoreFile){
-            val uri = d.data ?: run {
-                pendingVectorStorePickerId = null
-                return
-            }
-            val vsId = pendingVectorStorePickerId.also { pendingVectorStorePickerId = null }
-            if (vsId.isNullOrBlank() || vectorStoreId() != vsId) {
-                status.text = "Vector Store изменился — выберите файл заново"
-                return
-            }
-            val generation = vsUiGeneration.get()
-            vsStatusLine?.text="Загружаю файл…"
-            executor.execute {
-                try {
-                    val (fileId, _) = uploadFileForVectorStore(uri)
-                    attachFileToVectorStore(vsId, fileId)
-                    runOnUiThread {
-                        if (vsUiGeneration.get() == generation && vsDialog?.isShowing == true &&
-                            vectorStoreId() == vsId) renderVectorStoreList(vsId)
-                        else status.text = "Файл добавлен в исходный Vector Store: " + vsId
-                    }
-                } catch (e: Exception) {
-                    runOnUiThread {
-                        if (vsUiGeneration.get() == generation && vsDialog?.isShowing == true)
-                            vsStatusLine?.text = "Ошибка: " + (e.message ?: "неизвестная")
-                        else status.text = "Ошибка загрузки Vector Store"
-                    }
-                }
-            }
-            return
-        }
-        val provider = pendingPickerProvider ?: normalizedProviderId()
         val pickerSourceChatId = pendingPickerChatId ?: currentChatId()
-
-        // Selection is local for both providers. Upload once on Send, after its immutable
-        // options/credential snapshot chooses native input versus Python analysis.
         if (r == pickImage || r == pickAny) {
             val selectedUris = urisFromIntent(d)
             if (selectedUris.size > OpenRouterAttachmentStore.MAX_ATTACHMENTS) {
@@ -6473,7 +3795,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 return
             }
             selectedUris.forEach { uri ->
-                prepareOpenRouterAttachment(uri, pickerSourceChatId, provider)
+                prepareOpenRouterAttachment(uri, pickerSourceChatId)
             }
             return
         }
@@ -6504,9 +3826,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    private val supportedFileExtensions = TextFileFormatPolicy.extensions + TextFileFormatPolicy.office + setOf(
-        "pdf", "doc", "xls", "rtf", "zip", "jpg", "jpeg", "png", "webp", "gif"
-    )
 
     /** ZIP ownership is bound to the selected source draft, never to the latest UI. */
     private fun sourceStillOwnsZips(chatId: String, selected: List<Pair<String, String>>): Boolean {
@@ -6602,255 +3921,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             }
         }
     }
-    private fun preparePendingZipsThenSend(regenerate:Boolean){
-        if(preparingZipAttachments)return
-        val zipItems=pendingUploadUris.filter{it.second=="zip"}.toList()
-        if(zipItems.isEmpty())return
-        val sourceChatId=currentChatId()
-        preparingZipAttachments=true
-        send.isEnabled=false
-        status.text="Готовлю ZIP-вложение…"
-        executor.execute{
-            val uploaded=mutableListOf<LocalUploadedFile>()
-            val uploadedByZip=mutableListOf<Pair<String,LocalUploadedFile>>()
-            try{
-                zipItems.forEachIndexed { index,(rawUri,_) ->
-                    val uri=Uri.parse(rawUri)
-                    val zipName=queryName(uri) ?: "archive.zip"
-                    val key=attachmentKey(uri,"zip")
-                    val extracted=extractZipForSend(uri,zipName,key){stage,pct->
-                        runOnUiThread{uploadCards[key]?.details?.text="$stage · $pct%"}
-                    }
-                    uploaded += extracted
-                    extracted.forEach { uploadedByZip += rawUri to it }
-                    diagnostics.log("zip_prepared",mapOf("chat_id" to sourceChatId,"filename" to zipName,"files_uploaded" to uploaded.size,"index" to index))
-                }
-                runOnUiThread{
-                    when (
-                        AttachmentUploadCompletionPolicy.decide(
-                            sourceChatId = sourceChatId,
-                            currentChatId = currentChatId(),
-                            cancelled = false
-                        )
-                    ) {
-                        AttachmentUploadCompletionTarget.DISCARD -> Unit
-                        AttachmentUploadCompletionTarget.CURRENT_COMPOSER -> {
-                            zipItems.forEach{(raw,kind)->pendingUploadUris.remove(raw to kind)}
-                            uploaded.forEach{
-                                attachedFileIds.add(it.id);attachedFileNames.add(it.name);attachedFileSizes.add(it.size);attachedFilePaths.add(it.path);attachedFileMimes.add(it.mime)
-                            }
-                            persistComposerStateNow()
-                            preparingZipAttachments=false
-                            refreshAttachChips()
-                            status.text="ZIP подготовлен · файлов: ${uploaded.size}"
-                            sendMessage(regenerate)
-                        }
-                        AttachmentUploadCompletionTarget.SOURCE_CHAT -> {
-                            zipItems.forEach{(raw,kind)->pendingUploadUris.remove(raw to kind)}
-                            uploadedByZip.forEach { (rawUri,file) ->
-                                saveUploadedFileToComposer(
-                                    sourceChatId,
-                                    file.id,
-                                    file.name,
-                                    file.size,
-                                    rawUri = rawUri,
-                                    localPath = file.path,
-                                    mime = file.mime,
-                                    pendingUploadKind = "zip"
-                                )
-                            }
-                            preparingZipAttachments=false
-                            status.text="ZIP подготовлен в исходном чате"
-                        }
-                    }
-                }
-            }catch(e:Exception){
-                diagnostics.log("zip_prepare_failed",mapOf("chat_id" to sourceChatId,"error" to (e.message?:e.toString()).take(400)))
-                runOnUiThread{
-                    preparingZipAttachments=false
-                    refreshAttachChips()
-                    status.text="Не удалось подготовить ZIP: ${e.message}"
-                }
-            }
-        }
-    }
 
-    private fun extractZipForSend(uri:Uri,zipName:String,zipKey:String,onProgress:(String,Int)->Unit):List<LocalUploadedFile>{
-        val result=mutableListOf<LocalUploadedFile>()
-        var entries=0
-        var skipped=0
-        var totalInflated=0L
-        val maxEntryBytes=25_000_000L
-        val maxTotalBytes=200L*1024L*1024L
-        val maxEntries=100
-        contentResolver.openInputStream(uri)?.use{stream->
-            java.util.zip.ZipInputStream(java.io.BufferedInputStream(stream)).use{zin->
-                var entry=zin.nextEntry
-                while(entry!=null){
-                    entries++
-                    if(entries>maxEntries)throw IOException("ZIP содержит больше $maxEntries файлов")
-                    val entryName=entry.name.substringAfterLast('/').trim()
-                    val ext=entryName.substringAfterLast('.',"").lowercase()
-                    if(!entry.isDirectory && entry.size>=0L && entry.size>maxEntryBytes)throw ZipSafetyException("entry_too_large")
-                    if(!entry.isDirectory && entryName.isNotBlank() && (ext in supportedFileExtensions || TextFileFormatPolicy.knownText(entryName))){
-                        val local=File(File(filesDir,"attachments").apply{mkdirs()},"zip_${System.currentTimeMillis()}_${System.nanoTime()}_${safeFileName(entryName)}")
-                        var entryBytes=0L
-                        try{
-                            local.outputStream().use{out->
-                                val buffer=ByteArray(64*1024)
-                                while(true){
-                                    val n=zin.read(buffer);if(n<0)break
-                                    entryBytes+=n;totalInflated+=n
-                                    if(entryBytes>maxEntryBytes)throw ZipSafetyException("entry_too_large")
-                                    if(totalInflated>maxTotalBytes)throw ZipSafetyException("archive_too_large")
-                                    out.write(buffer,0,n)
-                                    onProgress("Распаковка $entryName",(entryBytes.coerceAtMost(maxEntryBytes)*50L/maxEntryBytes).toInt())
-                                }
-                            }
-                            if(entryBytes==0L){skipped++;local.delete()}
-                            else{
-                                val name=safeDisplayName(entryName)
-                                val mime=mimeForFilename(name)
-                                onProgress("Загрузка $name",50)
-                                val uploaded=uploadLocalUserFile(local,name,mime,null){done,total->
-                                    val pct=50 + (done*50L/total.coerceAtLeast(1L)).toInt()
-                                    onProgress("Загрузка $name",pct.coerceIn(50,100))
-                                }
-                                result.add(uploaded)
-                                onProgress("Готово $name",100)
-                            }
-                        }catch(e:ZipSafetyException){local.delete();throw e}
-                        catch(_:Exception){skipped++;local.delete()}
-                    }else if(!entry.isDirectory){
-                        val buffer=ByteArray(64*1024)
-                        var discarded=0L
-                        while(true){
-                            val n=zin.read(buffer);if(n<0)break
-                            discarded+=n;totalInflated+=n
-                            if(discarded>maxEntryBytes)throw ZipSafetyException("entry_too_large")
-                            if(totalInflated>maxTotalBytes)throw ZipSafetyException("archive_too_large")
-                        }
-                        skipped++
-                    }
-                    zin.closeEntry()
-                    entry=zin.nextEntry
-                }
-            }
-        } ?: throw IOException("Не удалось открыть ZIP")
-        if(result.isEmpty())throw IOException("В ZIP не найдено поддерживаемых файлов")
-        return result
-    }
-
-    private class ZipSafetyException(val reason:String):IOException(reason)
-
-    private fun uploadImageFile(path:String,name:String,key:String?=null,credential:String?=null,mimeOverride:String?=null,
-                                active:()->Boolean={true},onProgress:(Long,Long)->Unit={_,_->}):String{
-        val apiKey=credential ?: secure.getApiKey()
-        val file=File(path)
-        if(!file.isFile) throw IOException("Изображение больше недоступно")
-        val mime=mimeOverride ?: mimeForFilename(name).takeIf{it.startsWith("image/")} ?: "image/jpeg"
-        val cache=OpenAiFileUploadCache(getSharedPreferences("openai_file_upload_cache", Context.MODE_PRIVATE))
-        val id=cache.getOrUpload(file,name,mime,apiKey,
-            {active() && (key==null || !cancelledUploads.contains(key))},purpose="vision") {
-            val delegate=file.asRequestBody(mime.toMediaType())
-            val tracked=ProgressRequestBody(delegate){done,total->onProgress(done,total)}
-            val body=MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("purpose","vision")
-                .addFormDataPart("file",safeFileName(name),tracked)
-                .build()
-            val req=Request.Builder().url("https://api.openai.com/v1/files")
-                .addHeader("Authorization","Bearer $apiKey").post(body).build()
-            val call=client.newCall(req)
-            if(key!=null)uploadCalls[key]=call
-            try{
-                call.execute().use{resp->
-                    val raw=if(resp.isSuccessful) BoundedResponseDecoder.readBody(resp.body)
-                        else BoundedResponseDecoder.readErrorBody(resp.body)
-                    if(!resp.isSuccessful) throw IOException("HTTP ${resp.code}: $raw")
-                    JSONObject(raw).getString("id")
-                }
-            }finally{ if(key!=null)uploadCalls.remove(key) }
-        }
-        onProgress(file.length(),file.length())
-        return id
-    }
-
-    private fun uploadLocalUserFile(file:File,name:String,mime:String,key:String?=null,credential:String?=null,
-                                    active:()->Boolean={true},onProgress:(Long,Long)->Unit={_,_->}):LocalUploadedFile{
-        if(!file.isFile)throw IOException("Файл больше недоступен")
-        val size=file.length()
-        val max=50L*1024L*1024L
-        if(size>max)throw IOException("Файл слишком большой для Responses API (максимум ${formatBytes(max)})")
-        val apiKey=credential ?: secure.getApiKey()
-        val cache=OpenAiFileUploadCache(getSharedPreferences("openai_file_upload_cache", Context.MODE_PRIVATE))
-        val id=cache.getOrUpload(file,name,mime,apiKey,
-            {active() && (key==null || !cancelledUploads.contains(key))},purpose="user_data") {
-            val delegate=file.asRequestBody(mime.toMediaType())
-            val tracked=ProgressRequestBody(delegate){done,total->onProgress(done,total)}
-            val body=MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart("purpose","user_data")
-                .addFormDataPart("file",safeFileName(name),tracked)
-                .build()
-            val req=Request.Builder().url("https://api.openai.com/v1/files")
-                .addHeader("Authorization","Bearer $apiKey").post(body).build()
-            val call=client.newCall(req)
-            if(key!=null)uploadCalls[key]=call
-            try{
-                call.execute().use{resp->
-                    val raw=if(resp.isSuccessful) BoundedResponseDecoder.readBody(resp.body)
-                        else BoundedResponseDecoder.readErrorBody(resp.body)
-                    if(!resp.isSuccessful)throw IOException("HTTP ${resp.code}: $raw")
-                    JSONObject(raw).getString("id")
-                }
-            }finally{if(key!=null)uploadCalls.remove(key)}
-        }
-        onProgress(size,size)
-        return LocalUploadedFile(id,name,size,file.absolutePath,mime)
-    }
-
-    private fun uploadFile(
-        uri:Uri,
-        key:String?=null,
-        onProgress:(Long,Long)->Unit={_,_->},
-        onLocalReady:(String,String,Long)->Unit={_,_,_->}
-    ):LocalUploadedFile{
-        val maxInputFileBytes=50L*1024L*1024L
-        val reportedSize=querySize(uri)
-        if(reportedSize>maxInputFileBytes){
-            throw IOException("Файл слишком большой для Responses API (максимум ${formatBytes(maxInputFileBytes)})")
-        }
-        val name=queryName(uri) ?: "attachment"
-        val mime=contentResolver.getType(uri).orEmpty().ifBlank{mimeForFilename(name)}
-        val dir=File(filesDir,"attachments").apply{mkdirs()}
-        val local=File(dir,"user_${System.currentTimeMillis()}_${System.nanoTime()}_${safeFileName(name)}")
-        try{
-            val input=contentResolver.openInputStream(uri) ?: throw IOException("Не удалось открыть файл")
-            var copied=0L
-            input.use{src->local.outputStream().use{out->
-                val buffer=ByteArray(64*1024)
-                while(true){
-                    val n=src.read(buffer); if(n<0)break
-                    copied+=n
-                    if(copied>maxInputFileBytes)throw IOException("Файл слишком большой для Responses API (максимум ${formatBytes(maxInputFileBytes)})")
-                    out.write(buffer,0,n)
-                    val total=reportedSize.takeIf{it>0} ?: maxInputFileBytes
-                    onProgress((copied.coerceAtMost(total)*45L/total.coerceAtLeast(1L)),100L)
-                }
-            }}
-            onProgress(45L,100L)
-            // The permanent local copy is ready before the network upload finishes.
-            // Expose it to the composer so the user can preview/read the file immediately.
-            try { onLocalReady(local.absolutePath,mime,local.length()) } catch (_:Exception) {}
-            return uploadLocalUserFile(local,name,mime,key){done,total->
-                // The upload is the second half of the progress indicator.
-                val pctPart=50L + (done*50L/total.coerceAtLeast(1L))
-                onProgress(pctPart,100L)
-            }
-        }catch(e:Exception){
-            if(key==null || !cancelledUploads.contains(key)) local.delete()
-            throw e
-        }
-    }
 
     private fun queryName(uri:Uri):String?{
         var n:String?=null
@@ -6860,180 +3931,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         return n
     }
 
-
-
-    private fun saveUploadedFileToComposer(
-        chatId:String,
-        fileId:String,
-        name:String,
-        size:Long,
-        rawUri:String,
-        localPath:String?=null,
-        mime:String?=null,
-        pendingUploadKind:String="file"
-    ){
-        if(chatId.isBlank()) return
-        synchronized(composerMergeLock) {
-        if (chatDb.getChatTitle(chatId) == null) return
-        try{
-            val key=composerPrefsKey(chatId)
-            val o=try{JSONObject(prefs.getString(key,null).orEmpty())}catch(_:Exception){JSONObject()}
-            val ids=o.optJSONArray("file_ids") ?: JSONArray()
-            val names=o.optJSONArray("file_names") ?: JSONArray()
-            val sizes=o.optJSONArray("file_sizes") ?: JSONArray()
-            val paths=o.optJSONArray("file_paths") ?: JSONArray()
-            val mimes=o.optJSONArray("file_mimes") ?: JSONArray()
-            while(paths.length()<ids.length())paths.put("")
-            while(mimes.length()<ids.length())mimes.put("")
-            var exists=false
-            for(i in 0 until ids.length()) if(JsonProtocol.string(ids, i)==fileId) {
-                exists=true
-                if(localPath!=null)paths.put(i,localPath)
-                if(!mime.isNullOrBlank())mimes.put(i,mime)
-            }
-            if(!exists){ ids.put(fileId); names.put(name); sizes.put(size); paths.put(localPath ?: ""); mimes.put(mime ?: mimeForFilename(name)) }
-            val pending=JSONArray()
-            o.optJSONArray("pending_uploads")?.let{a->
-                for(i in 0 until a.length()){
-                    val item=a.optJSONObject(i) ?: continue
-                    if(item.optString("uri")==rawUri && item.optString("kind")==pendingUploadKind) continue
-                    pending.put(item)
-                }
-            }
-            o.put("file_ids",ids).put("file_names",names).put("file_sizes",sizes).put("file_paths",paths).put("file_mimes",mimes).put("pending_uploads",pending).put("saved_at",System.currentTimeMillis())
-            prefs.edit().putString(key,o.toString()).commit()
-        }catch(_:Exception){}
-        }
-    }
-
-    private fun saveUploadedImageToComposer(chatId:String,path:String,fileId:String,rawUri:String,name:String="image",mime:String="image/*",size:Long=0L){
-        if(chatId.isBlank()) return
-        synchronized(composerMergeLock) {
-        if (chatDb.getChatTitle(chatId) == null) return
-        try{
-            val key=composerPrefsKey(chatId)
-            val o=try{JSONObject(prefs.getString(key,null).orEmpty())}catch(_:Exception){JSONObject()}
-            o.put("image_path",path).put("image_file_id",fileId).put("image_name",name).put("image_mime",mime).put("image_size",size)
-            val pending=JSONArray()
-            o.optJSONArray("pending_uploads")?.let{a->
-                for(i in 0 until a.length()){
-                    val item=a.optJSONObject(i) ?: continue
-                    if(item.optString("uri")==rawUri && item.optString("kind")=="image") continue
-                    pending.put(item)
-                }
-            }
-            o.put("pending_uploads",pending).put("saved_at",System.currentTimeMillis())
-            prefs.edit().putString(key,o.toString()).commit()
-        }catch(_:Exception){}
-        }
-    }
-
-    private fun rememberUploadUri(uri:Uri, kind:String){
-        val value=uri.toString() to kind
-        cancelledUploads.remove(attachmentKey(uri,kind))
-        if(pendingUploadUris.none{it.first==value.first && it.second==value.second}){
-            try{
-                contentResolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }catch(_:Exception){}
-            pendingUploadUris.add(value)
-            persistComposerStateNow()
-        }
-    }
-
-    private fun forgetUploadUri(uri:Uri, kind:String){
-        pendingUploadUris.removeAll{it.first==uri.toString() && it.second==kind}
-        persistComposerStateNow()
-    }
-
-    private fun resumePendingUploads(){
-        val pending=pendingUploadUris.toList()
-        val uploadChatId=currentChatId()
-        val uploadGeneration=activeResponseState.state.generation
-        pending.forEach { (rawUri,kind) ->
-            if(kind=="zip") return@forEach // ZIP is intentionally prepared only when the user taps Send.
-            val key="$kind|$rawUri"
-            if(!activePendingUploadKeys.add(key)) return@forEach
-            val uri=try{Uri.parse(rawUri)}catch(_:Exception){activePendingUploadKeys.remove(key);return@forEach}
-            if(kind=="image"){
-                beginUpload(uploadChatId, uploadGeneration)
-                startPendingPreview(uri,"image")
-                executor.execute{
-                    try{
-                        val path=copyImageToLocal(uri){done,total->reportUploadProgress(key,"Подготовка",(done*45L/total.coerceAtLeast(1L)),100L)}
-                            ?: throw IOException("Не удалось восстановить изображение")
-                        pendingLocalUploadPaths[key]=path
-                        val name=queryName(uri) ?: "image.${File(path).extension}"
-                        val mime=contentResolver.getType(uri).orEmpty().ifBlank{mimeForFilename(name)}
-                        val fileId=uploadImageFile(path,name,key){done,total->reportUploadProgress(key,"Загрузка",50L + (done*50L/total.coerceAtLeast(1L)),100L)}
-                        runOnUiThread{
-                            if(cancelledUploads.contains(key))return@runOnUiThread
-                            if(currentChatId()==uploadChatId){
-                                pendingImagePath=path
-                                pendingImageFileId=fileId
-                                pendingImageName=name
-                                pendingImageMime=mime
-                                pendingImageSize=File(path).length()
-                                forgetUploadUri(uri,"image")
-                                refreshAttachChips()
-                                persistComposerStateNow()
-                                status.text="Изображение восстановлено"
-                            }else{
-                                saveUploadedImageToComposer(uploadChatId,path,fileId,rawUri,name,mime,File(path).length())
-                            }
-                        }
-                    }catch(e:Exception){
-                        if(!cancelledUploads.contains(key)){
-                            diagnostics.log("pending_image_resume_failed",mapOf("error" to (e.message?:e.toString()).take(300)))
-                            runOnUiThread{status.text="Не удалось восстановить изображение: ${e.message}"}
-                        }
-                    }finally{
-                        endUpload(uploadChatId, uploadGeneration); uploadProgress.remove(key); pendingPreviewBitmaps.remove(key); pendingLocalUploadPaths.remove(key); activePendingUploadKeys.remove(key)
-                    }
-                }
-            }else{
-                if(contentResolver.getType(uri).orEmpty().startsWith("image/")) startPendingPreview(uri,"file")
-                beginUpload(uploadChatId, uploadGeneration)
-                executor.execute{
-                    try{
-                        val name = queryName(uri) ?: ""
-                        val ext=name.substringAfterLast('.', "").lowercase()
-                        if(ext !in supportedFileExtensions && !TextFileFormatPolicy.knownText(name))throw IOException("Формат .$ext больше не поддерживается")
-                        val uploaded=uploadFile(uri,key,{done,total->reportUploadProgress(key,"Загрузка",done,total)}){localPath,localMime,localSize->
-                            runOnUiThread{
-                                if(!cancelledUploads.contains(key)){
-                                    pendingLocalUploadPaths[key]=localPath
-                                    showPendingLocalPreview(key,localPath,queryName(uri) ?: "attachment",localMime)
-                                }
-                            }
-                        }
-                        runOnUiThread{
-                            if(cancelledUploads.contains(key))return@runOnUiThread
-                            if(currentChatId()==uploadChatId){
-                                attachedFileIds.add(uploaded.id)
-                                attachedFileNames.add(uploaded.name)
-                                attachedFileSizes.add(uploaded.size)
-                                attachedFilePaths.add(uploaded.path)
-                                attachedFileMimes.add(uploaded.mime)
-                                forgetUploadUri(uri,"file")
-                                refreshAttachChips()
-                                persistComposerStateNow()
-                                status.text="Вложение восстановлено: ${uploaded.name}"
-                            }else{
-                                saveUploadedFileToComposer(uploadChatId,uploaded.id,uploaded.name,uploaded.size,rawUri,uploaded.path,uploaded.mime)
-                            }
-                        }
-                    }catch(e:Exception){
-                        if(!cancelledUploads.contains(key)){
-                            diagnostics.log("pending_file_resume_failed",mapOf("error" to (e.message?:e.toString()).take(300)))
-                            runOnUiThread{status.text="Не удалось восстановить вложение: ${e.message}"}
-                        }
-                    }finally{
-                        endUpload(uploadChatId, uploadGeneration); uploadProgress.remove(key); pendingLocalUploadPaths.remove(key); activePendingUploadKeys.remove(key)
-                    }
-                }
-            }
-        }
-    }
 
     private fun composerPrefsKey(chatId:String = currentChatId()) = "composer_state_$chatId"
 
@@ -7190,12 +4087,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         chatDb.ensureChat(id,titleText)
     }
     private fun loadAllChats():List<JSONObject> = chatDb.listChatSummaries()
-    private fun jsonArrayToMutableList(arr:JSONArray?):MutableList<JSONObject>{
-         val out=mutableListOf<JSONObject>()
-         if(arr==null)return out
-         for(i in 0 until arr.length()) arr.optJSONObject(i)?.let{out.add(it)}
-         return out
-     }
+
     private fun persistCurrentChat(){
         val id=currentChatId()
         if(id.isBlank())return
@@ -7256,17 +4148,17 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             (0 until tools.length()).map { tools.optString(it) }.filter { it.isNotBlank() }.distinct().joinToString("  ")
         }.orEmpty()
         val active=activeResponsePersistence.getActiveResponse(currentChatId())
-        if(active!=null && (JsonProtocol.string(active, "response_id").isNotBlank() ||
-            OpenAiCreateCallOwners.isRegistered(currentChatId(), JsonProtocol.string(active, "request_id")) ||
-            OpenRouterResponseRuntime.contains(active.optString("request_id")))){
+        if (active != null && OpenRouterResponseRuntime.contains(active.optString("request_id"))) {
             val partial=JsonProtocol.string(active, "text")
             val pendingModel = chatDb.getChat(currentChatId())?.optJSONArray("messages")?.let { rows ->
                 (0 until rows.length()).mapNotNull { rows.optJSONObject(it) }
                     .firstOrNull { it.optString("request_id") == active.optString("request_id") }
             }
             val activeLabel = AssistantModelLabel.text(
-                pendingModel?.let { JSONObject().put("provider", it.optString("provider"))
-                    .put("requested_model", it.optString("requested_model")) } ?: JSONObject()
+                pendingModel?.let {
+                    JSONObject().put("provider", it.optString("provider", "openrouter"))
+                        .put("requested_model", it.optString("requested_model"))
+                } ?: JSONObject()
             )
             val activeId = ChatScrollPolicy.activeAssistantIdentity(
                 JsonProtocol.nonBlank(active, "request_id"),
@@ -7282,7 +4174,10 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             activeAssistantItemId = activeId
             status.text=if(active.optString("status")=="queued")"Модель в очереди…" else "Продолжается генерация…"
             setBusy(true)
-        }else{
+        } else if (active != null) {
+            status.text = "Сохранён незавершённый запрос. Для новой отправки остановите его явно."
+            setBusy(true)
+        } else {
             val restoredStatus = chat.lastOrNull { it.optString("role") == "assistant" }?.optString("status")
             status.text = ResponseStatusLabel.restored(restoredStatus)
             setBusy(false)
@@ -7378,29 +4273,18 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         if(chat[idx].optString("role")!="user") return
         val editingChatId = currentChatId()
         val active = activeResponsePersistence.getActiveResponse(editingChatId)
-        val cancelCredential = captureOpenAiRequestCredential(editingChatId, active)
         val editingRequestId = active?.optString("request_id").takeIf { !it.isNullOrBlank() && it != "null" }
-        // Invalidate the persisted request *before* truncating history. UI Stop would
-        // restore/remove unrelated bubbles and is not suitable for Edit.
         if (editingRequestId != null) {
             OpenRouterResponseRuntime.cancel(editingRequestId, "Сообщение изменено")
             chatDb.stopActiveRequestOnce(editingChatId, editingRequestId)
-            BackgroundResponseWorkScheduler.cancel(applicationContext, editingChatId, editingRequestId)
-            activeResumeCalls.remove(editingChatId)?.cancel()
-            val activeId = active?.optString("response_id")?.takeIf { it.isNotBlank() && it != "null" }
-            if (activeId != null && active?.optBoolean("background_enabled", false) == true) {
-                cancelRemoteResponse(editingChatId, activeId, cancelCredential)
-            }
         }
         activeResponseState.nextGeneration()
-        currentCall?.cancel()
         cancelOpenRouterRequest()
         openRouterModelPreflightCall.getAndSet(null)?.cancel()
         cancelPendingGitHubConfirmation()
         val message=chat[idx]
         val text=JsonProtocol.string(message, "text")
 
-        // Restore attachments from the original user message into the composer.
         restoreAttachmentSelectionFromMessage(message)
 
         while(chat.size>idx) chat.removeAt(chat.size-1)
@@ -7408,7 +4292,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         currentResponseId=chat.lastOrNull{it.optString("role")=="assistant"}
             ?.optString("response_id")?.takeIf{it.isNotBlank() && it!="null"}
         if(chat.isEmpty()) baselineEffort=null
-        // An explicit Edit is the only operation allowed to delete a history suffix.
         chatDb.upsertCurrentChat(currentChatId(), currentChatTitleSafe(), currentResponseId, baselineEffort, chat)
         input.setText(text)
         input.setSelection(input.text.length)
@@ -7435,42 +4318,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }catch(_:Exception){null}
     }
 
-    private fun copyImageToLocal(uri:Uri,onProgress:(Long,Long)->Unit={_,_->}):String?{
-        val mime=contentResolver.getType(uri)?.lowercase() ?: "image/jpeg"
-        val ext=when{
-            mime=="image/png"->"png"
-            mime=="image/webp"->"webp"
-            mime=="image/gif"->"gif"
-            mime=="image/jpeg"->"jpg"
-            else->throw IOException("Формат изображения не поддерживается: $mime. Используйте PNG, JPEG, WEBP или GIF.")
-        }
-        val maxBytes=50L*1024L*1024L
-        val reportedSize=querySize(uri)
-        if(reportedSize>maxBytes)throw IOException("Изображение слишком большое (максимум ${formatBytes(maxBytes)})")
-        val dir=File(filesDir,"attachments").apply{mkdirs()}
-        val file=File(dir,"img_${System.currentTimeMillis()}_${System.nanoTime()}.$ext")
-        var total=0L
-        try{
-            contentResolver.openInputStream(uri)?.use{input->
-                file.outputStream().use{output->
-                    val buffer=ByteArray(64*1024)
-                    while(true){
-                        val n=input.read(buffer)
-                        if(n<0)break
-                        total+=n
-                        if(total>maxBytes)throw IOException("Изображение слишком большое (максимум ${formatBytes(maxBytes)})")
-                        output.write(buffer,0,n)
-                        val known=reportedSize.takeIf{it>0} ?: maxBytes
-                        onProgress((total.coerceAtMost(known)*100L/known.coerceAtLeast(1L)),100L)
-                    }
-                }
-            } ?: throw IOException("Не удалось открыть изображение")
-            return file.absolutePath
-        }catch(e:Exception){
-            file.delete()
-            throw e
-        }
-    }
 
     // ---------- attachment UI / previews ----------
     private fun attachmentKey(uri:Uri, kind:String) = "$kind|${uri}"
@@ -7487,8 +4334,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         pendingImageName=null
         pendingImageMime=null
         pendingImageSize=0L
-        // Pending composer attachments are chat-scoped too. The old chat has already
-        // been persisted by callers before switching/deleting/creating another chat.
         pendingUploadUris.clear()
         uploadProgress.clear()
         pendingPreviewBitmaps.clear()
@@ -7605,12 +4450,12 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     }
 
     private fun prepareComposerEncoding(path: String, name: String, mime: String) {
-        if (pendingOpenAiPreparation.get() != null || pendingOpenRouterPreparation.get() != null) { status.text = "Дождитесь подготовки запроса"; return }
+        if (pendingOpenRouterPreparation.get() != null) { status.text = "Дождитесь подготовки запроса"; return }
         executor.execute {
             try {
                 val item = OpenRouterAttachmentStore.classifyLocalFile(this, File(path), name, mime)
                 runOnUiThread {
-                    if (path !in attachedFilePaths || item.kind != "text" || pendingOpenAiPreparation.get() != null || pendingOpenRouterPreparation.get() != null) item.textPath?.let { File(it).delete() }
+                    if (path !in attachedFilePaths || item.kind != "text" || pendingOpenRouterPreparation.get() != null) item.textPath?.let { File(it).delete() }
                     else {
                         attachedOpenRouterAttachments.removeAll { it.path == path }
                         attachedOpenRouterAttachments.add(item)
@@ -7623,7 +4468,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
 
     private fun chooseAttachmentEncoding(attachment: OpenRouterLocalAttachment, target: HistoricalAttachmentTarget? = null) {
         if (target != null && !attachmentRepairAvailable(target)) return
-        if (pendingOpenAiPreparation.get() != null || pendingOpenRouterPreparation.get() != null) { status.text = "Дождитесь подготовки запроса"; return }
+        if (pendingOpenRouterPreparation.get() != null) { status.text = "Дождитесь подготовки запроса"; return }
         val encodings = TextFileFormatPolicy.selectableEncodings
         AppThemeViews.dialog(this, currentTheme()).setTitle("Кодировка исходного файла")
             .setItems(encodings.toTypedArray()) { _, selected ->
@@ -7648,7 +4493,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         HistoricalAttachmentTarget(JsonProtocol.string(message, "chat_id", currentChatId()), JsonProtocol.objectCopy(message), manifestIndex, fileIndex, image)
 
     private fun attachmentRepairAvailable(target: HistoricalAttachmentTarget): Boolean {
-        if (pendingOpenAiPreparation.get() != null || pendingOpenRouterPreparation.get() != null || chatDb.getActiveResponse(target.chatId) != null) {
+        if (pendingOpenRouterPreparation.get() != null || chatDb.getActiveResponse(target.chatId) != null) {
             status.text = "Сначала завершите или остановите текущий ответ"
             return false
         }
@@ -7676,7 +4521,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             runOnUiThread { applyHistoricalAttachmentChange(target, replacement, cleanup) }
             return
         }
-        if (pendingOpenAiPreparation.get() != null || pendingOpenRouterPreparation.get() != null ||
+        if (pendingOpenRouterPreparation.get() != null ||
             !pendingAttachmentChange.compareAndSet(null, target.chatId)) { cleanup?.invoke(); runOnUiThread { status.text = "Сначала завершите подготовку запроса" }; return }
         executor.execute {
             try {
@@ -7701,10 +4546,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         executor.execute {
             var attachment: OpenRouterLocalAttachment? = null
             try {
-                val imported = OpenRouterAttachmentStore.copyAndClassify(this, uri,
-                    allowOpenAiContainer = JsonProtocol.string(target.expected, "provider", "openai") == "openai")
+                val imported = OpenRouterAttachmentStore.copyAndClassify(this, uri)
                 attachment = imported
-                // A replacement never reuses a provider ID belonging to the previous bytes.
                 val replacement = AttachmentMessageState.remove(target.expected, target.manifestIndex, target.fileIndex, target.image)
                 val manifest = replacement.optJSONArray("attachments") ?: JSONArray()
                 manifest.put(imported.toJson()); replacement.put("attachments", manifest)
@@ -7717,7 +4560,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     }
 
     private fun renderUserAttachments(message:JSONObject,card:LinearLayout){
-        // OpenRouter manifests provide local previews without transforming the wire image.
         val localManifest = message.optJSONArray("attachments")
         if (localManifest != null) {
             for (index in 0 until localManifest.length()) {
@@ -7796,7 +4638,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 box.addView(preview,LinearLayout.LayoutParams(-1,dp(220)))
             }else{
                 box.addView(TextView(this).apply{
-                    text="🖼\nИзображение пока не скачано"
+                    text = "🖼\nЛокальная копия изображения отсутствует"
                     gravity=Gravity.CENTER
                     textSize=13f; setTextColor(currentTheme().textSecondary)
                     background=rounded(currentTheme().cardBg,8)
@@ -7811,8 +4653,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 row.addView(fileActionButton("Просмотр"){showImagePreviewFromFile(imagePath,name)})
                 row.addView(fileActionButton("Сохранить"){requestSaveLocalFile(imagePath,name,mime)})
                 row.addView(fileActionButton("Поделиться"){shareLocalFile(imagePath,name,mime)})
-            }else if(imageFileId.isNotBlank()){
-                row.addView(fileActionButton("Скачать и открыть"){downloadUserImageCopy(message,card,true)})
             }
             addHistoryRepairActions(row, historyAttachmentTarget(message, image = true), imagePath == null)
             box.addView(row)
@@ -7822,7 +4662,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val filePaths = message.optJSONArray("file_paths") ?: JSONArray()
         for(i in 0 until maxOf(fileIds.length(),fileNames.length(),filePaths.length())){
             if (JsonProtocol.string(filePaths, i) in manifestPaths) continue
-            val fileId=JsonProtocol.string(fileIds, i)
             val name=safeDisplayName(JsonProtocol.string(fileNames, i).ifBlank{"attachment_${i+1}"})
             val size=fileSizes.optLong(i,0L)
             val localPath=userFileLocalPath(message,i)
@@ -7848,8 +4687,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 else row.addView(fileActionButton("Открыть"){openLocalFile(localPath,name,mime)})
                 row.addView(fileActionButton("Сохранить"){requestSaveLocalFile(localPath,name,mime)})
                 row.addView(fileActionButton("Поделиться"){shareLocalFile(localPath,name,mime)})
-            }else if(fileId.isNotBlank()){
-                row.addView(fileActionButton("Скачать и открыть"){downloadUserFileCopy(message,i,card,true)})
             }
             addHistoryRepairActions(row, historyAttachmentTarget(message, fileIndex = i), localPath == null)
             box.addView(row)
@@ -7861,143 +4698,6 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    private fun downloadUserFileCopy(message:JSONObject,index:Int,card:LinearLayout,openAfter:Boolean=false){
-        val names=message.optJSONArray("file_names") ?: return
-        val chatId=message.optString("chat_id").ifBlank{currentChatId()}
-        val target=HistoricalAttachmentDownloadTarget.file(chatId,message,index) ?: return
-        val generation=activeResponseState.state.generation
-        val fileId=target.fileId
-        val requestId=target.requestId.orEmpty()
-        val filename=safeDisplayName(JsonProtocol.string(names, index).ifBlank{"attachment_${index+1}"})
-        val mimeHint=userFileMime(message,index,filename)
-        val readCredential=historicalAttachmentCredentialProvider ?: secure::getApiKey
-        val credential=readCredential()
-        status.text="Скачиваю $filename…"
-        executor.execute{
-            var destination:File?=null
-            var retained=false
-            try{
-                if(credential!=readCredential())throw IOException("Ключ API изменился. Повторите скачивание с выбранным аккаунтом")
-                val req=Request.Builder().url("https://api.openai.com/v1/files/$fileId/content")
-                    .addHeader("Authorization","Bearer $credential").get().build()
-                destination=File.createTempFile("user_","_"+safeFileName(filename),File(filesDir,"attachments").apply{mkdirs()})
-                client.newCall(req).execute().use{resp->
-                    if(!resp.isSuccessful)throw FileDownloadException(resp.code)
-                    val body=resp.body ?: throw IOException("Пустой ответ")
-                    val maxBytes=512L*1024L*1024L
-                    var total=0L
-                    body.byteStream().use{input->destination!!.outputStream().use{output->
-                        val buffer=ByteArray(64*1024)
-                        while(true){
-                            val n=input.read(buffer);if(n<0)break
-                            total+=n
-                            if(total>maxBytes)throw IOException("Файл слишком большой для мобильного клиента")
-                            output.write(buffer,0,n)
-                        }
-                    }}
-                }
-                val mime=if(mimeHint.isBlank())mimeForFilename(filename) else mimeHint
-                val finalPath=destination!!.absolutePath
-                val finalSize=destination!!.length()
-                retained=chatDb.updateUserFileLocalPath(target,finalPath,mime,finalSize)
-                if(!retained)return@execute
-                diagnostics.log("user_file_cache_restored",mapOf("chat_id" to chatId,"request_id" to requestId,"file_id" to fileId,"filename" to filename,"bytes" to finalSize))
-                runOnUiThread{
-                    if(!isRequestCurrent(chatId,generation) || !chatDb.isHistoricalAttachmentDownloadCurrent(target,finalPath))return@runOnUiThread
-                    persistComposerStateNow()
-                    restoreCurrentChat()
-                    status.text="Файл доступен: $filename"
-                    if(openAfter)openPreviewForLocalFile(finalPath,filename,mime) {
-                        isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target,finalPath)
-                    }
-                }
-            }catch(e:FileDownloadException){
-                runOnUiThread{
-                    if(isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target))
-                        status.text=if(e.code==404||e.code==410)"Исходный файл больше недоступен" else "Не удалось скачать $filename: HTTP ${e.code}"
-                }
-            }catch(e:Exception){
-                runOnUiThread{
-                    if(isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target))
-                        status.text="Не удалось скачать $filename: ${e.message}"
-                }
-            }finally{
-                if(!retained)destination?.delete()
-            }
-        }
-    }
-
-    private fun downloadUserImageCopy(message:JSONObject,card:LinearLayout,openAfter:Boolean=false){
-        val chatId=message.optString("chat_id").ifBlank{currentChatId()}
-        val target=HistoricalAttachmentDownloadTarget.image(chatId,message)
-        if(target==null){
-            status.text="Исходное изображение больше недоступно"
-            return
-        }
-        val generation=activeResponseState.state.generation
-        val fileId=target.fileId
-        val requestId=target.requestId.orEmpty()
-        val name=safeDisplayName(JsonProtocol.string(message, "image_name").ifBlank{"image.png"})
-        val mimeHint=JsonProtocol.string(message, "image_mime").ifBlank{mimeForFilename(name)}
-        val readCredential=historicalAttachmentCredentialProvider ?: secure::getApiKey
-        val credential=readCredential()
-        status.text="Скачиваю $name…"
-        executor.execute{
-            var destination:File?=null
-            var retained=false
-            try{
-                if(credential!=readCredential())throw IOException("Ключ API изменился. Повторите скачивание с выбранным аккаунтом")
-                val req=Request.Builder()
-                    .url("https://api.openai.com/v1/files/$fileId/content")
-                    .addHeader("Authorization","Bearer $credential").get().build()
-                val dir=File(filesDir,"attachments").apply{mkdirs()}
-                destination=File.createTempFile("user_image_","_"+safeFileName(name),dir)
-                var mime=mimeHint
-                client.newCall(req).execute().use{resp->
-                    if(!resp.isSuccessful)throw FileDownloadException(resp.code)
-                    val body=resp.body ?: throw IOException("Пустой ответ")
-                    resp.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf{it.isNotBlank()}?.let{mime=it}
-                    val maxBytes=512L*1024L*1024L
-                    var total=0L
-                    body.byteStream().use{input->destination!!.outputStream().use{output->
-                        val buffer=ByteArray(64*1024)
-                        while(true){
-                            val n=input.read(buffer);if(n<0)break
-                            total+=n
-                            if(total>maxBytes)throw IOException("Файл слишком большой для мобильного клиента")
-                            output.write(buffer,0,n)
-                        }
-                    }}
-                }
-                val finalPath=destination!!.absolutePath
-                val finalSize=destination!!.length()
-                retained=chatDb.updateUserImageLocalPath(target,finalPath,mime,finalSize)
-                if(!retained)return@execute
-                diagnostics.log("user_image_cache_restored",mapOf("chat_id" to chatId,"request_id" to requestId,"file_id" to fileId,"bytes" to finalSize))
-                runOnUiThread{
-                    if(!isRequestCurrent(chatId,generation) || !chatDb.isHistoricalAttachmentDownloadCurrent(target,finalPath))return@runOnUiThread
-                    persistComposerStateNow()
-                    restoreCurrentChat()
-                    status.text="Изображение доступно: $name"
-                    if(openAfter)showImagePreviewFromFile(finalPath,name) {
-                        isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target,finalPath)
-                    }
-                }
-            }catch(e:FileDownloadException){
-                runOnUiThread{
-                    if(isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target))
-                        status.text=if(e.code==404||e.code==410)"Исходное изображение больше недоступно" else "Не удалось скачать $name: HTTP ${e.code}"
-                }
-            }catch(e:Exception){
-                runOnUiThread{
-                    if(isRequestCurrent(chatId,generation) && chatDb.isHistoricalAttachmentDownloadCurrent(target))
-                        status.text="Не удалось скачать $name: ${e.message}"
-                }
-            }finally{
-                if(!retained)destination?.delete()
-            }
-        }
-    }
 
     private fun showImagePreviewFromBitmap(bitmap:Bitmap,name:String=""){
         val image=ImageView(this).apply{
@@ -8210,100 +4910,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         }
     }
 
-    private fun showPendingLocalPreview(key:String,path:String,name:String,mime:String){
-        uploadCards[key]?.let{v->
-            if(v.actions.childCount>1)v.actions.removeViews(0,v.actions.childCount-1)
-            if(v.root.findViewWithTag<View>("attachment_local_preview")==null){
-                when{
-                    mime.startsWith("image/") -> {
-                        val view=ImageView(this).apply{
-                            tag="attachment_local_preview"
-                            scaleType=ImageView.ScaleType.CENTER_CROP
-                            adjustViewBounds=true
-                            background=rounded(currentTheme().cardBg,8)
-                            setOnClickListener{showImagePreviewFromFile(path,name)}
-                        }
-                        v.root.addView(view,v.root.indexOfChild(v.name),LinearLayout.LayoutParams(-1,dp(52)).apply{bottomMargin=dp(6)})
-                    }
-                    isTextLikeMime(mime,name) -> {
-                        val view=TextView(this).apply{
-                            tag="attachment_local_preview"
-                            text="Читаю файл…"
-                            textSize=11.5f;setTextColor(currentTheme().textPrimary);typeface=Typeface.MONOSPACE
-                            setPadding(dp(10),dp(8),dp(10),dp(8));setBackgroundColor(currentTheme().cardBg);maxLines=2
-                            ellipsize=TextUtils.TruncateAt.END;setOnClickListener{showTextPreview(path,name)}
-                        }
-                        v.root.addView(view,v.root.indexOfChild(v.name),LinearLayout.LayoutParams(-1,dp(118)).apply{bottomMargin=dp(6)})
-                        executor.execute{
-                            try{
-                                val maxPreview=36*1024
-                                val bytes=ByteArray(maxPreview)
-                                var offset=0
-                                File(path).inputStream().use{input->while(offset<bytes.size){val n=input.read(bytes,offset,bytes.size-offset);if(n<0)break;offset+=n}}
-                                var text=String(bytes,0,offset,StandardCharsets.UTF_8).replace("\u0000","")
-                                if(name.substringAfterLast(".","").equals("json",true)) text=try{JSONObject(text).toString(2)}catch(_:Exception){try{JSONArray(text).toString(2)}catch(_:Exception){text}}
-                                val first=text.lineSequence().take(8).joinToString("\n")
-                                runOnUiThread{view.text=if(first.isBlank())"(пустой файл)" else first}
-                            }catch(_:Exception){runOnUiThread{view.text="Не удалось прочитать файл. Нажмите «Просмотр»."}}
-                        }
-                    }
-                    mime.equals("application/pdf",true) -> {
-                        val view=ImageView(this).apply{
-                            tag="attachment_local_preview"
-                            scaleType=ImageView.ScaleType.FIT_CENTER
-                            background=rounded(currentTheme().cardBg,8)
-                            setOnClickListener{showPdfPreview(path,name)}
-                        }
-                        v.root.addView(view,v.root.indexOfChild(v.name),LinearLayout.LayoutParams(-1,dp(52)).apply{bottomMargin=dp(6)})
-                        executor.execute{
-                            try{
-                                ParcelFileDescriptor.open(File(path),ParcelFileDescriptor.MODE_READ_ONLY).use{pfd->
-                                PdfRenderer(pfd).use{renderer->
-                                    if(renderer.pageCount>0){
-                                        renderer.openPage(0).use{page->
-                                            val scale=minOf(1.5f,720f/maxOf(page.width,1).toFloat())
-                                            val w=maxOf((page.width*scale).toInt(),1);val h=maxOf((page.height*scale).toInt(),1)
-                                            val bmp=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);bmp.eraseColor(Color.WHITE)
-                                            page.render(bmp,null,null,PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                            runOnUiThread{view.setImageBitmap(bmp)}
-                                        }
-                                    }
-                                }
-                                }
-                            }catch(_:Exception){}
-                        }
-                    }
-                }
-            }
-            val label=when{
-                mime.startsWith("image/") -> "Просмотр"
-                isTextLikeMime(mime,name) -> "Просмотр"
-                mime.equals("application/pdf",true) -> "Просмотр"
-                else -> "Открыть"
-            }
-            val button=fileActionButton(label){openPreviewForLocalFile(path,name,mime)}
-            v.actions.addView(button,0)
-            v.details.text="Локальная копия готова · загружаю на сервер…"
-        }
-    }
 
     private val pendingPreviewBitmaps = ConcurrentHashMap<String, Bitmap>()
 
-    private fun startPendingPreview(uri:Uri,kind:String){
-        if(kind!="image")return
-        val key=attachmentKey(uri,kind)
-        executor.execute{
-            val bmp=decodeThumbnailFromUri(uri,640) ?: return@execute
-            pendingPreviewBitmaps[key]=bmp
-            runOnUiThread{
-                uploadCards[key]?.let{v->
-                    v.preview.setImageBitmap(bmp)
-                    val displayName=v.name.text.toString().removePrefix("🖼 ")
-                    v.preview.setOnClickListener{showImagePreviewFromBitmap(bmp,displayName)}
-                }
-            }
-        }
-    }
 
     private fun decodeThumbnailFromUri(uri:Uri,maxDim:Int):Bitmap?{
         return try{
@@ -8322,30 +4931,14 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         return contentResolver.query(uri,arrayOf(OpenableColumns.SIZE),null,null,null)?.use{c->if(c.moveToFirst()&&!c.isNull(0))c.getLong(0) else 0L} ?: 0L
     }
 
-    private fun reportUploadProgress(key:String,stage:String,written:Long,total:Long){
-        val pct=if(total>0L)(written.coerceAtMost(total)*100L/total).toInt().coerceIn(0,100) else 0
-        val now=SystemClock.uptimeMillis()
-        val last=uploadProgress[key]
-        if(last!=null && last.second==pct && now-last.first<120L)return
-        uploadProgress[key]=now to pct
-        runOnUiThread{
-            uploadCards[key]?.let{v->
-                v.progress.visibility=View.VISIBLE
-                if(total>0){v.progress.isIndeterminate=false;v.progress.progress=pct}
-                v.details.text=if(total>0)"$stage · $pct%" else "$stage…"
-            }
-        }
-    }
 
     private fun cancelPendingUpload(uri:Uri,kind:String){
         val key=attachmentKey(uri,kind)
         cancelledUploads.add(key)
         if (kind == "zip") activeZipOperation = null
-        uploadCalls.remove(key)?.cancel()
         uploadProgress.remove(key)
         pendingUploadUris.removeAll{it.first==uri.toString() && it.second==kind}
         pendingPreviewBitmaps.remove(key)
-        pendingLocalUploadPaths.remove(key)?.let{try{File(it).delete()}catch(_:Exception){}}
         persistComposerStateNow()
         refreshAttachChips()
         status.text="Вложение удалено"

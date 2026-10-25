@@ -22,8 +22,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="astra-implementation-check-", dir=ROOT.parent) as temp:
         copy = Path(temp) / "repo"
         shutil.copytree(ROOT / "app/src", copy / "app/src")
+        shutil.copytree(ROOT / ".github/workflows", copy / ".github/workflows")
         cases = [
-            ("android_json_null_becomes_text", "app/src/main/java/com/example/openaichat/OpenAiLocalContextEncoder.kt",
+            ("android_json_null_becomes_text", "app/src/main/java/com/example/openaichat/MainActivity.kt",
              lambda text: text.replace('JsonProtocol.string(message, "text")', 'message.optString("text")', 1)),
             ("unclosed_kotlin", "app/src/main/java/com/example/openaichat/JsonProtocol.kt",
              lambda text: text + "\n{\n"),
@@ -38,6 +39,14 @@ def main():
              lambda text: text.replace('outState.putString("per_chat_scroll_anchors_v1", ChatScrollPolicy.encodeAnchorsJson(perChatScrollAnchors, currentChatId()))', '// dropped saved anchors', 1)),
             ("truncated_search_left_context_overlap", "app/src/main/java/com/example/openaichat/LocalFileTools.kt",
              lambda text: text.replace('val carryWindow = SEARCH_LEFT_CONTEXT + query.length - 1', 'val carryWindow = maxOf(query.length - 1, 100)', 1)),
+            ("database_closed_before_callbacks_finish", "app/src/main/java/com/example/openaichat/MainActivity.kt",
+             lambda text: text.replace('ExecutorResourceCloser.closeAfterTermination', 'UnsafeImmediateDatabaseClose.close', 1)),
+            ("direct_openai_endpoint", "app/src/main/java/com/example/openaichat/MainActivity.kt",
+             lambda text: text + '\nprivate const val RETIRED_ENDPOINT = "https://api.openai.com/v1/responses"\n'),
+            ("non_claude_model_in_catalog", "app/src/main/java/com/example/openaichat/ModelCatalog.kt",
+             lambda text: text.replace('ModelOption("anthropic/', 'ModelOption("other/', 1)),
+            ("legacy_protocol_metadata_removed", "app/src/main/java/com/example/openaichat/MessageMetadataCodec.kt",
+             lambda text: text.replace('"openai_protocol_output"', '"discarded_protocol"')),
         ]
         for name, relative, mutate in cases:
             path = copy / relative

@@ -6,8 +6,8 @@ import org.json.JSONObject
 /** Small request decisions shared by Send and the read-only context inspector. */
 object ContextRequestPolicy {
     fun model(provider: String, configured: String?): String {
-        val value = configured ?: if (provider == "openrouter") "anthropic/claude-opus-5.5" else "gpt-6-astra"
-        return if (provider == "openai") OpenAiInstructionChainPolicy.normalizedModel(value) else value
+        require(provider == "openrouter") { "Поддерживается только OpenRouter" }
+        return ModelCatalog.normalizedClaudeModel(configured)
     }
 
     fun openRouterTools(github: Boolean, webSearch: Boolean, webFetch: Boolean): JSONArray =

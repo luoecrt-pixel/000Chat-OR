@@ -31,7 +31,7 @@ data class ContextStatusSnapshot(
         append("\n\nПоследний ответ: " + (lastResponseAgeMillis?.let { "${it / 1000} с назад" } ?: "время неизвестно"))
         append("\nПолучено из кэша: " + (cacheReadTokens?.toString() ?: "неизвестно"))
         append("\nЗаписано в кэш: " + (cacheWriteTokens?.toString() ?: "неизвестно"))
-        append("\n\nЭто локальная проверка готовности. Срок кэша и сохранённая цепочка не гарантируют серверный cache hit. Размер в токенах и полный wire-размер определяются при подготовке запроса.")
+        append("\n\nЭто локальная проверка готовности. Срок кэша не гарантирует серверный cache hit. Размер в токенах и полный wire-размер определяются при подготовке запроса.")
     }
 }
 
@@ -40,56 +40,37 @@ object ContextStatusPolicy {
         source?.opt(key)?.toString()?.toLongOrNull()?.takeIf { it >= 0L }
 
     fun build(
-        provider: String, model: String, history: List<JSONObject>,
-        previousResponseId: String?, openAiFingerprint: String,
-        pendingManifests: Boolean, expectedOpenRouterBinding: String?,
+        model: String, history: List<JSONObject>,
+        expectedOpenRouterBinding: String?,
         route: OpenRouterClaudeRoute, cacheMode: String,
         attachmentNames: List<String>, tools: List<String>,
         accounting: JSONObject?, lastResponseAtMillis: Long?, nowMillis: Long,
         openRouterPrefixMatches: Boolean? = null, openRouterPrefixReason: String? = null,
         lastRequest: ContextLastRequest? = null
     ): ContextStatusSnapshot {
-        val last = history.lastOrNull()
-        val reusable = provider == "openai" && !pendingManifests &&
-            OpenAiInstructionChainPolicy.canReuse(previousResponseId, history, openAiFingerprint)
-        val mode: String
-        val reason: String
-        if (provider == "openai") {
-            mode = if (reusable) "цепочка" else "локальный replay"
-            reason = when {
-                reusable -> "Следующий обычный ход может использовать previous_response_id."
-                pendingManifests -> "Локальные manifests требуют полного typed replay."
-                last?.optString("status") != "completed" -> "Нет непосредственно предшествующего завершённого ответа OpenAI."
-                last?.optString("provider") != "openai" -> "Предыдущий ход принадлежит другому провайдеру."
-                last?.optString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD) != openAiFingerprint ->
-                    "Изменились модель, аккаунт или инструкции либо отсутствует совместимая привязка."
-                else -> "Нет совместимого идентификатора предыдущего ответа."
-            }
-        } else {
-            mode = if (OpenRouterClaudeRoute.isClaude(model)) "кэш $cacheMode" else "полная история"
-            val previous = history.lastOrNull { it.optString("role") == "assistant" }
-            val protocol = previous?.optJSONObject("openrouter_protocol")
-            val saved = protocol?.let { JsonProtocol.nonBlank(it, "binding_sha256") }
-            val bindingReason = when {
-                previous?.optString("protocol_context_state") == "invalidated" -> "Подписанная история сброшена после изменения контекста."
-                protocol == null -> "Сохранённой подписанной привязки нет."
-                protocol.optInt("version") != 1 -> "Версия сохранённого протокола не поддерживается."
-                (protocol.optJSONArray("tail")?.length() ?: protocol.optInt("_context_tail_count", -1)) <= 0 -> "В сохранённом протоколе нет воспроизводимой истории."
-                saved == null -> "Сохранённой подписанной привязки нет."
-                saved == expectedOpenRouterBinding -> "Привязка модели, маршрута и инструментов сохранена."
-                else -> "Привязка изменилась: модель, аккаунт, маршрут, формат или инструменты."
-            }
-            val prefixReason = when (openRouterPrefixMatches) {
-                true -> "Полный локальный префикс совпадает с сохранённым."
-                false -> openRouterPrefixReason ?: "Полный префикс изменился: системные инструкции, история или вложения."
-                null -> openRouterPrefixReason ?: "Полный префикс, включая системные инструкции и вложения, проверяется при подготовке."
-            }
-            reason = "$bindingReason $prefixReason История при проверке не изменяется."
+        val mode = if (OpenRouterClaudeRoute.isClaude(model)) "кэш $cacheMode" else "полная история"
+        val previous = history.lastOrNull { it.optString("role") == "assistant" }
+        val protocol = previous?.optJSONObject("openrouter_protocol")
+        val saved = protocol?.let { JsonProtocol.nonBlank(it, "binding_sha256") }
+        val bindingReason = when {
+            previous?.optString("protocol_context_state") == "invalidated" -> "Подписанная история сброшена после изменения контекста."
+            protocol == null -> "Сохранённой подписанной привязки нет."
+            protocol.optInt("version") != 1 -> "Версия сохранённого протокола не поддерживается."
+            (protocol.optJSONArray("tail")?.length() ?: protocol.optInt("_context_tail_count", -1)) <= 0 -> "В сохранённом протоколе нет воспроизводимой истории."
+            saved == null -> "Сохранённой подписанной привязки нет."
+            saved == expectedOpenRouterBinding -> "Привязка модели, маршрута и инструментов сохранена."
+            else -> "Привязка изменилась: модель, аккаунт, маршрут, формат или инструменты."
         }
+        val prefixReason = when (openRouterPrefixMatches) {
+            true -> "Полный локальный префикс совпадает с сохранённым."
+            false -> openRouterPrefixReason ?: "Полный префикс изменился: системные инструкции, история или вложения."
+            null -> openRouterPrefixReason ?: "Полный префикс, включая системные инструкции и вложения, проверяется при подготовке."
+        }
+        val reason = "$bindingReason $prefixReason История при проверке не изменяется."
         val usage = if (lastRequest != null) lastRequest.accounting else accounting
         val terminalAt = if (lastRequest != null) lastRequest.terminalAtMillis else lastResponseAtMillis
         return ContextStatusSnapshot(model,
-            if (provider == "openai") "OpenAI Responses" else if (OpenRouterClaudeRoute.isClaude(model) && route == OpenRouterClaudeRoute.ANTHROPIC)
+            if (OpenRouterClaudeRoute.isClaude(model) && route == OpenRouterClaudeRoute.ANTHROPIC)
                 "Anthropic через OpenRouter" else "OpenRouter · Auto",
             mode, reason, history.size, history.sumOf { JsonProtocol.string(it, "text").length.toLong() },
             attachmentNames.distinct(), tools.distinct(), counter(usage, "cached_tokens"),

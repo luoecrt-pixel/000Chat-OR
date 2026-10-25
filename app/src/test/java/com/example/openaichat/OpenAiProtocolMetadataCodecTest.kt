@@ -14,17 +14,17 @@ class OpenAiProtocolMetadataCodecTest {
             .put("encrypted_content", signed)
         val original = JSONObject()
             .put("openai_protocol_output", JSONArray().put(item))
-            .put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, digest)
+            .put("openai_instructions_sha256", digest)
         assertTrue(MessageMetadataCodec.allKeys.contains("openai_protocol_output"))
-        assertTrue(MessageMetadataCodec.allKeys.contains(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD))
+        assertTrue(MessageMetadataCodec.allKeys.contains("openai_instructions_sha256"))
         val restored = JSONObject()
         for (key in listOf("openai_protocol_output",
-            OpenAiInstructionChainPolicy.FINGERPRINT_FIELD)) {
+            "openai_instructions_sha256")) {
             val serialized = MessageMetadataCodec.serialized(original, key)
             assertNotNull(serialized)
             MessageMetadataCodec.decodeInto(restored, key, serialized)
         }
-        assertEquals(digest, restored.getString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD))
+        assertEquals(digest, restored.getString("openai_instructions_sha256"))
         assertEquals(signed, restored.getJSONArray("openai_protocol_output")
             .getJSONObject(0).getString("encrypted_content"))
         assertEquals(original.getJSONArray("openai_protocol_output").toString(),

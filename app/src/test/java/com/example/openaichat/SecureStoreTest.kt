@@ -30,16 +30,16 @@ class SecureStoreTest {
             ByteArray(12) { 1 } + raw
         }
 
-        assertTrue(store.setApiKey("sk-account-A-valid"))
-        assertTrue(prefs.getString("key", null).orEmpty().isNotBlank())
+        assertTrue(store.setOpenRouterApiKey("sk-account-A-valid"))
+        assertTrue(prefs.getString("openrouter_key", null).orEmpty().isNotBlank())
 
         // Simulate Keystore failure when user replaces Account A key with Account B key.
         shouldFail = true
-        assertFalse(store.setApiKey("sk-account-B-new"))
+        assertFalse(store.setOpenRouterApiKey("sk-account-B-new"))
 
         // Old Account A key must be evicted so next request cannot silently bill Account A.
-        assertEquals(null, prefs.getString("key", null))
-        assertEquals("", store.getApiKey())
+        assertEquals(null, prefs.getString("openrouter_key", null))
+        assertEquals("", store.getOpenRouterApiKey())
     }
 
     @Test
@@ -54,4 +54,19 @@ class SecureStoreTest {
         assertEquals("", store.getOpenRouterApiKey())
         assertEquals("", store.getGitHubToken())
     }
+    @Test
+    fun retiringDirectCredentialPreservesOpenRouterAndGitHubSlots() {
+        val context = RuntimeEnvironment.getApplication()
+        val prefs = context.getSharedPreferences("secure", Context.MODE_PRIVATE)
+        prefs.edit().clear().putString("key", "retired-encrypted-secret")
+            .putString("openrouter_key", "router-encrypted-secret")
+            .putString("github_pat", "github-encrypted-secret").commit()
+        val store = SecureStore(context)
+        assertTrue(store.discardLegacyOpenAiCredential())
+        assertFalse(prefs.contains("key"))
+        assertEquals("router-encrypted-secret", prefs.getString("openrouter_key", null))
+        assertEquals("github-encrypted-secret", prefs.getString("github_pat", null))
+        assertTrue(store.discardLegacyOpenAiCredential())
+    }
+
 }

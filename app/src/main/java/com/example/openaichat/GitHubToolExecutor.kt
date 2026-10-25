@@ -5,11 +5,16 @@ import android.util.Base64
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+
+/** A mutation may have reached GitHub; it must not become an ordinary failed tool result. */
+class GitHubToolOutcomeUnknownException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 class GitHubToolExecutor(
     private val secureStore: SecureStore,
@@ -50,6 +55,8 @@ class GitHubToolExecutor(
             "trigger_workflow_dispatch" -> triggerWorkflowDispatch(arguments)
             else -> errorResult("Unknown GitHub tool: $name")
         }
+    } catch (e: GitHubToolOutcomeUnknownException) {
+        throw e
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         if (!canExecute()) throw IOException("GitHub request owner is no longer current", e)
@@ -96,19 +103,38 @@ class GitHubToolExecutor(
         .addHeader("X-GitHub-Api-Version", "2022-11-28")
 
     private fun call(request: Request): Pair<Int, String> {
+        val mutation = request.method !in setOf("GET", "HEAD")
+        // A lost mutation response is not permission to send the mutation again.
+        val transport = if (mutation) httpClient.newBuilder().retryOnConnectionFailure(false)
+            .followRedirects(false).followSslRedirects(false).build() else httpClient
+        val outbound = if (mutation && request.body != null) {
+            val delegate = request.body!!
+            request.newBuilder().method(request.method, object : RequestBody() {
+                override fun contentType() = delegate.contentType()
+                override fun contentLength() = delegate.contentLength()
+                override fun isDuplex() = delegate.isDuplex()
+                // OkHttp can follow 503 Retry-After:0 even with connection retries disabled.
+                override fun isOneShot() = true
+                override fun writeTo(sink: BufferedSink) = delegate.writeTo(sink)
+            }).build()
+        } else request
         var attempt = 0
         var code = 0
         var body = ""
         while (attempt < 3) {
             if (!canExecute()) throw IOException("GitHub request owner is no longer current")
-            httpClient.newCall(request).execute().use { httpResponse ->
+            var observedCode: Int? = null
+            try { transport.newCall(outbound).execute().use { httpResponse ->
                 code = httpResponse.code
+                observedCode = code
+                if (mutation && code >= 500) throw GitHubToolOutcomeUnknownException(
+                    "GitHub вернул HTTP $code после отправки записи; результат операции неизвестен")
                 body = if (httpResponse.isSuccessful) {
                     BoundedResponseDecoder.readBody(httpResponse.body)
                 } else {
                     BoundedResponseDecoder.readErrorBody(httpResponse.body)
                 }
-                if (code != 403 && code != 429) return code to body
+                if (mutation || (code != 403 && code != 429)) return code to body
                 val retryMs = httpResponse.header("Retry-After")?.toLongOrNull()
                     ?.coerceIn(0L, 10L)?.times(1000L) ?: 750L * (attempt + 1)
                 try {
@@ -117,6 +143,12 @@ class GitHubToolExecutor(
                     Thread.currentThread().interrupt()
                     throw IOException("GitHub retry interrupted", interrupted)
                 }
+            } } catch (error: GitHubToolOutcomeUnknownException) { throw error }
+            catch (error: IOException) {
+                if (mutation && (observedCode == null || observedCode in 200..299))
+                    throw GitHubToolOutcomeUnknownException(
+                        "Ответ GitHub на запись не подтверждён; автоматическое продолжение запрещено", error)
+                throw error
             }
             attempt++
         }

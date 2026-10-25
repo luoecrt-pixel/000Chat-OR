@@ -10,24 +10,17 @@ import java.util.UUID
 
 /**
  * Real SQLite persistence/reopen and ownership tests for the state consumed
- * interchangeably by MainActivity.streamBackgroundResponse and the Worker.
+ * by the offline legacy checkpoint decoder.
  */
 @RunWith(AndroidJUnit4::class)
 class ActiveResponseIndexedCheckpointPersistenceTest {
-    private fun delta(sequence: Int, output: Int, part: Int, value: String) =
-        JSONObject().put("type", "response.output_text.delta")
-            .put("sequence_number", sequence)
-            .put("output_index", output).put("content_index", part)
-            .put("delta", value)
-
     @Test fun atomicCheckpointSurvivesReopenAndPreventsOutOfOrderCallbacks() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val chatId = "indexed-sse-" + UUID.randomUUID()
         val requestId = "owned-" + UUID.randomUUID()
         try {
-            var initial = ResponseEventState()
-            initial = ResponseEventReducer.reduce(initial, delta(1, 1, 0, "World")).state
-            initial = ResponseEventReducer.reduce(initial, delta(2, 0, 0, "Hello ")).state
+            val initial = ResponseEventState(text = "Hello World", indexedTextParts = mapOf(
+                ResponseContentIndex(0, 0) to "Hello ", ResponseContentIndex(1, 0) to "World"))
             assertEquals("Hello World", initial.text)
             ChatDatabase(context).use { db ->
                 db.ensureChat(chatId, "Indexed partial")
@@ -50,11 +43,10 @@ class ActiveResponseIndexedCheckpointPersistenceTest {
                 // Process / SQLiteOpenHelper reopen restores the same indexed
                 // prefix; seq=3 must extend the *existing* indexed part.
                 val saved = db.getActiveResponse(chatId)!!
-                var resumed = ResponseIndexedCheckpoint.restore(saved)
-                resumed = ResponseEventReducer.reduce(resumed,
-                    delta(3, 0, 0, "there, ")).state
-                resumed = ResponseEventReducer.reduce(resumed,
-                    delta(4, 1, 0, " again")).state
+                val restored = ResponseIndexedCheckpoint.restore(saved)
+                assertEquals("Hello World", restored.text)
+                val resumed = restored.copy(text = "Hello there, World again", indexedTextParts = mapOf(
+                    ResponseContentIndex(0, 0) to "Hello there, ", ResponseContentIndex(1, 0) to "World again"))
                 assertEquals("Hello there, World again", resumed.text)
                 db.updateActiveResponse(chatId, "resp_owned", resumed.text,
                     "in_progress", 4, requestId, ResponseIndexedCheckpoint.serialize(resumed))

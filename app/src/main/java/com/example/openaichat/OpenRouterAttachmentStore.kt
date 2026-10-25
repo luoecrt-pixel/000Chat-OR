@@ -8,7 +8,6 @@ import androidx.core.content.FileProvider
 import fr.free.nrw.commons.ajpegtran.Jpegtran
 import fr.free.nrw.commons.ajpegtran.Properties
 import fr.free.nrw.commons.ajpegtran.rotate.RotationDegree
-import java.util.Base64
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -89,8 +88,7 @@ object OpenRouterAttachmentStore {
         context: Context,
         uri: Uri,
         forcedName: String? = null,
-        inputStreamSource: AttachmentInputStreamSource = DefaultAttachmentInputStreamSource,
-        allowOpenAiContainer: Boolean = false
+        inputStreamSource: AttachmentInputStreamSource = DefaultAttachmentInputStreamSource
     ): OpenRouterLocalAttachment {
         val name = sanitizeDisplayName(forcedName ?: queryName(context, uri) ?: "attachment")
         val mime = runCatching { context.contentResolver.getType(uri).orEmpty() }.getOrDefault("").ifBlank { mimeForFilename(name) }
@@ -101,12 +99,6 @@ object OpenRouterAttachmentStore {
         } ?: throw IOException("Не удалось открыть файл: " + name)
         return try { finalizeFile(context, dir, raw, name, mime) }
         catch (e: Exception) {
-            if (allowOpenAiContainer && TextFileFormatPolicy.extension(name) in setOf("doc", "ppt", "xls", "zip")) {
-                val sha = sha256(raw)
-                return OpenRouterLocalAttachment("container_" + sha, name,
-                    if (TextFileFormatPolicy.extension(name) in setOf("doc", "ppt")) "container_document" else "container",
-                    raw.absolutePath, mime, raw.length(), sha)
-            }
             raw.delete(); throw e
         }
     }
@@ -256,19 +248,6 @@ object OpenRouterAttachmentStore {
     internal fun streamingDataUrl(a: OpenRouterLocalAttachment): FileBackedDataUrl {
         val (file, mime) = checkedWire(a)
         return FileBackedDataUrl(file, mime)
-    }
-    // Compatibility helper for the separate OpenAI encoder; OpenRouter uses disk-backed wire values.
-    fun toDataUrl(a: OpenRouterLocalAttachment): String {
-        val (wireFile, wireMime) = checkedWire(a)
-        val encoded = StringBuilder()
-        val ascii = object : java.io.OutputStream() {
-            override fun write(b: Int) { encoded.append((b and 255).toChar()) }
-            override fun write(b: ByteArray, off: Int, len: Int) { encoded.append(String(b, off, len, Charsets.US_ASCII)) }
-        }
-        Base64.getEncoder().wrap(ascii).use { output ->
-            wireFile.inputStream().use { input -> input.copyTo(output, 64 * 1024) }
-        }
-        return "data:" + wireMime + ";base64," + encoded
     }
 
     fun withTextEncoding(a: OpenRouterLocalAttachment, encoding: String): OpenRouterLocalAttachment {

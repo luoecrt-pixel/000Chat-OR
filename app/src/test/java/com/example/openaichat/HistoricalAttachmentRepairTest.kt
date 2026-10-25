@@ -95,12 +95,11 @@ class HistoricalAttachmentRepairTest {
             val message = JSONObject().put("role", "user").put("file_paths", JSONArray().put(source.path))
                 .put("file_names", JSONArray().put("input.txt")).put("attachments", JSONArray().put(selected.toJson()))
             val count = dir.listFiles()!!.size
-            OpenAiLocalContextEncoder.encode(listOf(message))
-            OpenAiLocalContextEncoder.encode(listOf(message))
+            LocalArtifactAttachmentResolver.resolveForTools(RuntimeEnvironment.getApplication(), selected)
+            LocalArtifactAttachmentResolver.resolveForTools(RuntimeEnvironment.getApplication(), selected)
             assertEquals(count, dir.listFiles()!!.size)
             File(selected.textPath!!).delete()
-            OpenAiLocalContextEncoder.materialize(listOf(message), false) { _, _ -> }
-            val restored = OpenRouterLocalAttachment.fromJson(message.getJSONArray("attachments").getJSONObject(0))
+            val restored = LocalArtifactAttachmentResolver.resolveForTools(RuntimeEnvironment.getApplication(), selected)
             assertEquals("KOI8-R", restored.textEncoding)
             assertEquals("Философия", File(restored.textPath!!).readText())
         } finally { dir.deleteRecursively() }

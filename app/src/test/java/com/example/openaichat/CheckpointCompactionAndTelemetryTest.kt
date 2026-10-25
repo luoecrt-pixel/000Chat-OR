@@ -202,7 +202,7 @@ class CheckpointCompactionAndTelemetryTest {
         }
     }
 
-    @Test fun failedClaimKeepsSignedOpenRouterTailAndCancelsOnlyUnfinishedToolCall() {
+    @Test fun failedClaimKeepsSignedOpenRouterTailAndBlocksUnknownToolOutcome() {
         ChatDatabase(context).use { db ->
             prepared(db, provider = "openrouter")
             val signed = JSONObject().put("role", "assistant").put("content", "paid reasoning text")
@@ -220,8 +220,12 @@ class CheckpointCompactionAndTelemetryTest {
             val tail = message.getJSONObject("openrouter_protocol").getJSONArray("tail")
             assertEquals("signed-thoughts", tail.getJSONObject(0).getJSONArray("reasoning_details")
                 .getJSONObject(0).getString("data"))
-            assertEquals("call_or", tail.getJSONObject(1).getString("tool_call_id"))
-            assertTrue(tail.getJSONObject(1).getString("content").contains("cancelled"))
+            assertEquals(1, tail.length())
+            assertEquals("call_or", tail.getJSONObject(0).getJSONArray("tool_calls").getJSONObject(0).getString("id"))
+            assertFalse(tail.toString().contains("cancelled"))
+            assertThrows(OpenRouterToolOutcomeUnknownException::class.java) {
+                OpenRouterProtocolCodec.append(JSONArray(), message)
+            }
         }
     }
 

@@ -75,7 +75,7 @@ class OpenAiV22ToV23MigrationTest {
                 assertEquals(imageManifest, old.getJSONArray("generated_images").toString())
                 assertFalse("No historical signed output can be fabricated", old.has("openai_protocol_output"))
                 assertFalse("No old instruction digest can be fabricated",
-                    old.has(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD))
+                    old.has("openai_instructions_sha256"))
                 upgraded.readableDatabase.rawQuery(
                     "SELECT input_tokens,output_tokens,cost_kind,cost_usd FROM request_accounting WHERE local_request_id=?",
                     arrayOf(localRequestId)).use { cursor ->

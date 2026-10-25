@@ -37,9 +37,6 @@ class MainActivityConversationExportTest {
         context.deleteDatabase("astra_chats.db")
         prefs.edit().clear().putString("current_chat", "visible").putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", 0).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         ChatDatabase(context).use { db ->
             db.upsertCurrentChat("visible", "Visible", null, null, listOf(JSONObject().put("role", "user").put("text", "OTHER CHAT")))
             db.upsertCurrentChat("selected", "Selected", null, null, listOf(JSONObject().put("role", "user").put("text", raw)))

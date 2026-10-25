@@ -20,7 +20,7 @@ class ContextHistorySnapshot private constructor(
 
     companion object {
         private val scalarKeys = listOf("role", "text", "provider", "status", "request_id", "response_id",
-            "protocol_context_state", "image_path", "image_name", OpenAiInstructionChainPolicy.FINGERPRINT_FIELD)
+            "protocol_context_state", "image_path", "image_name", "openai_instructions_sha256")
 
         fun capture(history: List<JSONObject>, items: List<ChatBubbleItem>): ContextHistorySnapshot {
             val fingerprints = java.util.IdentityHashMap<JSONObject, String>()

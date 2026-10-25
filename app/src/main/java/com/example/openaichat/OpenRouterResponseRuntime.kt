@@ -38,6 +38,45 @@ object OpenRouterResponseRuntime {
     }
     private val work = ConcurrentHashMap<String, Work>()
     private val executor = Executors.newCachedThreadPool()
+    private val artifactRecoveryRunning = AtomicBoolean(false)
+    private val artifactCleanupRunning = AtomicBoolean(false)
+    fun cleanupLocalArtifacts(context: Context) {
+        if (!artifactCleanupRunning.compareAndSet(false, true)) return
+        val app = context.applicationContext
+        executor.execute {
+            try {
+                ChatDatabase(app).use { db -> LocalArtifactCleanup(app, db).run() }
+            } catch (error: Exception) {
+                AstraDiagnostics(app).log("local_artifact_cleanup_deferred", mapOf("error_type" to error.javaClass.simpleName))
+            } finally { artifactCleanupRunning.set(false) }
+        }
+    }
+    /** Startup recovery only inspects published bytes. It never resumes inference or tool execution. */
+    fun recoverLocalArtifacts(context: Context) {
+        if (!artifactRecoveryRunning.compareAndSet(false, true)) return
+        val app = context.applicationContext
+        executor.execute {
+            try {
+                ChatDatabase(app).use { db ->
+                    val artifactTools = LocalArtifactToolExecutor(app)
+                    db.listLocalArtifactIntents().forEach { record ->
+                        if (record.getBoolean("tombstoned") || contains(record.getString("request_id"))) return@forEach
+                        try {
+                            LocalArtifactIntentCoordinator(db, artifactTools, record.getString("chat_id"),
+                                record.getString("request_id"), { false }).recoverStored(record) {
+                                OpenRouterUiBridge.historyReconciled(record.getString("chat_id"), record.getString("request_id"))
+                            }
+                        } catch (error: Exception) {
+                            AstraDiagnostics(app).log("local_artifact_recovery_unknown", mapOf(
+                                "request_id" to record.getString("request_id"), "error_type" to error.javaClass.simpleName))
+                        }
+                    }
+                }
+            } catch (error: Exception) {
+                AstraDiagnostics(app).log("local_artifact_recovery_failed", mapOf("error_type" to error.javaClass.simpleName))
+            } finally { artifactRecoveryRunning.set(false) }
+        }
+    }
     fun contains(requestId: String) = work.containsKey(requestId)
     fun uses(client: OpenRouterChatClient) = work.values.any { it.client === client }
     fun count() = work.size
@@ -51,7 +90,9 @@ object OpenRouterResponseRuntime {
     }
     fun start(context: Context, request: OpenRouterRuntimeRequest, client: OpenRouterChatClient) {
         val item = Work(context.applicationContext, request, client)
-        check(work.putIfAbsent(request.requestId, item) == null) { "Request is already running" }
+        synchronized(LocalArtifactOwnership.lock) {
+            check(work.putIfAbsent(request.requestId, item) == null) { "Request is already running" }
+        }
         try {
             if (request.background) ContextCompat.startForegroundService(item.context,
                 Intent(item.context, OpenRouterResponseService::class.java).putExtra(OpenRouterResponseService.EXTRA_REQUEST_ID, request.requestId))
@@ -159,7 +200,7 @@ object OpenRouterResponseRuntime {
                 }
             }
             val artifactTools = LocalArtifactToolExecutor(item.context)
-            var artifactCall = 0
+            val artifactIntents = LocalArtifactIntentCoordinator(db, artifactTools, r.chatId, r.requestId, ::active)
             if (r.github) {
                 github = GitHubToolExecutor(secure, { r.githubRepo }, { r.githubBranches },
                     { name, args -> OpenRouterUiBridge.confirm(r.chatId, r.requestId, name, args) },
@@ -175,26 +216,13 @@ object OpenRouterResponseRuntime {
                 pdfEngine = r.pdfEngine.takeIf { r.attachments.any { a -> a.kind == "pdf" } },
                 responseFormat = r.responseFormat, claudeRoute = r.claudeRoute,
                 shouldContinue = ::active,
-                executeTool = { name, args ->
+                executeTool = { _, _ -> throw LocalArtifactOutcomeUnknownException("Отсутствует provider tool_call_id") },
+                executeToolWithId = { callId, name, args ->
                     val response = try { when {
                         name == "create_local_text_file" || name == "patch_local_file" -> {
-                            if (!active()) throw java.io.IOException("Запрос остановлен")
-                            val callId = "local_artifact_${artifactCall++}"
-                            val argumentsSha = StreamingJsonRequestBody.sha256(args)
-                            val a = (if (name == "patch_local_file") artifactTools.patchLocalFile(args,
-                                r.attachments + item.runtimeAttachments, active = ::active,
-                                artifactKey = "${r.chatId}\u0000${r.requestId}\u0000$callId")
-                                else artifactTools.createTextFile(args))
-                                .put("tool_name", name).put("arguments_sha256", argumentsSha).put("tool_call_id", callId)
-                            val registered = db.registerLocalArtifactToolResultIfActive(r.chatId, r.requestId, callId, a)
-                            if (registered == null || JsonProtocol.string(registered, "path") != JsonProtocol.string(a, "path")) {
-                                val durable = db.getLocalArtifactToolResult(r.chatId, r.requestId, callId)
-                                if (durable?.let { JsonProtocol.string(it, "path") } != JsonProtocol.string(a, "path")) {
-                                    File(a.getString("path")).delete()
-                                    JsonProtocol.nonBlank(a, "patch_diff_path")?.let { File(it).delete() }
-                                }
-                            }
-                            if (registered == null) throw java.io.IOException("Запрос остановлен")
+                            val registered = artifactIntents.execute(callId, name, args,
+                                r.attachments + item.runtimeAttachments)
+                            if (!active()) throw LocalArtifactOutcomeUnknownException("Запрос остановлен после сохранения файла")
                             artifacts.add(registered)
                             val f = OpenRouterLocalAttachment.fromJson(registered.getJSONObject("attachment"))
                             item.runtimeAttachments.add(f)
@@ -204,7 +232,11 @@ object OpenRouterResponseRuntime {
                         name in LocalFileTools.names -> fileTools.execute(name, args)
                         r.github && github != null -> github!!.execute(name, args)
                         else -> JSONObject().put("ok", false).put("error", "Инструмент отключён").toString()
-                    } } catch (e: java.io.IOException) {
+                    } } catch (e: LocalArtifactOutcomeUnknownException) {
+                        throw e
+                    } catch (e: GitHubToolOutcomeUnknownException) {
+                        throw e
+                    } catch (e: java.io.IOException) {
                         if (!active()) throw e
                         JSONObject().put("ok", false).put("error", e.message).toString()
                     }
@@ -235,7 +267,10 @@ object OpenRouterResponseRuntime {
                         "file_work_ms" to stats.optLong("file_work_ms"), "round_read_passes" to stats.optLong("round_read_passes"),
                         "round_read_bytes" to stats.optLong("round_read_bytes"), "round_work_ms" to stats.optLong("round_work_ms")))
                 },
-                onProtocolCheckpoint = { checkpoint -> db.saveOpenRouterCheckpoint(r.chatId, r.requestId, checkpoint) },
+                onProtocolCheckpoint = { checkpoint ->
+                    if (!db.saveOpenRouterCheckpoint(r.chatId, r.requestId, checkpoint))
+                        throw LocalArtifactOutcomeUnknownException("Не подтверждено сохранение состояния вызова инструмента")
+                },
                 onProtocolWarning = { warning ->
                     protocolNotice = warning
                     diagnostics.log("openrouter_protocol_reset", mapOf("request_id" to r.requestId, "reason" to warning))
@@ -313,7 +348,7 @@ object OpenRouterResponseRuntime {
                 val owners = PreparedAttachmentFiles.Owners(
                     db.listAllLocalFilePaths().toSet() +
                         LocalAttachmentReferences.allComposerPaths(item.context.getSharedPreferences("app", Context.MODE_PRIVATE).all),
-                    localFilePaths() + db.listActiveOpenAiToolAttachmentPaths()
+                    localFilePaths() + db.listLegacyCheckpointAttachmentPaths()
                 )
                 runtimeLease.release(owners)
                 PreparedAttachmentFiles.cleanupPending(item.context) { owners }
@@ -322,7 +357,10 @@ object OpenRouterResponseRuntime {
             try {
                 if (!uses(item.client) && !OpenRouterUiBridge.ownsClient(item.client)) item.client.close()
                 if (work.values.none { it.request.background }) item.context.stopService(Intent(item.context, OpenRouterResponseService::class.java))
-            } finally { db.close() }
+            } finally {
+                db.close()
+                if (!fatalFailure) cleanupLocalArtifacts(item.context)
+            }
         }
     }
 }

@@ -49,9 +49,6 @@ class DrawerActivityGestureRegressionTest {
             .putString("provider", "openrouter").putString("model", "anthropic/claude-sonnet-5.5")
             .putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", 0).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         controller = Robolectric.buildActivity(MainActivity::class.java).create().start().resume().visible()
         activity = controller!!.get()
         drawer = field(activity, "drawerLayout") as FingerDrawerLayout

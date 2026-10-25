@@ -100,11 +100,14 @@ class OpenRouterChatClient(
         pdfEngine: String? = null,
         responseFormat: JSONObject? = null,
         claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO,
-        onFileIoObserved: (roundIndex: Int, stats: JSONObject) -> Unit = { _, _ -> }
+        onFileIoObserved: (roundIndex: Int, stats: JSONObject) -> Unit = { _, _ -> },
+        executeToolWithId: ((id: String, name: String, arguments: JSONObject) -> String)? = null
     ): OpenRouterCompletionResult {
         // Resolve once before HTTP and all tool rounds; Activity already resolves auto.
         val requestEffort = OpenRouterReasoningPolicy.requestEffort(model, reasoningEffort)
         val history = JsonProtocol.arrayCopy(messages)
+        // Validate direct callers as well as ContextSnapshot before any paid POST.
+        OpenRouterProtocolCodec.completePendingToolCalls(history)
         val inputCount = history.length()
         val binding = OpenRouterProtocolCodec.binding(model, tools, apiKey, responseFormat, claudeRoute)
         val sourceInputHash = OpenRouterProtocolCodec.fingerprint(history)
@@ -125,6 +128,7 @@ class OpenRouterChatClient(
             }
         }
         val toolNames = mutableListOf<String>()
+        val toolStates = JSONObject()
         val accumulatedText = mutableListOf<String>()
         val roundUsages = mutableListOf<JSONObject?>()
         var responseModel: String? = null
@@ -164,18 +168,20 @@ class OpenRouterChatClient(
             }
         }
 
-        fun emitProtocolCheckpoint() {
+        fun emitProtocolCheckpoint(interruptedAssistant: JSONObject? = null) {
             val checkpointTail = JSONArray()
             for (i in inputCount until history.length()) checkpointTail.put(JsonProtocol.copy(history.get(i)))
-            OpenRouterProtocolCodec.completePendingToolCalls(checkpointTail)
             onProtocolCheckpoint(
                 JSONObject().put("version", 1).put("input_sha256", sourceInputHash)
                     .put("wire_input_sha256", inputHash).put("binding_sha256", binding).put("tail", checkpointTail)
+                    .put("tool_states", JsonProtocol.objectCopy(toolStates))
+                    .apply { interruptedAssistant?.let { put("interrupted_assistant", it) } }
             )
         }
 
         fun requestMessage(toolChoice: String): Pair<JSONObject, JSONObject> {
             ensureWithinBudget()
+            OpenRouterProtocolCodec.completePendingToolCalls(history)
             val body = JSONObject()
                 .put("model", model)
                 .put("messages", history)
@@ -382,6 +388,15 @@ class OpenRouterChatClient(
             } catch (e: Exception) {
                 emitTextSnapshot(force = true)
                 commitRoundUsage()
+                val receivedReasoning = reasoningDetails.receivedFragments()
+                if (receivedReasoning.length() > 0) {
+                    // Keep the original fragments for local recovery, outside the replay tail.
+                    // An ambiguous/incomplete signed turn must never be guessed into a new POST.
+                    emitProtocolCheckpoint(JSONObject().put("role", "assistant")
+                        .put("content", contentParts.toString())
+                        .put("reasoning_details", reasoningDetails.array())
+                        .put("reasoning_delta_fragments", receivedReasoning).put("replay_safe", false))
+                }
                 if (e is CancellationException) throw e
                 if (e is OpenRouterCompletionException) {
                     val partial = buildList {
@@ -497,7 +512,8 @@ class OpenRouterChatClient(
                         finishReason = finishReason,
                         protocol = JSONObject().put("version", 1).put("input_sha256", sourceInputHash)
                             .put("wire_input_sha256", inputHash)
-                            .put("binding_sha256", binding).put("tail", tail).apply {
+                            .put("binding_sha256", binding).put("tail", tail)
+                            .put("tool_states", JsonProtocol.objectCopy(toolStates)).apply {
                                 if (finishReason != "stop") put("interrupted_assistant", JsonProtocol.objectCopy(message))
                             },
                         fileIoTelemetry = currentFileIoJson(), roundsCompleted = roundsCompleted
@@ -525,20 +541,36 @@ class OpenRouterChatClient(
                     validatedCalls.add(Triple(id, name, arguments))
                 }
                 JsonProtocol.string(message, "content").trim().takeIf { it.isNotBlank() }?.let { accumulatedText += it }
+                for ((id, name, arguments) in validatedCalls) {
+                    if (toolStates.has(id)) throw IOException("Reused provider tool call id: $id")
+                    toolStates.put(id, JSONObject().put("state", "not_started").put("tool_name", name)
+                        .put("arguments_sha256", StreamingJsonRequestBody.sha256(arguments)))
+                }
                 history.put(JSONObject(message.toString()))
                 emitProtocolCheckpoint()
                 for ((id, name, arguments) in validatedCalls) {
                     ensureWithinBudget()
                     toolNames += name
                     ensureActive()
-                    val toolResult = executeTool(name, arguments)
+                    toolStates.getJSONObject(id).put("state", "in_flight")
+                    // A failed durable acknowledgement aborts before the side effect.
+                    emitProtocolCheckpoint()
+                    ensureActive()
+                    val toolResult = try {
+                        executeToolWithId?.invoke(id, name, arguments) ?: executeTool(name, arguments)
+                    } catch (failure: Exception) {
+                        toolStates.getJSONObject(id).put("state", "outcome_unknown")
+                        try { emitProtocolCheckpoint() } catch (saveFailure: Exception) { failure.addSuppressed(saveFailure) }
+                        throw failure
+                    }
                     history.put(
                         JSONObject()
                             .put("role", "tool")
                             .put("tool_call_id", id)
                             .put("content", toolResult)
                     )
-                    // Persist durable checkpoint immediately after each completed tool side effect.
+                    toolStates.getJSONObject(id).put("state", "completed")
+                    // Persist exact output and completed state together before another POST.
                     emitProtocolCheckpoint()
                     ensureWithinBudget()
                 }

@@ -67,7 +67,7 @@ class OpenAiV23ToV24ActiveCheckpointMigrationTest {
                 assertTrue(ResponseIndexedCheckpoint.restore(active).legacyFlatCheckpoint)
                 val historical = db.getChat(chatId)!!.getJSONArray("messages").getJSONObject(0)
                 assertEquals("Existing signed answer", historical.getString("text"))
-                assertEquals(instructionFingerprint, historical.getString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD))
+                assertEquals(instructionFingerprint, historical.getString("openai_instructions_sha256"))
                 assertEquals(signedOutput, historical.getJSONArray("openai_protocol_output").toString())
                 val accounting = db.listRequestAccounting(chatId).single()
                 assertEquals("running", accounting.getString("local_status"))

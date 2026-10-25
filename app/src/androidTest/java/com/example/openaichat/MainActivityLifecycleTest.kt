@@ -74,186 +74,95 @@ class MainActivityLifecycleTest {
         } finally { ChatDatabase(context).use { it.deleteChat(chatId) } }
     }
 
-    // Verify the *real Activity Send* JSON rather than a helper-only fixture.
-    // The interceptor redirects a synthetic request to a locally trusted HTTPS
-    // MockWebServer; no live provider endpoint or billable credentials are used.
-    private fun actualOpenAiWireWithOwnedLocalManifest(replayAttachment: Boolean): JSONObject {
-        val (server, testHttpClient) = createHttpsMockServer()
-        val response = JSONObject().put("id", "resp_mock_new").put("status", "completed")
-            .put("output", JSONArray().put(JSONObject().put("type", "message")
-                .put("role", "assistant").put("content", JSONArray().put(
-                    JSONObject().put("type", "output_text").put("text", "ok")))))
-        val sse = "data: " + JSONObject().put("type", "response.created")
-            .put("sequence_number", 0).put("response", JSONObject().put("id", "resp_mock_new")) +
-            "\n\ndata: " + JSONObject().put("type", "response.completed")
-                .put("sequence_number", 1).put("response", response) + "\n\n"
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(sse))
+    // Real Activity sends use a locally trusted HTTPS mock and synthetic credentials.
 
+
+    /**
+     * Real Send -> failed/disconnected SSE -> durable assistant -> next explicit
+     * Send. Covers the auditor's reachable P1 path rather than testing only a
+     * pure encoder. Uses local trusted HTTPS and a synthetic key, never billing.
+     */
+    private fun assertActualSendAfterInterruptedOpenRouterResponse(reopen: Boolean, errorEvent: Boolean) {
+        val (server, testHttpClient) = createHttpsMockServer()
+        val endpoint = server.url("/api/v1").toString()
+        val firstSse = "data: " + JSONObject().put("id", "gen-unfinished")
+            .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject()
+                .put("content", "Partial first answer.  ")))) + "\n\n" +
+            if (errorEvent) "data: " + JSONObject().put("error", JSONObject()
+                .put("message", "Synthetic interrupted stream").put("code", 500)) + "\n\n" else ""
+        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(firstSse))
+        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody("data: {\"choices\":[{\"delta\":{\"content\":\"Second answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val prefs = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
             .targetContext.getSharedPreferences("app", android.content.Context.MODE_PRIVATE)
-        val modified = listOf("provider", "model", "reasoning", "text_format",
-            "system_prompt", "instructions", "file_analysis_tools", "background_responses",
-            "openai_auto_compaction", "web", "file_search", "code_interpreter", "image_generation")
-        val saved = modified.associateWith { key -> prefs.all[key] }
-        var originalApiKey: String? = null
+        val keys = listOf("provider", "model", "reasoning", "openrouter_text_format", "system_prompt", "instructions",
+            "background_responses", "openrouter_web_search", "openrouter_web_fetch", "github_tools")
+        val previousPrefs = keys.associateWith { prefs.all[it] }
+        var oldApiKey: String? = null
+        fun installMockClient(activity: MainActivity) {
+            setPrivateField(activity, "openRouterClientFactory",
+                { OpenRouterChatClient(endpoint, testHttpClient, reconcileGenerations = false) })
+        }
         try {
             scenario.onActivity { activity ->
                 activity.newChat()
-                activity.prefs.edit().putString("provider", "openai")
-                    .putString("model", "gpt-6-astra").putString("reasoning", "high")
-                    .putString("text_format", "text")
-                    .putString("system_prompt", "System fixture")
-                    .putString("instructions", "Developer fixture")
-                    .putBoolean("file_analysis_tools", false)
-                    .putBoolean("background_responses", false)
-                    .putBoolean("openai_auto_compaction", false)
-                    .putBoolean("web", false).putBoolean("file_search", false)
-                    .putBoolean("code_interpreter", false).putBoolean("image_generation", false)
-                    .commit()
-                originalApiKey = SecureStore(activity).getApiKey()
-                SecureStore(activity).setApiKey("sk-synthetic-only")
-                val secureClient = testHttpClient.newBuilder().addInterceptor { chain ->
-                    val redirected = chain.request().newBuilder()
-                        .url(server.url("/v1/responses")).build()
-                    chain.proceed(redirected)
-                }.build()
-                setPrivateField(activity, "client", secureClient)
-                val presentation = invoke(activity, "presentationInstructionsForRequest") as String?
-                val fingerprint = OpenAiInstructionChainPolicy.fingerprint(
-                    GenerationInstructions("System fixture", "Developer fixture", presentation),
-                    "sk-synthetic-only", "gpt-6-astra")
-                @Suppress("UNCHECKED_CAST")
-                val history = privateField(activity, "chat") as MutableList<JSONObject>
-                history.clear()
-                history.add(JSONObject().put("role", "user").put("text", "Earlier question")
-                    .put("provider", "openai"))
-                history.add(JSONObject().put("role", "assistant").put("text", "Earlier answer")
-                    .put("provider", "openai").put("response_id", "resp_previous")
-                    .put("status", "completed")
-                    .put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, fingerprint)
-                    .put("openai_protocol_output", JSONArray().put(
-                        JSONObject().put("type", "message").put("role", "assistant")
-                            .put("content", JSONArray().put(JSONObject()
-                                .put("type", "output_text").put("text", "Earlier answer"))))))
-                (privateField(activity, "activeResponseState") as ActiveResponseStateStore)
-                    .setResponseId("resp_previous")
-                if (replayAttachment) {
-                    val file = java.io.File(activity.filesDir, "fixture-openai-owned-note.txt")
-                        .apply { writeText("ORIGINAL-LOCAL-BYTES-123") }
-                    val manifest = OpenRouterAttachmentStore.classifyLocalFile(
-                        file, file.name, "text/plain")
-                    @Suppress("UNCHECKED_CAST")
-                    val attachments = privateField(activity, "attachedOpenRouterAttachments")
-                        as MutableList<OpenRouterLocalAttachment>
-                    attachments.add(manifest)
-                }
-                (privateField(activity, "input") as android.widget.EditText)
-                    .setText("Next question")
+                prefs.edit().putString("provider", "openrouter").putString("model", "anthropic/claude-opus-5.5")
+                    .putString("reasoning", "high").putString("openrouter_text_format", "text")
+                    .putString("system_prompt", "System retained").putString("instructions", "Developer retained")
+                    .putBoolean("background_responses", false).putBoolean("openrouter_web_search", false)
+                    .putBoolean("openrouter_web_fetch", false).putBoolean("github_tools", false).commit()
+                oldApiKey = SecureStore(activity).getOpenRouterApiKey()
+                SecureStore(activity).setOpenRouterApiKey("sk-or-only-local-test")
+                installMockClient(activity)
+                (privateField(activity, "input") as android.widget.EditText).setText("First explicit request")
                 invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
             }
-            val wire = server.takeRequest(20, TimeUnit.SECONDS)
-                ?: throw AssertionError("Actual OpenAI Activity Send did not reach HTTPS mock")
-            return JSONObject(wire.body.readUtf8())
-        } finally {
-            scenario.onActivity { activity ->
-                originalApiKey?.let { SecureStore(activity).setApiKey(it) }
-            }
-            prefs.edit().apply {
-                for (key in modified) {
-                    when (val value = saved[key]) {
-                        is String -> putString(key, value)
-                        is Boolean -> putBoolean(key, value)
-                        is Int -> putInt(key, value)
-                        is Long -> putLong(key, value)
-                        else -> remove(key)
+            assertTrue("First Send did not reach local HTTPS mock", server.takeRequest(20, TimeUnit.SECONDS) != null)
+            var recordedAssistant = false
+            for (attempt in 0 until 250) {
+                scenario.onActivity { activity ->
+                    @Suppress("UNCHECKED_CAST")
+                    val history = privateField(activity, "chat") as MutableList<JSONObject>
+                    val last = history.lastOrNull()
+                    if (last?.optString("role") == "assistant" && last.optString("status") == "failed") {
+                        recordedAssistant = true
+                        assertTrue(last.optString("text").contains("Partial first answer."))
+                        assertEquals("openrouter", last.optString("provider"))
                     }
                 }
-            }.commit()
-            scenario.close()
-            server.shutdown()
-        }
-    }
-
-    @Test fun legacyCompletedOpenAiRequiresVisibleConsentBeforeWireAndPreservesDraft() {
-        val (server, testHttpClient) = createHttpsMockServer()
-        val terminal = JSONObject().put("id", "resp_legacy_followup")
-            .put("status", "completed")
-            .put("output", JSONArray().put(JSONObject().put("type", "message")
-                .put("role", "assistant").put("content", JSONArray().put(JSONObject()
-                    .put("type", "output_text").put("text", "Follow-up answer")))))
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
-            .setBody("data: " + JSONObject().put("type", "response.created")
-                .put("sequence_number", 0).put("response", JSONObject()
-                    .put("id", "resp_legacy_followup")) +
-                "\n\ndata: " + JSONObject().put("type", "response.completed")
-                .put("sequence_number", 1).put("response", terminal) + "\n\n"))
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
-        val prefs = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
-            .targetContext.getSharedPreferences("app", android.content.Context.MODE_PRIVATE)
-        val keys = listOf("provider", "model", "reasoning", "text_format",
-            "system_prompt", "instructions", "background_responses",
-            "file_analysis_tools", "web", "file_search", "code_interpreter", "image_generation")
-        val previous = keys.associateWith { prefs.all[it] }
-        var originalKey: String? = null
-        try {
+                if (recordedAssistant) break
+                SystemClock.sleep(40L)
+            }
+            assertTrue("Interrupted reply must be persisted before next Send", recordedAssistant)
+            assertEquals("No hidden network retry permitted", 1, server.requestCount)
+            if (reopen) scenario.recreate()
             scenario.onActivity { activity ->
-                activity.newChat()
-                prefs.edit().putString("provider", "openai")
-                    .putString("model", "gpt-6-astra")
-                    .putString("reasoning", "high").putString("text_format", "text")
-                    .putString("system_prompt", "Current system")
-                    .putString("instructions", "Current developer")
-                    .putBoolean("background_responses", false)
-                    .putBoolean("file_analysis_tools", false)
-                    .putBoolean("web", false).putBoolean("file_search", false)
-                    .putBoolean("code_interpreter", false).putBoolean("image_generation", false)
-                    .commit()
-                originalKey = SecureStore(activity).getApiKey()
-                SecureStore(activity).setApiKey("sk-only-local-test")
-                val redirected = testHttpClient.newBuilder().addInterceptor { chain ->
-                    chain.proceed(chain.request().newBuilder()
-                        .url(server.url("/v1/responses")).build())
-                }.build()
-                setPrivateField(activity, "client", redirected)
+                installMockClient(activity)
                 @Suppress("UNCHECKED_CAST")
                 val history = privateField(activity, "chat") as MutableList<JSONObject>
-                history.clear()
-                history += JSONObject().put("role", "user").put("text", "Original prompt")
-                history += JSONObject().put("role", "assistant").put("provider", "openai")
-                    .put("status", "completed").put("response_id", "resp_old_no_output")
-                    .put("text", "Legacy visible answer")
-                (privateField(activity, "input") as android.widget.EditText)
-                    .setText("Follow up")
+                assertTrue("Partial response must survive Activity recreation", history.any {
+                    it.optString("role") == "assistant" && it.optString("text").contains("Partial first answer.") })
+                (privateField(activity, "input") as android.widget.EditText).setText("Continue from saved partial")
                 invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
-                val first = privateField(activity, "openAiLegacyConsentDialog") as android.app.AlertDialog
-                assertTrue("Legacy downgrade must require dialog", first.isShowing)
-                first.getButton(android.app.AlertDialog.BUTTON_NEGATIVE).performClick()
-                assertEquals("Follow up", (privateField(activity, "input") as android.widget.EditText)
-                    .text.toString())
-                assertEquals(2, history.size)
-                invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
-                val second = privateField(activity, "openAiLegacyConsentDialog") as android.app.AlertDialog
-                assertTrue(second.isShowing)
-                second.getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick()
             }
-            val request = server.takeRequest(25, TimeUnit.SECONDS)
-                ?: throw AssertionError("Explicit legacy text-only Send did not reach local HTTPS")
-            val body = JSONObject(request.body.readUtf8())
-            assertFalse(body.has("previous_response_id"))
-            val wire = body.getJSONArray("input").toString()
-            assertTrue(wire.contains("Current system"))
-            assertTrue(wire.contains("Current developer"))
-            assertTrue(wire.contains("Legacy visible answer"))
-            assertTrue(wire.contains("ТОЛЬКО видимый текст"))
-            assertTrue(wire.contains("Follow up"))
-            assertEquals("Consent cannot trigger more than one Create", 1, server.requestCount)
+            val second = server.takeRequest(25, TimeUnit.SECONDS)
+                ?: throw AssertionError("Explicit second Send blocked by partial transcript replay")
+            val wire = JSONObject(second.body.readUtf8())
+            assertFalse(wire.has("previous_response_id"))
+            val messages = wire.getJSONArray("messages")
+            assertEquals("system", messages.getJSONObject(0).getString("role"))
+            val body = messages.toString()
+            assertTrue(body.contains("System retained"))
+            assertTrue(body.contains("Developer retained"))
+            assertTrue(body.contains("First explicit request"))
+            assertTrue(body.contains("Partial first answer."))
+            assertTrue(body.contains("Continue from saved partial"))
+            assertEquals("Only explicit sends must contact the provider", 2, server.requestCount)
         } finally {
-            scenario.onActivity { activity ->
-                originalKey?.let { SecureStore(activity).setApiKey(it) }
-            }
+            scenario.onActivity { activity -> oldApiKey?.let { SecureStore(activity).setOpenRouterApiKey(it) } }
             prefs.edit().apply {
-                for (key in keys) when (val value = previous[key]) {
+                for (key in keys) when (val value = previousPrefs[key]) {
                     is String -> putString(key, value)
                     is Boolean -> putBoolean(key, value)
                     is Int -> putInt(key, value)
@@ -266,193 +175,12 @@ class MainActivityLifecycleTest {
         }
     }
 
-    @Test fun actualOpenAiSendKeepsInheritedChainWithoutRepeatingRoles() {
-        val body = actualOpenAiWireWithOwnedLocalManifest(false)
-        assertEquals("resp_previous", body.getString("previous_response_id"))
-        assertFalse(body.has("instructions"))
-        val includes = body.getJSONArray("include")
-        assertTrue("Signed reasoning output must be requested on the real Send wire",
-            (0 until includes.length()).any { includes.optString(it) == "reasoning.encrypted_content" })
-        val input = body.getJSONArray("input")
-        assertEquals(1, input.length())
-        assertEquals("user", input.getJSONObject(0).getString("role"))
-    }
-
-    @Test fun actualOpenAiSendSwitchesToFullReplayAndRestoresRolesForManifest() {
-        val body = actualOpenAiWireWithOwnedLocalManifest(true)
-        assertFalse(body.has("previous_response_id"))
-        assertFalse(body.has("instructions"))
-        val includes = body.getJSONArray("include")
-        assertTrue("Signed reasoning output must be requested on the real Send wire",
-            (0 until includes.length()).any { includes.optString(it) == "reasoning.encrypted_content" })
-        val input = body.getJSONArray("input")
-        assertEquals("system", input.getJSONObject(0).getString("role"))
-        assertEquals("developer", input.getJSONObject(1).getString("role"))
-        assertTrue(input.getJSONObject(0).getString("content").contains("System fixture"))
-        assertEquals("Developer fixture", input.getJSONObject(1).getString("content"))
-        assertTrue("Historical assistant output must be replayed",
-            input.toString().contains("Earlier answer"))
-        assertFalse("Selective local reading must not inline the complete document",
-            input.toString().contains("ORIGINAL-LOCAL-BYTES-123"))
-        assertTrue(body.getJSONArray("tools").toString().contains("read_attached_file"))
-        assertTrue(input.toString().contains("Next question"))
-    }
-
-    /**
-     * Real Send -> failed/disconnected SSE -> durable assistant -> next explicit
-     * Send. Covers the auditor's reachable P1 path rather than testing only a
-     * pure encoder. Uses local trusted HTTPS and a synthetic key, never billing.
-     */
-    private fun assertActualSendAfterInterruptedOpenAiResponse(reopen: Boolean, errorEvent: Boolean) {
-        val (server, testHttpClient) = createHttpsMockServer()
-        val firstEvents = listOf(
-            JSONObject().put("type", "response.created").put("sequence_number", 0)
-                .put("response", JSONObject().put("id", "resp_unfinished")),
-            JSONObject().put("type", "response.output_text.delta")
-                .put("sequence_number", 1).put("delta", "Partial first answer.  "),
-            JSONObject().put("type", "response.reasoning_summary_text.delta")
-                .put("sequence_number", 2).put("delta", "Received summary before interrupt."),
-            JSONObject().put("type", "response.web_search_call.completed")
-                .put("sequence_number", 3)
-        ).toMutableList()
-        if (errorEvent) firstEvents.add(JSONObject().put("type", "error")
-            .put("sequence_number", 4)
-            .put("message", "Synthetic interrupted stream"))
-        val firstSse = firstEvents.joinToString("") { "data: " + it.toString() + "\n\n" }
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
-            .setBody(firstSse))
-        val final = JSONObject().put("id", "resp_recovery_ok").put("status", "completed")
-            .put("output", JSONArray().put(JSONObject().put("type", "message")
-                .put("role", "assistant").put("content", JSONArray().put(
-                    JSONObject().put("type", "output_text").put("text", "Second answer")))))
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
-            .setBody("data: " + JSONObject().put("type", "response.created")
-                .put("sequence_number", 0)
-                .put("response", JSONObject().put("id", "resp_recovery_ok")) +
-                "\n\ndata: " + JSONObject().put("type", "response.completed")
-                .put("sequence_number", 1).put("response", final) + "\n\n"))
-
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
-        val prefs = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
-            .targetContext.getSharedPreferences("app", android.content.Context.MODE_PRIVATE)
-        val keys = listOf("provider", "model", "reasoning", "text_format",
-            "system_prompt", "instructions", "background_responses", "file_analysis_tools",
-            "web", "file_search", "code_interpreter", "image_generation")
-        val previousPrefs = keys.associateWith { prefs.all[it] }
-        var oldApiKey: String? = null
-        fun installMockClient(activity: MainActivity) {
-            val redirected = testHttpClient.newBuilder().addInterceptor { chain ->
-                chain.proceed(chain.request().newBuilder()
-                    .url(server.url("/v1/responses")).build())
-            }.build()
-            setPrivateField(activity, "client", redirected)
-        }
-        try {
-            scenario.onActivity { activity ->
-                activity.newChat()
-                prefs.edit().putString("provider", "openai")
-                    .putString("model", "gpt-6-astra")
-                    .putString("reasoning", "high").putString("text_format", "text")
-                    .putString("system_prompt", "System retained")
-                    .putString("instructions", "Developer retained")
-                    .putBoolean("background_responses", false)
-                    .putBoolean("file_analysis_tools", false)
-                    .putBoolean("web", false).putBoolean("file_search", false)
-                    .putBoolean("code_interpreter", false).putBoolean("image_generation", false)
-                    .commit()
-                oldApiKey = SecureStore(activity).getApiKey()
-                SecureStore(activity).setApiKey("sk-only-local-test")
-                installMockClient(activity)
-                (privateField(activity, "input") as android.widget.EditText)
-                    .setText("First explicit paid request")
-                invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
-            }
-            assertTrue("First Send did not reach local HTTPS mock",
-                server.takeRequest(20, TimeUnit.SECONDS) != null)
-
-            var recordedAssistant = false
-            var savedFragment = ""
-            var savedStatus = ""
-            for (attempt in 0 until 250) {
-                scenario.onActivity { activity ->
-                    @Suppress("UNCHECKED_CAST")
-                    val history = privateField(activity, "chat") as MutableList<JSONObject>
-                    val last = history.lastOrNull()
-                    if (last?.optString("role") == "assistant" &&
-                        last.optString("status") in setOf("disconnected", "failed")) {
-                        recordedAssistant = true
-                        savedFragment = last.optString("text")
-                        savedStatus = last.optString("status")
-                        assertFalse("A nonterminal stream must not fabricate output",
-                            last.has("openai_protocol_output"))
-                        assertEquals("Received summary before interrupt.",
-                            last.optString("reasoning_summary"))
-                    }
-                }
-                if (recordedAssistant) break
-                SystemClock.sleep(40L)
-            }
-            assertTrue("Interrupted reply must be persisted before next Send", recordedAssistant)
-            assertTrue(savedFragment.contains("Partial first answer."))
-            assertEquals(if (errorEvent) "failed" else "disconnected", savedStatus)
-            assertEquals("No hidden network retry permitted", 1, server.requestCount)
-
-            if (reopen) {
-                scenario.recreate()
-            }
-            scenario.onActivity { activity ->
-                installMockClient(activity)
-                @Suppress("UNCHECKED_CAST")
-                val history = privateField(activity, "chat") as MutableList<JSONObject>
-                assertTrue("Partial response must survive Activity recreation",
-                    history.any { it.optString("role") == "assistant" &&
-                        it.optString("text").contains("Partial first answer.") })
-                (privateField(activity, "input") as android.widget.EditText)
-                    .setText("Continue from visible partial only")
-                invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
-            }
-            val second = server.takeRequest(25, TimeUnit.SECONDS)
-                ?: throw AssertionError("Explicit second Send blocked by partial transcript replay")
-            val wire = JSONObject(second.body.readUtf8())
-            assertFalse("Interrupted response is not a reusable server chain",
-                wire.has("previous_response_id"))
-            val input = wire.getJSONArray("input")
-            assertEquals("system", input.getJSONObject(0).getString("role"))
-            assertEquals("developer", input.getJSONObject(1).getString("role"))
-            val body = input.toString()
-            assertTrue(body.contains("First explicit paid request"))
-            assertTrue(body.contains("Partial first answer."))
-            assertTrue(body.contains("Received summary before interrupt."))
-            assertTrue(body.contains("did NOT complete successfully"))
-            assertTrue(body.contains("Do not retry or regenerate"))
-            assertTrue(body.contains("Continue from visible partial only"))
-            assertEquals("Only explicitly initiated sends must contact the provider", 2, server.requestCount)
-        } finally {
-            scenario.onActivity { activity ->
-                oldApiKey?.let { SecureStore(activity).setApiKey(it) }
-            }
-            prefs.edit().apply {
-                for (key in keys) {
-                    when (val value = previousPrefs[key]) {
-                        is String -> putString(key, value)
-                        is Boolean -> putBoolean(key, value)
-                        is Int -> putInt(key, value)
-                        is Long -> putLong(key, value)
-                        else -> remove(key)
-                    }
-                }
-            }.commit()
-            scenario.close()
-            server.shutdown()
-        }
-    }
-
-    @Test fun disconnectedStreamWithNoTerminalDoesNotBlockSecondRealSend() {
-        assertActualSendAfterInterruptedOpenAiResponse(reopen = false, errorEvent = false)
+    @Test fun unterminatedOpenRouterStreamDoesNotBlockSecondRealSend() {
+        assertActualSendAfterInterruptedOpenRouterResponse(reopen = false, errorEvent = false)
     }
 
     @Test fun failedStreamAfterRecreateDoesNotBlockSecondRealSend() {
-        assertActualSendAfterInterruptedOpenAiResponse(reopen = true, errorEvent = true)
+        assertActualSendAfterInterruptedOpenRouterResponse(reopen = true, errorEvent = true)
     }
 
 
@@ -465,10 +193,7 @@ class MainActivityLifecycleTest {
         val savedPaths = mutableListOf<String>()
         try {
             scenario.onActivity { activity ->
-                val manifest = invokeMethod(
-                    activity, "saveGeneratedImages", arrayOf(List::class.java),
-                    arrayOf(results)
-                ) as JSONArray
+                val manifest = GeneratedImageStore.save(activity.filesDir, results) { _, _ -> }
                 assertEquals("Every provider output needs a durable outcome", 7, manifest.length())
                 for (i in 0 until 6) {
                     val entry = manifest.getJSONObject(i)
@@ -608,39 +333,6 @@ class MainActivityLifecycleTest {
         scenario.close()
     }
 
-    @Test
-    fun cameraResultAfterChatSwitchAndRecreateKeepsOpenAiSourceDraftWithoutUploading() {
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
-        var originalChatId = ""
-        var otherChatId = ""
-        var photoPath = ""
-        scenario.onActivity { activity ->
-            activity.newChat()
-            originalChatId = activity.currentChatIdForTesting()
-            photoPath = createCameraFixture(activity)
-            activity.setPendingCameraCaptureForTesting(photoPath, originalChatId, "openai")
-            activity.newChat()
-            otherChatId = activity.currentChatIdForTesting()
-            activity.prefs.edit().putString(
-                "composer_state_$originalChatId", JSONObject().put("text", "Исходный текст").toString()
-            ).apply()
-        }
-        scenario.recreate()
-        scenario.onActivity { activity ->
-            activity.completePendingCameraCapture(Activity.RESULT_OK)
-            val source = JSONObject(activity.prefs.getString("composer_state_$originalChatId", "{}")!!)
-            val other = JSONObject(activity.prefs.getString("composer_state_$otherChatId", "{}")!!)
-            assertEquals("Исходный текст", source.getString("text"))
-            assertEquals(photoPath, source.getString("image_path"))
-            assertEquals("image/jpeg", source.getString("image_mime"))
-            assertFalse(source.has("image_file_id")) // Upload is deferred: no API calls in the test.
-            assertEquals(1, source.getJSONArray("pending_uploads").length())
-            assertEquals("image", source.getJSONArray("pending_uploads").getJSONObject(0).getString("kind"))
-            assertFalse(other.has("image_path"))
-            assertTrue(java.io.File(photoPath).isFile)
-        }
-        scenario.close()
-    }
 
     @Test
     fun cameraResultAfterChatSwitchAndRecreateKeepsOpenRouterSourceDraft() {
@@ -683,7 +375,7 @@ class MainActivityLifecycleTest {
             activity.newChat()
             val sourceChatId = activity.currentChatIdForTesting()
             val photoPath = createCameraFixture(activity)
-            activity.setPendingCameraCaptureForTesting(photoPath, sourceChatId, "openai")
+            activity.setPendingCameraCaptureForTesting(photoPath, sourceChatId, "openrouter")
             activity.newChat()
             // newChat() saves the source composer; Cancellation must not change that saved state.
             val savedAfterNavigation = activity.prefs.getString("composer_state_$sourceChatId", null)
@@ -1635,7 +1327,7 @@ class MainActivityLifecycleTest {
     }
 
     @Test
-    fun openAiHistoryWithoutResponseChainNeverSilentlyDropsFileInputs() {
+    fun historicalRemoteOnlyFileNeverSilentlyDisappearsFromOpenRouterSend() {
         val scenario = ActivityScenario.launch(MainActivity::class.java)
         val httpAttempts = AtomicInteger(0)
         var originalApiKey: String? = null
@@ -1650,11 +1342,11 @@ class MainActivityLifecycleTest {
             var failed = false
             while (!failed && SystemClock.uptimeMillis() < deadline) {
                 scenario.onActivity { activity ->
-                    val pending = privateField(activity, "pendingOpenAiPreparation")
+                    val pending = privateField(activity, "pendingOpenRouterPreparation")
                         as AtomicReference<*>
                     val status = privateField(activity, "status") as android.widget.TextView
                     failed = pending.get() == null &&
-                        status.text.toString().startsWith("Не отправлено:")
+                        status.text.toString().startsWith("Ошибка подготовки вложений:")
                 }
                 if (!failed) SystemClock.sleep(20L)
             }
@@ -1682,19 +1374,21 @@ class MainActivityLifecycleTest {
         try {
             scenario.onActivity { activity ->
                 activity.newChat()
-                activity.prefs.edit().putString("provider", "openai")
-                    .putString("model", "gpt-6-astra").putString("reasoning", "high")
-                    .putString("text_format", "text").apply()
+                activity.prefs.edit().putString("provider", "openrouter")
+                    .putString("model", "anthropic/claude-opus-5.5").putString("reasoning", "high")
+                    .putString("openrouter_text_format", "text").apply()
                 val secrets = SecureStore(activity)
-                originalApiKey = secrets.getApiKey()
-                secrets.setApiKey("test-key")
+                originalApiKey = secrets.getOpenRouterApiKey()
+                secrets.setOpenRouterApiKey("test-key")
                 // Reject any accidental real call, and prove both fallback cases
                 // finish before HTTP rather than merely failing authentication.
-                setPrivateField(activity, "client", OkHttpClient.Builder()
-                    .addInterceptor {
-                        httpAttempts.incrementAndGet()
-                        throw java.io.IOException("Unexpected HTTP during local context preflight")
-                    }.build())
+                val denyingClient = OkHttpClient.Builder().addInterceptor {
+                    httpAttempts.incrementAndGet()
+                    throw java.io.IOException("Unexpected HTTP during local context preflight")
+                }.build()
+                setPrivateField(activity, "openRouterClientFactory", {
+                    OpenRouterChatClient("https://fixture.invalid/api/v1", denyingClient, reconcileGenerations = false)
+                })
                 @Suppress("UNCHECKED_CAST")
                 val history = privateField(activity, "chat") as MutableList<JSONObject>
                 originalHistory = history.map { JSONObject(it.toString()) }
@@ -1732,7 +1426,7 @@ class MainActivityLifecycleTest {
             assertFailedPreparation()
         } finally {
             scenario.onActivity { activity ->
-                originalApiKey?.let { SecureStore(activity).setApiKey(it) }
+                originalApiKey?.let { SecureStore(activity).setOpenRouterApiKey(it) }
                 @Suppress("UNCHECKED_CAST")
                 val history = privateField(activity, "chat") as MutableList<JSONObject>
                 history.clear()
@@ -1786,41 +1480,6 @@ class MainActivityLifecycleTest {
         scenario.close()
     }
 
-    @Test
-    fun vectorStoreRenderCanBeInvokedOffMainWithoutUiMutationException() {
-        var activity: MainActivity? = null
-        val scenario = ActivityScenario.launch(MainActivity::class.java)
-        scenario.onActivity { launched ->
-            activity = launched
-            val attachedStatus = privateField(launched, "status") as android.widget.TextView
-            setPrivateField(launched, "vsStatusLine", attachedStatus)
-            setPrivateField(launched, "vsListArea", LinearLayout(launched))
-        }
-
-        val thrown = AtomicReference<Throwable?>()
-        val done = CountDownLatch(1)
-        Thread {
-            try {
-                invoke(
-                    activity!!,
-                    "renderVectorStoreList",
-                    String::class.java,
-                    "vs-test-background-thread"
-                )
-            } catch (t: Throwable) {
-                thrown.set(t)
-            } finally {
-                done.countDown()
-            }
-        }.start()
-
-        assertTrue(done.await(2, TimeUnit.SECONDS))
-        assertTrue(
-            "off-main renderVectorStoreList invocation threw " + thrown.get(),
-            thrown.get() == null
-        )
-        scenario.close()
-    }
 
     @Test
     fun zipSourceChatCompletionConsumesOnlyCapturedPersistedZip() {
@@ -1840,17 +1499,9 @@ class MainActivityLifecycleTest {
             val prefs = activity.prefs
             prefs.edit().putString("composer_state_$chatId", state.toString()).commit()
 
-            invokeSaveUploadedFileToComposer(
-                activity = activity,
-                chatId = chatId,
-                fileId = "file-from-zip",
-                name = "extracted.txt",
-                size = 12L,
-                rawUri = pendingZipUri,
-                localPath = "/tmp/extracted.txt",
-                mime = "text/plain",
-                pendingUploadKind = "zip"
-            )
+            activity.saveOpenRouterAttachmentsToComposer(chatId,
+                listOf(OpenRouterLocalAttachment("extracted", "extracted.txt", "text", "/tmp/extracted.txt",
+                    "text/plain", 12L, "sha-extracted")), listOf(pendingZipUri to "zip"))
 
             val saved = JSONObject(prefs.getString("composer_state_$chatId", "") ?: "")
             val pending = saved.getJSONArray("pending_uploads")
@@ -1874,7 +1525,7 @@ class MainActivityLifecycleTest {
 
             invoke(
                 activity,
-                "preparePendingZipsThenSend",
+                "preparePendingOpenRouterZipsThenSend",
                 Boolean::class.javaPrimitiveType!!,
                 false
             )
@@ -2044,33 +1695,6 @@ class MainActivityLifecycleTest {
     private fun adapterIndexOf(activity: MainActivity, itemId: String): Int =
         (privateField(activity, "messageAdapter") as ChatMessageAdapter).indexOfId(itemId)
 
-    private fun invokeSaveUploadedFileToComposer(
-        activity: MainActivity,
-        chatId: String,
-        fileId: String,
-        name: String,
-        size: Long,
-        rawUri: String,
-        localPath: String,
-        mime: String,
-        pendingUploadKind: String
-    ) {
-        invokeMethod(
-            activity,
-            "saveUploadedFileToComposer",
-            arrayOf(
-                String::class.java,
-                String::class.java,
-                String::class.java,
-                Long::class.javaPrimitiveType!!,
-                String::class.java,
-                String::class.java,
-                String::class.java,
-                String::class.java
-            ),
-            arrayOf(chatId, fileId, name, size, rawUri, localPath, mime, pendingUploadKind)
-        )
-    }
 
     private fun waitForSourceAttachmentCount(
         scenario: ActivityScenario<MainActivity>,
@@ -2486,50 +2110,34 @@ class MainActivityLifecycleTest {
 
     @Test
     @androidx.test.filters.SdkSuppress(minSdkVersion = 29)
-    fun savedBackgroundResponsesFalseSurvivesUpgradeAndSendsBackgroundFalseOnWire() {
+    fun savedBackgroundFalseSurvivesUpgradeAndStopsTheOpenRouterConnection() {
         val (server, testHttpClient) = createHttpsMockServer()
-        val response = JSONObject().put("id", "resp_fg_only").put("status", "completed")
-            .put("output", JSONArray().put(JSONObject().put("type", "message")
-                .put("role", "assistant").put("content", JSONArray().put(
-                    JSONObject().put("type", "output_text").put("text", "ok")))))
-        val sse = "data: " + JSONObject().put("type", "response.created")
-            .put("sequence_number", 0).put("response", JSONObject().put("id", "resp_fg_only")) +
-            "\n\ndata: " + JSONObject().put("type", "response.completed")
-                .put("sequence_number", 1).put("response", response) + "\n\n"
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(sse))
-
+        val endpoint = server.url("/api/v1").toString()
+        server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE))
         val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
         val prefs = context.getSharedPreferences("app", android.content.Context.MODE_PRIVATE)
         val modified = listOf("background_responses", "background_responses_migrated_v25", "current_chat",
-            "provider", "model", "reasoning", "text_format", "system_prompt", "instructions",
-            "web", "file_search", "code_interpreter", "file_analysis_tools", "image_generation",
-            "openai_auto_compaction", "openai_auto_compaction_opt_in_migrated_v25")
+            "provider", "model", "reasoning", "openrouter_text_format", "system_prompt", "instructions")
         val previous = modified.associateWith { prefs.all[it] }
-        val originalKey = SecureStore(context).getApiKey()
+        val originalKey = SecureStore(context).getOpenRouterApiKey()
         var fixtureChatId: String? = null
-
+        var requestId: String? = null
         fun backgroundSwitch(view: android.view.View): android.widget.CheckBox? {
             if (view is android.widget.CheckBox && view.text.toString() == "Продолжать генерацию ответа в фоне") return view
-            if (view is android.view.ViewGroup) {
-                for (i in 0 until view.childCount) backgroundSwitch(view.getChildAt(i))?.let { return it }
-            }
+            if (view is android.view.ViewGroup) for (i in 0 until view.childCount)
+                backgroundSwitch(view.getChildAt(i))?.let { return it }
             return null
         }
-
         try {
-            // A pre-upgrade explicit false must survive both startup and Activity recreation.
             assertTrue(prefs.edit().putBoolean("background_responses", false)
-                .remove("background_responses_migrated_v25")
-                .putString("provider", "openai").putString("model", "gpt-6-astra")
-                .putString("reasoning", "high").putString("text_format", "text")
-                .putString("system_prompt", "").putString("instructions", "")
-                .putBoolean("web", false).putBoolean("file_search", false)
-                .putBoolean("code_interpreter", false).putBoolean("file_analysis_tools", false)
-                .putBoolean("image_generation", false).putBoolean("openai_auto_compaction", false).commit())
-
+                .remove("background_responses_migrated_v25").putString("provider", "openai")
+                .putString("model", "gpt-6-astra").putString("reasoning", "high")
+                .putString("openrouter_text_format", "text").putString("system_prompt", "")
+                .putString("instructions", "").commit())
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
-                    assertFalse("Explicit false must survive startup migration", activity.prefs.getBoolean("background_responses", true))
+                    assertFalse(activity.prefs.getBoolean("background_responses", true))
+                    assertEquals("openrouter", activity.prefs.getString("provider", null))
                     activity.newChat()
                     fixtureChatId = activity.currentChatIdForTesting()
                 }
@@ -2537,51 +2145,40 @@ class MainActivityLifecycleTest {
                 scenario.onActivity { activity ->
                     assertFalse("Explicit false must survive restart", activity.prefs.getBoolean("background_responses", true))
                     invoke(activity, "showSettings")
-                    val root = android.view.inspector.WindowInspector.getGlobalWindowViews()
-                        .single { backgroundSwitch(it) != null }
-                    assertFalse("Settings must show the saved switch disabled", backgroundSwitch(root)!!.isChecked)
+                    val root = android.view.inspector.WindowInspector.getGlobalWindowViews().single { backgroundSwitch(it) != null }
+                    assertFalse(backgroundSwitch(root)!!.isChecked)
                     root.findViewById<Button>(android.R.id.button2).performClick()
-                    assertTrue(SecureStore(activity).setApiKey("sk-synthetic-bg-false-test"))
-                    val redirected = testHttpClient.newBuilder().addInterceptor { chain ->
-                        chain.proceed(chain.request().newBuilder().url(server.url("/v1/responses")).build())
-                    }.build()
-                    setPrivateField(activity, "client", redirected)
+                    assertTrue(SecureStore(activity).setOpenRouterApiKey("sk-or-synthetic-bg-false"))
+                    setPrivateField(activity, "openRouterClientFactory",
+                        { OpenRouterChatClient(endpoint, testHttpClient, reconcileGenerations = false) })
                     (privateField(activity, "input") as android.widget.EditText).setText("Foreground only request")
                     invoke(activity, "sendMessage", Boolean::class.javaPrimitiveType!!, false)
                 }
-
                 val recorded = server.takeRequest(20, TimeUnit.SECONDS)
-                    ?: throw AssertionError("OpenAI Send did not reach local HTTPS MockWebServer")
+                    ?: throw AssertionError("OpenRouter Send did not reach local HTTPS mock")
                 assertEquals("POST", recorded.method)
-                assertEquals("/v1/responses", recorded.path)
-                assertFalse("Actual OpenAI wire JSON must respect the saved false",
-                    JSONObject(recorded.body.readUtf8()).getBoolean("background"))
-                // Finish this foreground request before closing Activity or restoring its credential.
-                var completed = false
-                val deadline = SystemClock.elapsedRealtime() + 20_000L
-                while (!completed && SystemClock.elapsedRealtime() < deadline) {
-                    scenario.onActivity { activity ->
-                        completed = (privateField(activity, "status") as android.widget.TextView)
-                            .text.toString().startsWith("Готово")
-                    }
-                    if (!completed) SystemClock.sleep(50L)
+                assertEquals("/api/v1/chat/completions", recorded.path)
+                assertFalse("OpenRouter does not accept the direct Responses background option", JSONObject(recorded.body.readUtf8()).has("background"))
+                ChatDatabase(context).use { db ->
+                    val active = db.getActiveResponse(fixtureChatId!!)!!
+                    requestId = active.getString("request_id")
+                    assertFalse("Runtime must capture the saved foreground preference", active.getBoolean("background_enabled"))
                 }
-                assertTrue("Foreground response must finish before fixture cleanup", completed)
-                assertEquals(1, server.requestCount)
+                scenario.moveToState(Lifecycle.State.CREATED)
+                val deadline = SystemClock.elapsedRealtime() + 10_000L
+                while (requestId?.let(OpenRouterResponseRuntime::contains) == true && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(20L)
+                assertFalse("A foreground-only stream must be cancelled on Stop", requestId?.let(OpenRouterResponseRuntime::contains) == true)
+                assertEquals("Stopping must not initiate another inference", 1, server.requestCount)
             }
         } finally {
-            SecureStore(context).setApiKey(originalKey)
-            fixtureChatId?.let { id ->
-                ChatDatabase(context).use { it.deleteChat(id) }
-                prefs.edit().remove("composer_state_$id").commit()
-            }
-            prefs.edit().apply {
-                previous.forEach { (key, value) -> when (value) {
-                    is String -> putString(key, value)
-                    is Boolean -> putBoolean(key, value)
-                    else -> remove(key)
-                } }
-            }.commit()
+            requestId?.let { OpenRouterResponseRuntime.cancel(it, "fixture cleanup") }
+            SecureStore(context).setOpenRouterApiKey(originalKey)
+            fixtureChatId?.let { id -> ChatDatabase(context).use { it.deleteChat(id) }; prefs.edit().remove("composer_state_$id").commit() }
+            prefs.edit().apply { previous.forEach { (key, value) -> when (value) {
+                is String -> putString(key, value)
+                is Boolean -> putBoolean(key, value)
+                else -> remove(key)
+            } } }.commit()
             server.shutdown()
         }
     }

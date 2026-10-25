@@ -111,7 +111,8 @@ android {
     sourceSets.getByName("main").assets.srcDir(responseRendererAssets)
 
     defaultConfig {
-        applicationId = "com.example.openaichat"
+        // Independent installation and data directory alongside the original 000Chat app.
+        applicationId = "com.example.openaichat.openrouter"
         minSdk = 26
         targetSdk = 35
         versionCode = 64
@@ -188,10 +189,6 @@ dependencies {
     androidTestImplementation("androidx.test:runner:1.7.0")
     implementation("androidx.annotation:annotation:1.11.0")
     implementation("androidx.activity:activity-ktx:1.10.1")
-    implementation("androidx.work:work-runtime-ktx:2.11.2")
-    // Execute the actual CoroutineWorker body with controlled SQLite state,
-    // without a paid provider connection in Android instrumentation.
-    androidTestImplementation("androidx.work:work-testing:2.11.2")
     implementation("androidx.recyclerview:recyclerview:1.4.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.core:core-ktx:1.15.0")

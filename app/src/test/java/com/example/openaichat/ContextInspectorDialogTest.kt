@@ -20,11 +20,8 @@ class ContextInspectorDialogTest {
     @Test fun activityBadgeIsInTelemetryHeaderAndClickOpensInspector() {
         val context = RuntimeEnvironment.getApplication()
         context.getSharedPreferences("app", android.content.Context.MODE_PRIVATE).edit().clear()
-            .putString("provider", "openai").putString("model", "gpt-6-astra")
+            .putString("provider", "openrouter").putString("model", "anthropic/claude-opus-5.5")
             .putBoolean("response_notifications", false).commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         try {
             val activity = controller.get()
@@ -51,7 +48,7 @@ class ContextInspectorDialogTest {
 
     @Test fun dialogUsesCapturedSnapshotAndOpensOnlyOnExplicitAction() {
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
-        val snapshot = ContextStatusSnapshot("captured-model", "OpenAI Responses", "локальный replay", "reason",
+        val snapshot = ContextStatusSnapshot("captured-model", "Anthropic через OpenRouter", "кэш 1h", "reason",
             2, 42L, listOf("данные.csv"), emptyList(), null, 0L, null)
         val dialog = ContextInspectorDialog.show(activity, AppThemePalette.byId("dark"), snapshot)
         assertTrue(dialog.isShowing)

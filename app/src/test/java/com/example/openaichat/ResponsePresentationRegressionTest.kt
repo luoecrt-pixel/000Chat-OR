@@ -70,15 +70,9 @@ class ResponsePresentationRegressionTest {
     }
     @Test fun presentationInstructionsDoNotReplaceUserInstructionsOrCapTables() {
         val instructions = GenerationInstructions("User system", "User developer", ResponsePresentationInstructions.text)
-        val body = org.json.JSONObject().put("input", org.json.JSONArray())
-        instructions.applyToOpenAiRequest(body)
-        assertFalse(body.has("instructions"))
-        val openAi = body.getJSONArray("input")
-        assertEquals(2, openAi.length())
-        assertEquals("system", openAi.getJSONObject(0).getString("role"))
-        assertTrue(openAi.getJSONObject(0).getString("content").startsWith("User system\n\n"))
-        assertEquals("developer", openAi.getJSONObject(1).getString("role"))
-        assertEquals("User developer", openAi.getJSONObject(1).getString("content"))
+        val prompt = instructions.openRouter(null, null, null)!!
+        assertTrue(prompt.startsWith("User system\n\nUser developer\n\n"))
+        assertTrue(prompt.endsWith(ResponsePresentationInstructions.text))
         assertTrue(instructions.openRouter(null, null, null)!!.contains("User developer"))
         assertFalse(ResponsePresentationInstructions.text.contains("не больше 4"))
     }

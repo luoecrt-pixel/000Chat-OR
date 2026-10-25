@@ -84,8 +84,10 @@ class SecureStore(
         } catch (_: Exception) { "" }
     }
 
-    fun setApiKey(v: String): Boolean = setSecret("key", v)
-    fun getApiKey(): String = getSecret("key")
+    /** Remove the retired credential without reading it or changing shared encryption keys. */
+    fun discardLegacyOpenAiCredential(): Boolean = synchronized(keystoreLock) {
+        !prefs.contains("key") || prefs.edit().remove("key").commit()
+    }
 
     fun setOpenRouterApiKey(v: String): Boolean = setSecret("openrouter_key", v)
     fun getOpenRouterApiKey(): String = getSecret("openrouter_key")

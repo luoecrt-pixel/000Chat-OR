@@ -12,25 +12,14 @@ data class ApiSourceOption(
 )
 
 object ModelCatalog {
-    // [https://developers.openai.com/api/docs/models](https://developers.openai.com/api/docs/models) (verified 2026-10-10).
-    // This is a context-window capability, never a client-side output-token cap.
-    fun openAiContextWindow(model: String): Int? = when (model.removePrefix("~")) {
-        "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna" -> 1_050_000
-        else -> null
-    }
-    fun compactionThreshold(model: String): Int? = openAiContextWindow(model)?.let { window ->
-        minOf(800_000, window - 16_384).takeIf { it > 0 }
-    }
+    // Read-only labels for imported history; these are never selectable or sent.
+    private val legacyDisplayNames = mapOf(
+        "gpt-6-astra" to "GPT-6 Astra",
+        "gpt-6.1-sol" to "GPT-6.1 Sol",
+        "gpt-6-luna" to "GPT-6 Luna"
+    )
+
     val sources: List<ApiSourceOption> = listOf(
-        ApiSourceOption(
-            id = "openai",
-            label = "OpenAI",
-            models = listOf(
-                ModelOption("gpt-6-astra", "GPT-6 Astra"),
-                ModelOption("gpt-6.1-sol", "GPT-6.1 Sol"),
-                ModelOption("gpt-6-luna", "GPT-6 Luna")
-            )
-        ),
         ApiSourceOption(
             id = "openrouter",
             label = "OpenRouter / Anthropic",
@@ -46,6 +35,17 @@ object ModelCatalog {
     fun source(id: String?): ApiSourceOption =
         sources.firstOrNull { it.id == id } ?: sources.first()
 
+    fun isClaudeModel(modelId: String?): Boolean =
+        modelId?.trim()?.removePrefix("~")?.startsWith("anthropic/claude-") == true
+
+    /** Preserve a configured Claude ID; never silently substitute another selected model. */
+    fun normalizedClaudeModel(modelId: String?): String {
+        val normalized = modelId?.trim()?.removePrefix("~")?.takeIf { it.isNotEmpty() }
+            ?: source("openrouter").models.first().id
+        require(isClaudeModel(normalized)) { "Выберите модель Claude через OpenRouter" }
+        return normalized
+    }
+
     fun model(providerId: String?, modelId: String?): ModelOption? {
         val normalized = modelId?.trim()?.removePrefix("~").orEmpty()
         return source(providerId).models.firstOrNull { it.id == normalized }
@@ -54,6 +54,7 @@ object ModelCatalog {
     fun displayName(providerId: String?, modelId: String?): String {
         val normalized = modelId?.trim()?.removePrefix("~").orEmpty()
         return model(providerId, normalized)?.label
+            ?: legacyDisplayNames[normalized]
             ?: normalized.ifBlank { "Модель не выбрана" }
     }
 

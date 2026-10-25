@@ -10,63 +10,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReconciliationBoundedDecoderTest {
-    @Test fun cancelAndMetadataPreserveCompleteOwnedUnicodeSnapshots() {
+    @Test fun metadataPreservesCompleteOwnedUnicodeSnapshotWithOneGet() {
         withServer { server ->
-            server.enqueue(MockResponse().setBody(
-                """{"id":"resp_owned","status":"cancelled","usage":{"input_tokens":7,"output_tokens":0},"text":"привет 😀"}"""
-            ))
             server.enqueue(MockResponse().setBody(
                 """{"data":{"id":"gen-owned","total_cost":0.125,"provider_name":"привет 😀"}}"""
             ))
-            val snapshots = mutableListOf<JSONObject>()
-            val outcome = OpenAiCancelReconciler(OkHttpClient(), server.url("/v1/"))
-                .reconcile("resp_owned", "synthetic-key") { snapshots += it }
-            assertEquals(200, outcome.cancelStatus)
-            assertEquals(0, outcome.retrievals)
-            assertEquals("привет 😀", snapshots.single().getString("text"))
-            assertTrue(outcome.hasUsage)
-            assertNull(outcome.decoderDiagnostic)
             val metadata = mutableListOf<JSONObject>()
             val lookups = OpenRouterGenerationReconciler(OkHttpClient(), server.url("/v1/"))
                 .reconcile(rounds(), "synthetic-key") { _, body -> metadata += body }
             assertEquals(1, lookups)
             assertEquals("привет 😀", metadata.single().getString("provider_name"))
-            assertEquals(2, server.requestCount)
-            assertEquals("POST", server.takeRequest().method)
+            assertEquals(1, server.requestCount)
             assertEquals("GET", server.takeRequest().method)
-        }
-    }
-
-    @Test fun cancelOversizedSuccessfulBodyCannotAttributePartialUsageOrIssueAnotherRequest() {
-        withServer { server ->
-            server.enqueue(MockResponse().setBody(JSONObject().put("id", "resp_owned").put("status", "cancelled")
-                .put("usage", JSONObject().put("input_tokens", 999).put("output_tokens", 9))
-                .put("extra", "x".repeat(200)).toString()))
-            var snapshots = 0
-            val failure = assertThrows(ResponsesSseLimitException::class.java) {
-                OpenAiCancelReconciler(OkHttpClient(), server.url("/v1/"), bodyLimits =
-                    BoundedResponseDecoder.BodyLimits(maxBytes = 128, maxChars = 512))
-                    .reconcile("resp_owned", "synthetic-key") { snapshots++ }
-            }
-            assertTrue(failure.message.orEmpty().contains("byte limit"))
-            assertEquals(0, snapshots)
-            assertEquals(1, server.requestCount)
-        }
-    }
-
-    @Test fun cancelOversizedAuthErrorPreservesStatusAndBoundDiagnosticWithoutRetrieve() {
-        withServer { server ->
-            server.enqueue(MockResponse().setResponseCode(401).setBody("x".repeat(1024 * 1024 + 1)))
-            val outcome = OpenAiCancelReconciler(OkHttpClient(), server.url("/v1/"))
-                .reconcile("resp_owned", "synthetic-key") { error("Auth body must not attribute usage") }
-            assertEquals(401, outcome.cancelStatus)
-            assertEquals(0, outcome.retrievals)
-            assertFalse(outcome.hasUsage)
-            assertTrue(outcome.decoderDiagnostic.orEmpty().contains("HTTP 401"))
-            assertTrue("Expected bounded decoder limit for oversized HTTP 401, got: ${outcome.decoderDiagnostic}",
-                isBoundedDecoderLimitMessage(outcome.decoderDiagnostic))
-            assertFalse(outcome.decoderDiagnostic.orEmpty().contains("synthetic-key"))
-            assertEquals(1, server.requestCount)
         }
     }
 

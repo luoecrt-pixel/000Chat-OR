@@ -7,11 +7,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
-import okhttp3.OkHttpClient
-import okhttp3.mockwebserver.MockResponse
-import okhttp3.mockwebserver.MockWebServer
 import java.io.IOException
-import java.util.concurrent.TimeUnit
 import org.robolectric.annotation.Config
 import java.io.File
 import java.nio.charset.Charset
@@ -22,6 +18,16 @@ import java.util.zip.ZipOutputStream
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class LocalFileToolsRegressionTest {
+    /** Saved v25 checkpoint fixture: no retired tool executor or network path is invoked. */
+    private fun saveLegacyCheckpoint(db: ChatDatabase, chatId: String, requestId: String,
+        files: List<OpenRouterLocalAttachment>) {
+        assertTrue(db.saveOpenAiToolCheckpoint(chatId, requestId, JSONObject().put("version", 1)
+            .put("phase", "idle").put("round", 0)
+            .put("attachments", JSONArray().apply { files.forEach { put(it.toJson()) } })
+            .put("prior_output", JSONArray()).put("local_artifacts", JSONArray())
+            .put("usage", JSONObject()).put(OpenAiUsageLedger.FIELD, OpenAiUsageLedger.empty())))
+    }
+
     private fun stats(a: OpenRouterLocalAttachment, args: JSONObject) = JSONObject(LocalFileTools(listOf(a))
         .execute("file_table_stats", args.put("file_id", a.id)))
 
@@ -83,7 +89,7 @@ class LocalFileToolsRegressionTest {
         } finally { folder.deleteRecursively() }
     }
 
-    @Test fun chatScopedArtifactsUseClassifyLocalFileAndExcludeForeignChats() {
+    @Test fun chatBoundArtifactResolverClassifiesLocalFilesAndRejectsForeignChats() {
         val folder = Files.createTempDirectory("chat-artifacts-").toFile()
         try {
             val cp1251File = File(folder, "report-cp1251.txt").apply {
@@ -101,7 +107,10 @@ class LocalFileToolsRegressionTest {
             val context = RuntimeEnvironment.getApplication()
             val lease = PreparedAttachmentFiles.lease(context)
             val resolved = lease.capture().use {
-                OpenAiLocalFileToolBridge.attachments(emptyList(), localFiles, "chat-1", context)
+                assertThrows(IOException::class.java) {
+                    LocalArtifactAttachmentResolver.resolve(context, null, "chat-1", localFiles[1])
+                }
+                listOf(LocalArtifactAttachmentResolver.resolve(context, null, "chat-1", localFiles[0]))
             }
             assertEquals(1, resolved.size)
             val item = resolved.single()
@@ -126,15 +135,14 @@ class LocalFileToolsRegressionTest {
                 db.setActiveResponse("chat-1", "resp_1", "req_tool_1", "", "in_progress",
                     System.currentTimeMillis(), "high", "high", false, 10, 1, true)
                 db.startRequestAccounting("chat-1", "req_tool_1", "openai", "gpt-5.4", "openai_api_key")
-                val body = JSONObject().put("model", "gpt-5.4").put("input", JSONArray())
-                OpenAiLocalFileToolBridge.configure(db, "chat-1", "req_tool_1", body, resolved)
-                val activePaths = db.listActiveOpenAiToolAttachmentPaths()
+                saveLegacyCheckpoint(db, "chat-1", "req_tool_1", resolved)
+                val activePaths = db.listLegacyCheckpointAttachmentPaths()
                 assertTrue("Active checkpoint must protect .utf8 derivative path", derivedFile.path in activePaths)
 
                 // Release lease while checkpoint is active: .utf8 derivative must stay on disk.
                 val activeOwners = PreparedAttachmentFiles.Owners(
                     durable = db.listAllLocalFilePaths().toSet(),
-                    active = db.listActiveOpenAiToolAttachmentPaths()
+                    active = db.listLegacyCheckpointAttachmentPaths()
                 )
                 lease.release(activeOwners)
                 assertTrue("Derivative must remain while OpenAI tool checkpoint is active", derivedFile.isFile)
@@ -184,10 +192,9 @@ class LocalFileToolsRegressionTest {
                 db.setActiveResponse(chatId, "resp_terminal", requestId, "", "in_progress",
                     System.currentTimeMillis(), "high", "high", false, 1, 1, true)
                 db.startRequestAccounting(chatId, requestId, "openai", "gpt-5.4", "openai_api_key")
-                OpenAiLocalFileToolBridge.configure(db, chatId, requestId,
-                    JSONObject().put("model", "gpt-5.4"), listOf(attachment))
+                saveLegacyCheckpoint(db, chatId, requestId, listOf(attachment))
                 lease.release(PreparedAttachmentFiles.Owners(
-                    db.listAllLocalFilePaths().toSet(), db.listActiveOpenAiToolAttachmentPaths()))
+                    db.listAllLocalFilePaths().toSet(), db.listLegacyCheckpointAttachmentPaths()))
                 fun answer(owner: String) = JSONObject().put("role", "assistant").put("provider", "openai")
                     .put("request_id", owner).put("status", "completed").put("text", "Done")
                 assertFalse(db.finalizeCurrentChatIfActiveRequest(chatId, "Terminal cleanup", "resp_terminal",
@@ -243,11 +250,10 @@ class LocalFileToolsRegressionTest {
                     db.setActiveResponse(chatId, "resp_$index", "req_$index", "", "in_progress",
                         System.currentTimeMillis(), "high", "high", false, 1, 1, true)
                     db.startRequestAccounting(chatId, "req_$index", "openai", "gpt-5.4", "openai_api_key")
-                    OpenAiLocalFileToolBridge.configure(db, chatId, "req_$index",
-                        JSONObject().put("model", "gpt-5.4"), listOf(attachments[index]))
+                    saveLegacyCheckpoint(db, chatId, "req_$index", listOf(attachments[index]))
                 }
                 val owners = PreparedAttachmentFiles.Owners(
-                    db.listAllLocalFilePaths().toSet(), db.listActiveOpenAiToolAttachmentPaths())
+                    db.listAllLocalFilePaths().toSet(), db.listLegacyCheckpointAttachmentPaths())
                 leases.forEach { it.release(owners) }
                 assertTrue(derivatives.all { it.isFile })
                 val answer = JSONObject().put("role", "assistant").put("provider", "openai")
@@ -268,94 +274,58 @@ class LocalFileToolsRegressionTest {
         }
     }
 
-    @Test fun missingArtifactDerivativeIsRebuiltUnderLeaseAndReusedAcrossResumedBatches() {
+    @Test fun missingArtifactDerivativeIsRebuiltUnderLeaseAndReusedAcrossLocalReopen() {
         val context = RuntimeEnvironment.getApplication()
         val chatId = "artifact-rebuild-${System.nanoTime()}"
         val requestId = "request-rebuild"
-        val credential = "mock-artifact-key"
-        val model = "gpt-5.4"
         val original = File(context.filesDir, "generated/$chatId/report.txt").apply {
             parentFile!!.mkdirs()
             writeBytes("Отчёт по эксперименту №1".toByteArray(Charset.forName("windows-1251")))
         }
-        val server = MockWebServer().apply { start() }
-        val http = OkHttpClient.Builder().addInterceptor { chain ->
-            chain.proceed(chain.request().newBuilder().url(server.url(chain.request().url.encodedPath)).build())
-        }.build()
         var db = ChatDatabase(context)
-        var initialLease: PreparedAttachmentFiles.Lease? = null
+        val leases = mutableListOf<PreparedAttachmentFiles.Lease>()
         try {
-            val lease = PreparedAttachmentFiles.lease(context).also { initialLease = it }
-            val attachment = lease.capture().use { OpenRouterAttachmentStore.classifyLocalFile(context, original) }
+            val initialLease = PreparedAttachmentFiles.lease(context).also(leases::add)
+            val attachment = initialLease.capture().use { OpenRouterAttachmentStore.classifyLocalFile(context, original) }
             val oldDerivative = File(attachment.textPath!!)
-            val fingerprint = OpenAiInstructionChainPolicy.fingerprint(
-                GenerationInstructions("", "", null), credential, model)
-            db.upsertCurrentChat(chatId, "Rebuild", null, null, listOf(JSONObject()
-                .put("role", "user").put("provider", "openai").put("request_id", requestId)
-                .put("text", "Read the artifact").put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, fingerprint)))
+            db.ensureChat(chatId, "Rebuild")
             db.setActiveResponse(chatId, "resp_parent", requestId, "", "in_progress",
                 System.currentTimeMillis(), "high", "high", false, 10, 1, true)
-            db.startRequestAccounting(chatId, requestId, "openai", model, "openai_api_key")
-            OpenAiLocalFileToolBridge.configure(db, chatId, requestId,
-                JSONObject().put("model", model).put("background", true), listOf(attachment))
-            fun owners() = PreparedAttachmentFiles.Owners(db.listAllLocalFilePaths().toSet(), db.listActiveOpenAiToolAttachmentPaths())
-            lease.release(owners())
+            db.startRequestAccounting(chatId, requestId, "openai", "legacy-model", "retired")
+            saveLegacyCheckpoint(db, chatId, requestId, listOf(attachment))
+            fun owners() = PreparedAttachmentFiles.Owners(db.listAllLocalFilePaths().toSet(), db.listLegacyCheckpointAttachmentPaths())
+            initialLease.release(owners())
             assertTrue(oldDerivative.delete())
-            fun toolCall(id: String, callId: String) = JSONObject().put("id", id).put("status", "completed")
-                .put("output", JSONArray().put(JSONObject().put("type", "function_call")
-                    .put("call_id", callId).put("name", "read_attached_file")
-                    .put("arguments", JSONObject().put("file_id", attachment.id).toString())))
-            var credentialLookups = 0
-            assertThrows(IOException::class.java) {
-                OpenAiLocalFileToolBridge.finish(context, db, chatId, requestId, toolCall("resp_parent", "call_1"), http,
-                    credential = {
-                        if (++credentialLookups == 2) throw IOException("Pause after prepared checkpoint")
-                        credential
-                    })
-            }
-            val prepared = db.getOpenAiToolCheckpoint(chatId, requestId)!!
-            assertEquals("prepared", prepared.getString("phase"))
-            assertEquals(0, server.requestCount)
-            val rebuiltPath = prepared.getJSONArray("attachments").getJSONObject(0).getString("text_path")
-            val rebuiltFile = File(rebuiltPath)
-            assertNotEquals(oldDerivative.path, rebuiltPath)
+
+            val rebuiltLease = PreparedAttachmentFiles.lease(context).also(leases::add)
+            val rebuilt = rebuiltLease.capture().use { LocalArtifactAttachmentResolver.resolveForTools(context, attachment) }
+            val rebuiltFile = File(rebuilt.textPath!!)
+            assertEquals(attachment.id, rebuilt.id)
+            assertNotEquals(oldDerivative.path, rebuiltFile.path)
             assertEquals(File(context.filesDir, "attachments").canonicalFile, rebuiltFile.canonicalFile.parentFile)
             assertEquals("Отчёт по эксперименту №1", rebuiltFile.readText(Charsets.UTF_8))
-            assertTrue(rebuiltPath in db.listActiveOpenAiToolAttachmentPaths())
+            saveLegacyCheckpoint(db, chatId, requestId, listOf(rebuilt))
+            rebuiltLease.release(owners())
             db.close()
             db = ChatDatabase(context)
-            server.enqueue(MockResponse().setBody(toolCall("resp_child", "call_2").toString()))
-            server.enqueue(MockResponse().setBody(JSONObject().put("id", "resp_final").put("status", "completed")
-                .put("output", JSONArray()).toString()))
-            val observedPaths = mutableListOf<String>()
-            OpenAiLocalFileToolBridge.finish(context, db, chatId, requestId, toolCall("resp_parent", "call_1"), http,
-                credential = { credential }, onStatus = {
-                    observedPaths += db.getOpenAiToolCheckpoint(chatId, requestId)!!
-                        .getJSONArray("attachments").getJSONObject(0).getString("text_path")
-                })
-            assertEquals(2, server.requestCount)
-            assertTrue(observedPaths.isNotEmpty())
-            assertTrue(observedPaths.all { it == rebuiltPath })
-            assertEquals(rebuiltPath, db.getOpenAiToolCheckpoint(chatId, requestId)!!
-                .getJSONArray("attachments").getJSONObject(0).getString("text_path"))
+            val persisted = OpenRouterLocalAttachment.fromJson(db.getOpenAiToolCheckpoint(chatId, requestId)!!
+                .getJSONArray("attachments").getJSONObject(0))
             repeat(2) {
-                val sent = JSONObject(server.takeRequest(2, TimeUnit.SECONDS)!!.body.readUtf8())
-                val result = JSONObject(sent.getJSONArray("input").getJSONObject(0).getString("output"))
+                val resolved = LocalArtifactAttachmentResolver.resolveForTools(context, persisted)
+                assertEquals(rebuiltFile.path, resolved.textPath)
+                val result = JSONObject(LocalFileTools(listOf(resolved)).execute("file_read_range",
+                    JSONObject().put("file_id", resolved.id)))
                 assertTrue(result.getBoolean("ok"))
                 assertEquals("Отчёт по эксперименту №1", result.getString("content"))
             }
-            assertEquals(2, db.getOpenAiToolCheckpoint(chatId, requestId)!!.getJSONObject("telemetry").getInt("rounds_completed"))
-            assertTrue(rebuiltFile.isFile)
+            assertTrue(rebuiltFile.path in db.listLegacyCheckpointAttachmentPaths())
             assertTrue(db.stopActiveRequestOnce(chatId, requestId, removeUserMessage = true))
             assertFalse("Temporary rebuilt derivative must be removed after Stop", rebuiltFile.exists())
             assertTrue("Original generated artifact must survive", original.isFile)
         } finally {
-            initialLease?.defer()
+            leases.forEach { it.defer() }
             db.deleteChat(chatId)
             db.close()
-            server.shutdown()
-            http.dispatcher.executorService.shutdown()
-            http.connectionPool.evictAll()
             original.parentFile!!.deleteRecursively()
         }
     }
@@ -469,24 +439,8 @@ class LocalFileToolsRegressionTest {
     @Test fun blankHistoricalPathDoesNotSilentlyDropAnUploadedFile() {
         val message = JSONObject().put("role", "user").put("text", "Use my dataset")
             .put("file_ids", JSONArray().put("file_123")).put("file_paths", JSONArray().put(""))
-        assertThrows(java.io.IOException::class.java) { OpenAiLocalContextEncoder.encode(listOf(message)) }
         assertThrows(java.io.IOException::class.java) { AttachmentHistoryPolicy.validate(message) }
     }
 
-    @Test fun wholeFileContainerInputDoesNotInlineASpreadsheetPreview() {
-        val folder = Files.createTempDirectory("full-input-").toFile()
-        try {
-            val file = File(folder, "all.csv").apply { writeText("x\n" + "1\n".repeat(1501)) }
-            val m = JSONObject().put("role", "user").put("text", "Sum all rows")
-                .put("provider", "openai").put("file_ids", JSONArray().put("file_native"))
-                .put("file_paths", JSONArray().put(file.path)).put("file_names", JSONArray().put(file.name))
-            val ids = OpenAiFileAnalysis.prepare(listOf(m), { true }) { source, _, _ ->
-                assertEquals(file.readText(), source.readText()); "file_current_account"
-            }
-            val wire = OpenAiLocalContextEncoder.encode(listOf(m), ids)
-            assertTrue(wire.toString().contains("file_current_account")); assertTrue(wire.toString().contains("Complete file"))
-            assertFalse(wire.toString().contains("file_native"))
-            assertFalse(wire.toString().contains("input_file"))
-        } finally { folder.deleteRecursively() }
-    }
+
 }

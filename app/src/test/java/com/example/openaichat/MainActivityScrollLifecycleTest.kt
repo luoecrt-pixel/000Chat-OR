@@ -39,14 +39,9 @@ class MainActivityScrollLifecycleTest {
     @Before fun before() {
         RuntimeEnvironment.setQualifiers("w1080dp-h1800dp-mdpi")
         val context = RuntimeEnvironment.getApplication()
-        try {
-            androidx.work.WorkManager.getInstance(context)
-        } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         prefs = context.getSharedPreferences("app", Context.MODE_PRIVATE)
         prefs.edit().clear().putBoolean("response_notifications", false)
-            .putString("provider", "openai").putString("model", "gpt-6-astra").commit()
+            .putString("provider", "openrouter").putString("model", "anthropic/claude-sonnet-5.5").commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
         context.deleteDatabase("astra_chats.db")
     }
@@ -96,7 +91,7 @@ class MainActivityScrollLifecycleTest {
         assertFalse("stream" in locks(activity))
     }
 
-    @Test fun onStartWaitsForWorkerHistoryDiffBeforeCompletingTheSavedReadingAnchor() {
+    @Test fun onStartWaitsForRuntimeHistoryDiffBeforeCompletingTheSavedReadingAnchor() {
         val diffTasks = java.util.ArrayDeque<Runnable>()
         ChatMessageAdapter.diffExecutorForTests = java.util.concurrent.Executor { diffTasks.addLast(it) }
         val source = streamingSource().take(31_999)
@@ -109,7 +104,7 @@ class MainActivityScrollLifecycleTest {
             val messages = db.getChat("stream")!!.getJSONArray("messages")
             db.upsertCurrentChat("stream", "Stream", null, null,
                 listOf(messages.getJSONObject(0), JSONObject().put("role", "assistant")
-                    .put("request_id", "worker-answer").put("status", "completed").put("text", "Worker completed")))
+                    .put("request_id", "runtime-answer").put("status", "completed").put("text", "Runtime completed")))
         }
         controller!!.start().resume().visible()
         val adapter = field<ChatMessageAdapter>(activity, "messageAdapter")

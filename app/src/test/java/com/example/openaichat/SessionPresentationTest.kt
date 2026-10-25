@@ -52,9 +52,6 @@ class SessionPresentationTest {
         context.deleteDatabase("astra_chats.db")
         prefs.edit().clear().putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         activity = Robolectric.buildActivity(MainActivity::class.java).create().also { controller = it }.get()
     }
     @After fun after() {
@@ -276,7 +273,7 @@ class SessionPresentationTest {
         views(latestCard).filterIsInstance<TextView>().single { it.text == "Повторить" }.performClick()
         val sendPreflight = ShadowAlertDialog.getLatestAlertDialog()!!
         assertTrue("The genuine latest request reaches sendMessage's missing-key preflight",
-            views(sendPreflight.window!!.decorView).filterIsInstance<EditText>().any { it.hint == "OpenAI API key" })
+            views(sendPreflight.window!!.decorView).filterIsInstance<EditText>().any { it.hint == "OpenRouter API key" })
         sendPreflight.dismiss()
         views(latestCard).filterIsInstance<TextView>().single { it.text == "👍" }.performClick()
         assertEquals(1, ChatDatabase(context).use { it.getChat(sourceChat)!!.getJSONArray("messages").getJSONObject(3).getInt("feedback") })
