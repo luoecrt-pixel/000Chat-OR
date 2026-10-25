@@ -20,7 +20,7 @@ class ContextLastRequestPolicyTest {
         assertNull(latest.accounting)
         assertEquals("openrouter", latest.provider)
         assertEquals("claude-test", latest.model)
-        val snapshot = ContextStatusPolicy.build("openai", "gpt-test", emptyList(), null, "", false, null,
+        val snapshot = ContextStatusPolicy.build("anthropic/claude-test", emptyList(), null,
             OpenRouterClaudeRoute.AUTO, "off", emptyList(), emptyList(), old, 1, 10, lastRequest = latest)
         assertNull(snapshot.cacheReadTokens)
         assertEquals("openrouter", snapshot.lastResponseProvider)
@@ -31,7 +31,7 @@ class ContextLastRequestPolicyTest {
     @Test fun actualZeroSurvivesProviderSwitchAndReturnedAccountingIsDetached() {
         val row = account("latest").put("cached_tokens", 0).put("cache_write_tokens", JSONObject.NULL)
         val latest = ContextLastRequestPolicy.selectLatestCompletedRequest(listOf(row), listOf(event("latest", 3)))!!
-        val snapshot = ContextStatusPolicy.build("openai", "new-model", emptyList(), null, "", false, null,
+        val snapshot = ContextStatusPolicy.build("anthropic/claude-new", emptyList(), null,
             OpenRouterClaudeRoute.AUTO, "off", emptyList(), emptyList(), null, null, 10, lastRequest = latest)
         assertEquals(0L, snapshot.cacheReadTokens)
         assertNull(snapshot.cacheWriteTokens)

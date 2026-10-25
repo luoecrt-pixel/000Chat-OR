@@ -39,9 +39,6 @@ class MainActivityEvidenceReadingAnchorTest {
         prefs.edit().clear().putString("current_chat", "reading-evidence")
             .putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         val source = File(context.filesDir, "reading-evidence-source.txt").apply { writeText("Локальный исходник для проверки цитат.") }
         val attachment = OpenRouterLocalAttachment("reading-evidence-source", source.name, "text", source.path,
             "text/plain", source.length(), OpenRouterAttachmentStore.sha256(source), textPath = source.path, textEncoding = "UTF-8")
@@ -143,9 +140,6 @@ class MainActivityEvidenceReadingAnchorTest {
         context.deleteDatabase("astra_chats.db")
         prefs.edit().clear().putString("current_chat", "shared-evidence").putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         val source = File(context.filesDir, "shared-evidence-source.txt").apply { writeText("source") }
         val attachment = OpenRouterLocalAttachment("shared", source.name, "text", source.path, "text/plain",
             source.length(), OpenRouterAttachmentStore.sha256(source), textPath = source.path, textEncoding = "UTF-8")
@@ -206,9 +200,6 @@ class MainActivityEvidenceReadingAnchorTest {
     @Test fun ordinaryAndForeignFileChatsNeverDiscoverEvidenceEvenAfterFontChange() {
         val context = RuntimeEnvironment.getApplication()
         val prefs = context.getSharedPreferences("app", Context.MODE_PRIVATE)
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         for (foreignFile in listOf(false, true)) {
             RuntimeEnvironment.setFontScale(1f)
             RuntimeEnvironment.setQualifiers("w1080dp-h1800dp-mdpi")

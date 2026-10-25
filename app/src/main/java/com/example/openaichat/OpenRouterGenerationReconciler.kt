@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * Bounded read-only OpenRouter generation reconciliation. Every request is
@@ -15,9 +16,10 @@ import java.io.IOException
 class OpenRouterGenerationReconciler(
     private val http: OkHttpClient,
     private val baseUrl: HttpUrl = "https://openrouter.ai/api/v1/".toHttpUrl(),
-    private val maxLookups: Int = 4,
     private val bodyLimits: BoundedResponseDecoder.BodyLimits = BoundedResponseDecoder.BodyLimits(),
-    private val onDiagnostic: (Int, String) -> Unit = { _, _ -> }
+    private val onDiagnostic: (Int, String) -> Unit = { _, _ -> },
+    private val maxDurationMillis: Long = 120_000L,
+    private val monotonicNanos: () -> Long = System::nanoTime
 ) {
     fun reconcile(
         rounds: List<JSONObject>,
@@ -25,6 +27,9 @@ class OpenRouterGenerationReconciler(
         onMetadata: (generationId: String, metadata: JSONObject) -> Unit
     ): Int {
         if (apiKey.isBlank()) return 0
+        require(maxDurationMillis > 0L) { "Reconciliation time budget must be positive" }
+        val startedNanos = monotonicNanos()
+        val budgetNanos = TimeUnit.MILLISECONDS.toNanos(maxDurationMillis)
         var attempts = 0
         fun report(status: Int, failure: IOException) {
             try { onDiagnostic(status, "${failure.javaClass.simpleName}: ${failure.message.orEmpty()}") }
@@ -36,8 +41,12 @@ class OpenRouterGenerationReconciler(
                 id.matches(Regex("[A-Za-z0-9_-]{1,128}"))
             } }
             .distinct()
-            .take(maxLookups.coerceIn(0, 4))
         for (generationId in candidates) {
+            // Reconcile every pending ID while the explicit read-only pass budget
+            // remains. Successfully saved IDs are skipped on the next pass/reopen.
+            if (Thread.currentThread().isInterrupted) break
+            val remainingNanos = budgetNanos - (monotonicNanos() - startedNanos).coerceAtLeast(0L)
+            if (remainingNanos <= 0L) break
             val url = baseUrl.newBuilder().addPathSegment("generation")
                 .addQueryParameter("id", generationId).build()
             val request = Request.Builder().url(url)
@@ -45,7 +54,11 @@ class OpenRouterGenerationReconciler(
             var code = 0
             var metadata: JSONObject? = null
             try {
-                http.newCall(request).execute().use { response ->
+                val call = http.newCall(request)
+                val configuredNanos = call.timeout().timeoutNanos()
+                call.timeout().timeout(if (configuredNanos > 0L) minOf(configuredNanos, remainingNanos)
+                    else remainingNanos, TimeUnit.NANOSECONDS)
+                call.execute().use { response ->
                     code = response.code
                     metadata = if (response.isSuccessful) {
                         val raw = BoundedResponseDecoder.readBody(response.body, bodyLimits)

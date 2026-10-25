@@ -4,12 +4,25 @@ import java.io.File
 import java.nio.charset.Charset
 import java.util.Base64
 import org.json.JSONArray
+import org.json.JSONObject
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class OpenRouterAttachmentStoreTest {
+    /** Exercise the same file-backed JSON path used by OpenRouter requests. */
+    private fun wireDataUrl(attachment: OpenRouterLocalAttachment): String {
+        val body = StreamingJsonRequestBody(JSONObject()
+            .put("content", OpenRouterAttachmentStore.toContentBlock(attachment)))
+        val sink = Buffer()
+        body.writeTo(sink)
+        val part = JSONObject(sink.readUtf8()).getJSONObject("content")
+        return if (attachment.kind == "image") part.getJSONObject("image_url").getString("url")
+            else part.getJSONObject("file").getString("file_data")
+    }
+
     @Test fun interruptedHashingPreservesOriginalAndCreatesNoDerivative() {
         val dir = createTempDir()
         val bytes = "original UTF-8 text".toByteArray(Charsets.UTF_8)
@@ -37,7 +50,7 @@ class OpenRouterAttachmentStoreTest {
             val file = File(dir, "motion.jpg").apply { writeBytes(jpeg + ByteArray(300_000) { 65 }) }
             val a = OpenRouterAttachmentStore.classifyLocalFile(file, file.name, "image/jpeg")
             assertEquals("image/jpeg", a.mime)
-            assertTrue(Base64.getDecoder().decode(OpenRouterAttachmentStore.toDataUrl(a).substringAfter(',')).contentEquals(file.readBytes()))
+            assertTrue(Base64.getDecoder().decode(wireDataUrl(a).substringAfter(',')).contentEquals(file.readBytes()))
             file.writeBytes(jpeg.copyOf(jpeg.size - 2) + ByteArray(300_000) { 65 })
             var rejected = false
             try { OpenRouterAttachmentStore.classifyLocalFile(file, file.name, "image/jpeg") }
@@ -141,7 +154,7 @@ class OpenRouterAttachmentStoreTest {
         val original = realImageBytes("jpeg")
         val file = File(dir, "x.jpg").apply { writeBytes(original) }
         val a = OpenRouterLocalAttachment("1", "x.jpg", "image", file.absolutePath, "image/jpeg", original.size.toLong(), "hash")
-        val data = OpenRouterAttachmentStore.toDataUrl(a)
+        val data = wireDataUrl(a)
         assertTrue(data.startsWith("data:image/jpeg;base64,"))
         val encoded = data.substringAfter(",")
         assertTrue(Base64.getDecoder().decode(encoded).contentEquals(original))
@@ -226,7 +239,7 @@ class OpenRouterAttachmentStoreTest {
         )
         assertEquals(null, a.wirePath)
         assertEquals(null, a.wireMime)
-        assertTrue(OpenRouterAttachmentStore.toDataUrl(a).startsWith("data:image/jpeg;base64,"))
+        assertTrue(wireDataUrl(a).startsWith("data:image/jpeg;base64,"))
     }
 
     @Test(expected = java.io.IOException::class)
@@ -240,7 +253,7 @@ class OpenRouterAttachmentStoreTest {
     @Test(expected = java.io.IOException::class)
     fun missingWireFileDoesNotProduceEmptyBase64() {
         val a = OpenRouterLocalAttachment("id","x.png","image","/missing/app04-image.png","image/png",12L,"sha")
-        OpenRouterAttachmentStore.toDataUrl(a)
+        wireDataUrl(a)
     }
 
     @Test
@@ -253,7 +266,7 @@ class OpenRouterAttachmentStoreTest {
             val file = File(dir, "wrong.jpeg").apply { writeBytes(original) }
             val attachment = OpenRouterAttachmentStore.classifyLocalFile(file, "wrong.jpeg", "image/jpeg")
             assertEquals(mime, attachment.mime)
-            val url = OpenRouterAttachmentStore.toDataUrl(attachment)
+            val url = wireDataUrl(attachment)
             assertTrue(url.startsWith("data:$mime;base64,"))
             assertTrue(Base64.getDecoder().decode(url.substringAfter(",")).contentEquals(original))
         }
@@ -273,7 +286,7 @@ class OpenRouterAttachmentStoreTest {
             )
             var rejected = false
             try {
-                OpenRouterAttachmentStore.toDataUrl(attachment)
+                wireDataUrl(attachment)
             } catch (_: java.io.IOException) {
                 rejected = true
             }

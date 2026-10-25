@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">Integral LLM</string>
+    <string name="app_name">Integral LLM · OpenRouter</string>
     <item name="chat_messages_recycler" type="id" />
 </resources>

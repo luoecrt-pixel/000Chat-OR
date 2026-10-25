@@ -177,22 +177,9 @@ for populated in (False, True):
 # Regression guards for the previously reproduced Android foreground loss:
 # provider HTTP x-request-id must not become the SQLite ownership request_id.
 main_activity = (ROOT / "app/src/main/java/com/example/openaichat/MainActivity.kt").read_text()
-parsed = re.search(r'val parsedModel = AstraResponseModel\.fromResponse\(\s*effectiveResponse,\s*finalText,\s*(\w+)\s*,', main_activity)
-assert parsed and parsed.group(1) == "localRequestId", "Foreground assistant must use its local active request ID"
-assert re.search(r'val effectiveResponse = durableToolTerminal\s*\?: OpenAiEffectiveResponse\.assemble\(completedResponse, responseState\)', main_activity), "Foreground failure must prefer durable terminal output and otherwise retain all received typed output"
 assert 'JsonProtocol.string(messages[0], "request_id") != expectedRequestId) return false' in db, "Mismatched terminal assistant must not consume active ownership"
 assert '"Готово. Ответ не содержит текста."' not in main_activity, "UI status must not enter canonical response"
 assert '"Ответ завершился без полученного текста: "' not in main_activity, "Exception text must stay in metadata"
-worker = (ROOT / "app/src/main/java/com/example/openaichat/BackgroundResponseWorker.kt").read_text()
-# The old lexical guard required naive full.append(delta), which silently
-# scrambled interleaved output after WorkManager resume. Require the shared,
-# durable indexed reducer instead of reintroducing the known P1 regression.
-assert 'ResponseEventReducer.reduce(responseState, event).state' in worker
-assert 'ResponseIndexedCheckpoint.restore(current)' in worker
-assert 'indexedCheckpoint = ResponseIndexedCheckpoint.serialize(responseState)' in worker
-assert 'full.append' not in worker
-reducer = (ROOT / "app/src/main/java/com/example/openaichat/ResponseEventReducer.kt").read_text()
-assert 'JsonProtocol.string(event, "delta")' in reducer and 'JsonProtocol.nonBlank(it, "message")' in reducer
 xlsx = (ROOT / "app/src/main/java/com/example/openaichat/StructuredDocumentExtractor.kt").read_text()
 assert 'cell?.put("formula", "")' in xlsx and '"formula_si"' in xlsx
 
@@ -218,8 +205,33 @@ assert 'OpenRouterAttachmentStore.classifyLocalFile(' in artifact_resolver and \
     'persistLocalArtifactAttachment(' in artifact_resolver, "Artifact reuse must retain source verification, fallback classification and durable manifest CAS"
 assert 'textEncoding = "UTF-8".takeIf' not in orr_runtime, "Unconditional UTF-8 local file registration must not remain in OpenRouterResponseRuntime"
 chat_db_src = (ROOT / "app/src/main/java/com/example/openaichat/ChatDatabase.kt").read_text()
-assert 'fun listActiveOpenAiToolAttachmentPaths(' in chat_db_src, "ChatDatabase must expose active OpenAI tool checkpoint attachment paths separately from durable paths"
+assert 'fun listLegacyCheckpointAttachmentPaths(' in chat_db_src, "ChatDatabase must expose legacy checkpoint attachment paths separately from durable paths"
 assert 'cachedLayout' in pages_src, "ResponseTextPages must cache computed page slices to avoid repeated O(N) formula scans"
 assert 'legacyAliases' in local_tools, "LocalFileTools must support legacy local_<filename> alias lookup"
+assert "ExecutorResourceCloser.closeAfterTermination" in main_activity, "Activity teardown must defer SQLite close until owned callbacks terminate"
+
+
+# Direct OpenAI networking is retired; local historical metadata is still supported.
+main_sources = ROOT / "app/src/main/java/com/example/openaichat"
+retired_network_sources = (
+    "OpenAiCancelReconciler.kt", "OpenAiCreateCallOwners.kt", "OpenAiFileUploadCache.kt",
+    "OpenAiFileAnalysis.kt", "OpenAiLocalContextEncoder.kt", "OpenAiLocalFileToolBridge.kt",
+    "ResumableResponseStreamClient.kt", "ResumableResponseRequest.kt",
+    "BackgroundResponseWorker.kt", "BackgroundResponseWorkScheduler.kt", "ContextToolSchemas.kt",
+)
+for name in retired_network_sources:
+    assert not (main_sources / name).exists(), f"Retired direct OpenAI transport remains: {name}"
+for path in main_sources.glob("*.kt"):
+    assert not re.search(r'https?://api\.openai\.com(?:/|["\s])', path.read_text()), \
+        f"Direct OpenAI endpoint remains in production: {path.name}"
+catalog = (main_sources / "ModelCatalog.kt").read_text()
+model_ids = re.findall(r'ModelOption\(\s*"([^"]+)"', catalog)
+assert model_ids and all(model.startswith("anthropic/") for model in model_ids), "Only Claude models may be selected"
+codec = (main_sources / "MessageMetadataCodec.kt").read_text()
+for key in ("openai_protocol_output", "openai_usage_ledger"):
+    assert key in codec, f"Legacy metadata contract lost: {key}"
+assert 'FINGERPRINT_FIELD' in codec or '"openai_instructions_sha256"' in codec, "Historical instruction fingerprint field must remain in metadata v1"
+assert any('"openai_instructions_sha256"' in path.read_text() for path in main_sources.glob("*.kt")), "Historical instruction fingerprint wire key lost"
+assert 'OpenAiRequestSnapshotAndUploadTest' not in (ROOT / '.github/workflows/build.yml').read_text(), "CI must not invoke the retired OpenAI suite"
 
 print(f"Implementation lexical/schema checks: PASS ({len(files)} Kotlin files; SQLite definitions, v20->v21->v22 additive columns, FK cleanup, long UTF-8/NUL byte slices). Android compilation/tests remain separate.")

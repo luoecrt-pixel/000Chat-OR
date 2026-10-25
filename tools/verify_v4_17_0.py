@@ -20,9 +20,10 @@ gradle = GRADLE.read_text()
 workflow = WF.read_text()
 
 assert 'versionName = "4.17.0"' in gradle
+assert 'applicationId = "com.example.openaichat.openrouter"' in gradle
+assert 'androidx.work:' not in gradle, 'OpenRouter service must not retain the retired Worker dependency'
 assert 'implementation("androidx.recyclerview:recyclerview:1.4.0")' in gradle
 assert 'implementation("androidx.core:core-ktx:1.15.0")' in gradle
-assert 'implementation("androidx.work:work-runtime-ktx:2.11.2")' in gradle
 assert 'implementation("androidx.activity:activity-ktx:1.10.1")' in gradle
 assert 'class MainActivity : ComponentActivity()' in main
 assert 'registerForActivityResult(ActivityResultContracts.StartActivityForResult())' in main
@@ -33,40 +34,21 @@ assert 'buildConfig = true' in gradle
 assert 'container_file_citation' in main
 assert 'file_citation' in main
 assert 'url_citation' in main
-tool_schemas = (ROOT / 'app/src/main/java/com/example/openaichat/ContextToolSchemas.kt').read_text()
-assert 'if (web) put(JSONObject().put("type", "web_search"))' in tool_schemas
-assert main.count('ContextToolSchemas.openAi(') >= 2, 'Send and Inspector must use the same tool schema builder'
-assert 'configuration_update' in main
-assert 'autoCompaction = prefs.getBoolean("openai_auto_compaction", false)' in main
-assert 'configUpdateEffort == null && openAiOptions.autoCompaction' in main
-assert 'background' in main
-assert 'streamBackgroundResponse' in main
-assert 'response.reasoning_summary_text.delta' in main
+assert 'background_responses' in main
+assert 'preparePendingOpenRouterZipsThenSend' in main
 assert 'reasoningSummary' in model
-assert 'AstraResponseModel.fromResponse' in main
 assert 'AstraResponseModel.fromChatJson' in main
 assert 'URLSpan' in renderer
 assert 'LinkMovementMethod' in main
 assert 'file_paths' in main and 'file_mimes' in main
 assert 'image_name' in main and 'image_mime' in main
 assert 'showTextPreview' in main and 'showPdfPreview' in main
-assert 'downloadUserImageCopy' in main
-assert 'showPendingLocalPreview' in main
 assert 'addCompactTextPreview' in main
 assert 'addCompactImagePreview' in main
 assert 'addCompactPdfPreview' in main
 assert 'updateMessageFileLocalState' not in main, 'historical downloads must not mutate captured message/index state'
-assert 'updateUserFileLocalPath' in db
-assert 'updateUserImageLocalPath' in db
-assert 'import okio.buffer' in main
 assert 'while(message.optJSONArray("file_paths")' not in main
-assert 'ProgressRequestBody' in main
-assert 'preparePendingZipsThenSend' in main
-assert 'extractZipForSend' in main
 assert 'handleZipAttachment' not in main
-assert '25_000_000L' in main
-assert '200L*1024L*1024L' in main
-assert 'maxEntries=100' in main
 assert 'web_search_preview' not in main
 assert 'listChatSummaries()' in main
 assert 'BuildConfig.APPLICATION_ID' in main
@@ -181,24 +163,17 @@ assert 'gradle --no-daemon --stacktrace test lintDebug assembleDebug' in workflo
 assert 'permissions:' in workflow and 'contents: read' in workflow
 assert 'expectedRequestId' in main
 assert 'upsertCurrentChatIfActiveRequest' in db
-assert 'backgroundEnabled = backgroundEnabled' in main
 assert 'active_background_enabled' in db
-assert 'background_enabled' in main
 assert 'isNearLatest' in main
 assert 'ChatScrollPolicy.shouldScrollToLatest' in main
 assert (ROOT / 'app/src/main/java/com/example/openaichat/ChatScrollPolicy.kt').exists()
 assert (ROOT / 'app/src/test/java/com/example/openaichat/ChatScrollPolicyTest.kt').exists()
-assert (ROOT / 'app/src/main/java/com/example/openaichat/ResumableResponseRequest.kt').exists()
-assert (ROOT / 'app/src/test/java/com/example/openaichat/ResumableResponseRequestTest.kt').exists()
-assert 'jitteredDelayMs' in (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundRecoveryPolicy.kt').read_text()
-assert 'jitteredDelayMs' in (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundResponseWorker.kt').read_text()
 assert 'concurrency:' in workflow
 assert 'activityVisible' in main
 assert 'isFinishing)' in main
 assert '!finishing' in (ROOT / 'app/src/main/java/com/example/openaichat/ActiveResponseState.kt').read_text()
 assert 'ViewCompat.setOnApplyWindowInsetsListener' in main
 assert 'WindowInsetsCompat.Type.systemBars()' in main
-assert 'ResumableResponseStreamClient' in main
 adapter = (ROOT / 'app/src/main/java/com/example/openaichat/ChatMessageAdapter.kt').read_text()
 assert 'AsyncListDiffer' in adapter
 assert 'itemById' in adapter
@@ -206,16 +181,12 @@ assert 'itemIndexById' in adapter
 assert 'displayPositionById' in adapter
 assert 'items.firstOrNull' not in adapter
 assert 'differ.currentList.indexOfFirst' not in adapter
-assert 'startingAfter = cursor' in main
-assert 'last_sequence_number' in main
-assert (ROOT / 'app/src/main/java/com/example/openaichat/ResumableResponseStreamClient.kt').exists()
+assert 'active_last_sequence_number < ?' in db, 'OpenRouter prefix updates must remain monotonic'
 assert (ROOT / 'app/src/main/java/com/example/openaichat/ActiveResponseState.kt').exists()
 assert (ROOT / 'app/src/test/java/com/example/openaichat/ActiveResponseStateTest.kt').exists()
 assert 'backgroundResumeUiSnapshotMustMatchGenerationChatAndAssistant' in (ROOT / 'app/src/test/java/com/example/openaichat/ActiveResponseStateTest.kt').read_text()
 assert 'ActiveResponseStateStore' in main
-assert 'BackgroundResponseUiSnapshot' in main
 assert 'activeResponseState.state.isCurrent' in main
-assert 'streamBackgroundResponse(a, uiSnapshot)' in main
 assert 'activeResponseState.markUserStop()' in main
 
 def find_matching_kotlin_brace(src: str, open_index: int) -> int:
@@ -287,111 +258,38 @@ def kotlin_method(src: str, name: str) -> str:
     return src[match.start():find_matching_kotlin_brace(src, opening) + 1]
 
 
-# Historical downloads bind one immutable source to an atomic SQLite CAS. A chat
-# switch may keep the valid durable copy, but must never apply its posted UI work.
-for suffix in ('File', 'Image'):
-    download = kotlin_method(main, f'downloadUser{suffix}Copy')
-    persist = kotlin_method(db, f'updateUser{suffix}LocalPath')
-    assert 'HistoricalAttachmentDownloadTarget.' + suffix.lower() + '(' in download
-    assert 'val fileId=target.fileId' in download
-    assert download.index('val credential=readCredential()') < download.index('executor.execute{')
-    assert 'if(credential!=readCredential())throw IOException(' in download
-    assert '.addHeader("Authorization","Bearer $credential")' in download
-    assert 'File.createTempFile(' in download, 'downloads need their own disposable destination'
-    assert 'retained=chatDb.updateUser' + suffix + 'LocalPath(target,' in download
-    assert 'if(!retained)return@execute' in download
-    assert 'if(!retained)destination?.delete()' in download, 'failed source CAS must release downloaded bytes'
-    assert download.count('isRequestCurrent(chatId,generation)') == 4
-    assert download.count('chatDb.isHistoricalAttachmentDownloadCurrent(target,finalPath)') == 2
-    assert download.count('chatDb.isHistoricalAttachmentDownloadCurrent(target)') == 2
-    assert 'writableDatabase.transaction { db ->' in persist
-    assert 'historicalDownloadMessage(db, target) ?: return@transaction' in persist
-    assert 'if (!target.matches(current)) return@transaction' in persist
-    assert 'arrayOf(current.getLong("_db_message_id").toString())' in persist
-historical_read = kotlin_method(db, 'historicalDownloadMessage')
-assert 'SqliteLargeTextQuery.query(db, MESSAGE_TABLE,' in historical_read
-assert 'chat_id=? AND role=\'user\' AND $identity' in historical_read
-
-
-# Vector Store list rendering must be UI-thread-safe even when called from an Executor callback.
-vector_start = main.find("private fun renderVectorStoreList(vsId:String)")
-assert vector_start >= 0
-vector_end = main.find("    private fun pickFileForVectorStore()", vector_start)
-assert vector_end > vector_start
-vector_block = main[vector_start:vector_end]
-outer_gate = "runOnUiThread{"
-outer_gate_pos = vector_block.find(outer_gate)
-assert outer_gate_pos >= 0
-assert vector_block.startswith("private fun renderVectorStoreList(vsId:String){\n        " + outer_gate)
-outer_gate_open = outer_gate_pos + len(outer_gate) - 1
-outer_gate_close = find_matching_kotlin_brace(vector_block, outer_gate_open)
-outside_outer_gate = vector_block[:outer_gate_open] + vector_block[outer_gate_close + 1:]
-
-assert 'vsStatusLine?.text="Загрузка списка файлов…"' in vector_block
-assert "renderVectorStoreList(vsId)" in vector_block
-for ui_access in ("vsStatusLine?.text", "vsListArea"):
-    assert ui_access not in outside_outer_gate, (
-        f"{ui_access} must remain inside renderVectorStoreList's main-thread gate"
-    )
-assert 'streamClient.stream' in (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundResponseWorker.kt').read_text()
-assert 'starting_after' in (ROOT / 'app/src/main/java/com/example/openaichat/ResumableResponseStreamClient.kt').read_text()
-assert 'ResponseStreamSequenceGapException' in (ROOT / 'app/src/main/java/com/example/openaichat/ResumableResponseStreamClient.kt').read_text()
-assert 'background_resume_sequence_gap' in main
-assert 'worker_sequence_gap' in (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundResponseWorker.kt').read_text()
 assert 'systemWindowInsetLeft' not in main
 assert 'consumeSystemWindowInsets()' not in main
 assert 'pollingClient' in main
-# Responses SSE framing moved into a shared foreground/recovery reader in STREAM-01.
-reader = (ROOT / 'app/src/main/java/com/example/openaichat/OpenAiSseStreamReader.kt').read_text()
-resumable = (ROOT / 'app/src/main/java/com/example/openaichat/ResumableResponseStreamClient.kt').read_text()
+# OpenRouter uses the shared bounded HTTP/SSE decoder.
 bounded_decoder = (ROOT / 'app/src/main/java/com/example/openaichat/BoundedResponseDecoder.kt').read_text()
 router_client = (ROOT / 'app/src/main/java/com/example/openaichat/OpenRouterChatClient.kt').read_text()
 assert 'SseEventParser()' in bounded_decoder
-assert 'BoundedResponseDecoder.readSse(reader' in reader
 assert 'BoundedResponseDecoder.readSse(reader' in router_client
 assert 'BoundedResponseDecoder.openSse(bodyResponse.byteStream(), sseLimits)' in router_client
 assert 'if (frame != null && consume(frame)) { stopped = true; break }' in bounded_decoder
-assert 'CodingErrorAction.REPORT' in bounded_decoder
+assert '.onMalformedInput(CodingErrorAction.REPORT)' in bounded_decoder
+assert '.onUnmappableCharacter(CodingErrorAction.REPORT)' in bounded_decoder
 assert 'allocation.framingCharacters' in bounded_decoder
 assert 'allocation.json' in bounded_decoder
 assert 'ERROR_BODY_LIMITS' in bounded_decoder
-for transport in (main, resumable, router_client):
+for transport in (router_client,):
     assert 'body?.string()' not in transport
     assert 'BoundedResponseDecoder.readErrorBody' in transport
 assert 'reader.readLine()' not in router_client
-assert 'OpenAiReceivedSseReader.read(reader, rawSseArchive)' in main
-assert 'OpenAiReceivedSseReader.read(reader, source as? OpenAiRawSseArchive)' in resumable
-received_reader = (ROOT / 'app/src/main/java/com/example/openaichat/OpenAiReceivedSseReader.kt').read_text()
-assert 'OpenAiSseStreamReader.read(reader, limits, onEvent)' in received_reader
-assert 'archive?.receiveRemaining()' in received_reader
-assert 'OpenAiStreamEnd.DISCONNECTED' in reader
-assert 'OpenAiEffectiveResponse.assemble(completedResponse, responseState)' in main
-assert 'terminalOutputText(effectiveResponse)' in main
-assert 'pollingClient.newCall(req)' in main
-assert 'ApiHttpException' in main or (ROOT / 'app/src/main/java/com/example/openaichat/ApiHttpException.kt').exists()
-assert 'sse_event_sequence_gap' in main
-assert 'background_resume_rate_limited' in main
 assert 'listLocalFilePaths' in db
 assert 'deleteOwnedLocalFile' in main
 assert (ROOT / 'app/src/test/java/com/example/openaichat/SseEventParserTest.kt').exists()
 assert 'testImplementation("junit:junit:4.13.2")' in gradle
-assert 'androidx.work:work-runtime-ktx:2.11.2' in gradle
-assert 'BackgroundResponseWorkScheduler' in main
-assert 'BackgroundResponseWorkScheduler.cancelAll(applicationContext)' in main
-assert 'BackgroundResponseWorkScheduler.rescheduleAll(applicationContext, active)' in main
-assert 'BackgroundResponseWorker' in workflow or (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundResponseWorker.kt').exists()
-assert 'BackgroundRecoveryPolicy' in (ROOT / 'app/src/main/java/com/example/openaichat/BackgroundRecoveryPolicy.kt').read_text()
 assert 'FOREGROUND_SERVICE_DATA_SYNC' in (ROOT / 'app/src/main/AndroidManifest.xml').read_text()
-assert 'androidx.work.impl.foreground.SystemForegroundService' in (ROOT / 'app/src/main/AndroidManifest.xml').read_text()
 assert 'foregroundServiceType="dataSync"' in (ROOT / 'app/src/main/AndroidManifest.xml').read_text()
-assert (ROOT / 'app/src/test/java/com/example/openaichat/BackgroundRecoveryPolicyTest.kt').exists()
-assert 'val success=state=="completed"' in main
+assert (ROOT / 'app/src/test/java/com/example/openaichat/OpenRouterPaidPostSafetyTest.kt').exists()
+assert (ROOT / 'app/src/test/java/com/example/openaichat/OpenRouterRuntimeCheckpointTest.kt').exists()
 assert 'idx_effort_metrics_chat_request' in db
 assert 'CREATE UNIQUE INDEX' in db
 assert 'DELETE FROM $METRICS_TABLE' in db
 assert 'GROUP BY chat_id, request_id' in db
 assert 'activityVisible' in main
-assert 'activeResumeChats.clear()' in main
 assert 'setForeignKeyConstraintsEnabled(true)' in db
 assert not list(ROOT.glob('*-source.zip')), 'source archive must not remain in the repository'
 assert 'tools/verify_v4_17_0.py' in workflow

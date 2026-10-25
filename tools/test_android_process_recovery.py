@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Kill the live seeded app process, then verify production WorkManager recovery.
+"""Kill a real OpenRouter tool/SSE process, then verify local restart recovery.
 
-Installs the current Debug + AndroidTest APKs on a disposable emulator. Uses
-ordinary AndroidJUnitRunner arguments; never clears app data or touches a phone.
-The seed test does not return normally: its marker proves a durable checkpoint
-and pending WorkManager work before an external force-stop kills that process.
+Runs only on a disposable emulator. Synthetic credentials and trusted localhost
+HTTPS seed a completed tool round and an open paid-response prefix. The new
+process must preserve the checkpoint, Stop/replacement ownership and original
+result file without creating a new inference round. The intent-gap scenario
+forces native SQLite registration failure after publication, then verifies local
+SQL/protocol reconciliation and a separate explicit synthetic next-turn replay.
+The deleted-intent scenario verifies a late publication cannot revive its chat.
+A persisted synthetic key
+remains available during both restarts; a pre-create localhost transport
+tripwire verifies that recovery sends no additional HTTP.
 """
 from __future__ import annotations
 
@@ -19,14 +25,16 @@ import sys
 import threading
 import time
 
-PACKAGE = "com.example.openaichat"
+PACKAGE = "com.example.openaichat.openrouter"
 RUNNER = PACKAGE + ".test/androidx.test.runner.AndroidJUnitRunner"
-FIXTURE = PACKAGE + ".ProcessDeathRecoveryFixture"
-SCENARIOS = ("terminal", "expired_partial", "stopped_pre_id", "replaced", "background_created")
+FIXTURE = "com.example.openaichat.ProcessDeathRecoveryFixture"
+SCENARIOS = ("partial", "stopped", "replaced", "intent_gap", "deleted_intent")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--instrumentation-first", action="store_true",
+                        help="Run connected Android tests first; still collect host recovery evidence if they fail")
     parser.add_argument("--serial", default=os.environ.get("ANDROID_SERIAL"))
     parser.add_argument("--app-apk", type=Path, default=Path("app/build/outputs/apk/debug/app-debug.apk"))
     parser.add_argument("--test-apk", type=Path,
@@ -49,6 +57,13 @@ def main() -> None:
 
     if command("shell", "getprop", "ro.kernel.qemu") != "1":
         raise SystemExit("Refusing process-kill tests on a physical device")
+    instrumentation_status = 0
+    if args.instrumentation_first:
+        print("Running connected Android instrumentation before host process recovery", flush=True)
+        instrumentation_status = subprocess.run(
+            ["gradle", "--no-daemon", "--stacktrace", "connectedDebugAndroidTest"], check=False,
+            env={**os.environ, "ANDROID_SERIAL": args.serial}).returncode
+        print(f"Android instrumentation exit status: {instrumentation_status}; collecting host recovery evidence", flush=True)
     # connectedDebugAndroidTest uninstalls its APKs on completion. Install the
     # exact current build for this separate host-driven run, retaining app data.
     for apk in (args.app_apk, args.test_apk):
@@ -120,7 +135,7 @@ def main() -> None:
             (args.reports / f"{scenario}-seed.log").write_text("".join(lines), encoding="utf-8")
 
         verification = command("shell", "am", "instrument", "-w", "-r", "-e", "class",
-                               FIXTURE + "#verifyProductionScheduledRecoveryInNewProcess",
+                               FIXTURE + "#verifyLocalRecoveryInNewProcess",
                                "-e", "recoveryStage", "verify", "-e", "recoveryScenario", scenario,
                                RUNNER, timeout=150)
         (args.reports / f"{scenario}-verify.log").write_text(verification + "\n", encoding="utf-8")
@@ -128,9 +143,13 @@ def main() -> None:
                 "INSTRUMENTATION_FAILED" in verification):
             raise RuntimeError(f"Recovery verification failed: {scenario}\n{verification}")
         summary.append({"scenario": scenario, "seed_pid": seed_pid,
-                        "live_process_killed": True, "production_workmanager": "passed"})
+                        "live_process_killed": True, "production_openrouter_recovery": "passed",
+                        "automatic_restart_http_posts": 0,
+                        "explicit_synthetic_next_turn_posts": 1 if scenario == "intent_gap" else 0,
+                        "published_target_bytes_and_mtime_preserved": True,
+                        "fixture_transport": "trusted_local_https" if scenario != "deleted_intent" else "local_sql_and_files"})
         (args.reports / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        print(f"Process recovery: {scenario} PASS (live PID {seed_pid} killed; new-process WorkManager)", flush=True)
+        print(f"Process recovery: {scenario} PASS (live PID {seed_pid} killed; new-process local OpenRouter recovery)", flush=True)
 
     for scenario in SCENARIOS:
         try:
@@ -140,6 +159,18 @@ def main() -> None:
             # preferences and the synthetic credential even if verification
             # timed out, failed, or never started. No app data is cleared.
             failed = sys.exc_info()[0] is not None
+            if failed:
+                try:
+                    # Collect only redacted app diagnostics and VM errors before
+                    # fixture cleanup removes its SQLite state. Never mask the
+                    # original test failure with an optional evidence failure.
+                    diagnostic = subprocess.run(adb + ["logcat", "-d", "-v", "brief",
+                        "AstraDiagnostics:D", "AndroidRuntime:E", "*:S"], capture_output=True,
+                        text=True, timeout=15)
+                    (args.reports / f"{scenario}-diagnostics.log").write_text(
+                        diagnostic.stdout + diagnostic.stderr, encoding="utf-8")
+                except Exception as diagnostic_error:
+                    print(f"Process recovery diagnostic collection failed: {type(diagnostic_error).__name__}", file=sys.stderr)
             try:
                 command("shell", "am", "force-stop", PACKAGE)
                 cleanup = command("shell", "am", "instrument", "-w", "-r", "-e", "class",
@@ -153,6 +184,11 @@ def main() -> None:
                 if not failed:
                     raise
                 print(f"Process recovery cleanup also failed: {scenario}: {cleanup_error}", file=sys.stderr)
+
+    # A green recovery pass must never mask a failed connected suite. Recovery
+    # exceptions above also fail the job; both kinds of evidence are uploaded.
+    if instrumentation_status:
+        raise SystemExit(instrumentation_status)
 
 
 if __name__ == "__main__":

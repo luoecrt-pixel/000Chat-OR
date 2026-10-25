@@ -43,11 +43,6 @@ class MainActivitySettingsTest {
         RuntimeEnvironment.setFontScale(1f)
         RuntimeEnvironment.setQualifiers("w1080dp-h1800dp-mdpi")
         val context = RuntimeEnvironment.getApplication()
-        try {
-            androidx.work.WorkManager.getInstance(context)
-        } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         prefs = context.getSharedPreferences("app", Context.MODE_PRIVATE)
         prefs.edit().clear().putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
@@ -62,7 +57,7 @@ class MainActivitySettingsTest {
         prefs.edit().clear().commit()
     }
 
-    private fun launch(provider: String = "openai"): MainActivity {
+    private fun launch(provider: String = "openrouter"): MainActivity {
         prefs.edit().putString("provider", provider)
             .putString("model", if (provider == "openai") "gpt-6-astra" else "anthropic/claude-haiku-5.5").commit()
         return Robolectric.buildActivity(MainActivity::class.java).create().also { controller = it }.get()
@@ -145,7 +140,8 @@ class MainActivitySettingsTest {
         val activity = launch()
         val dialog = openAppSettings(activity)
         val hints = widgets(dialog).filterIsInstance<EditText>().map { it.hint?.toString() }
-        assertTrue(hints.containsAll(listOf("OpenAI API key", "OpenRouter API key", "GitHub fine-grained PAT")))
+        assertTrue(hints.containsAll(listOf("OpenRouter API key", "GitHub fine-grained PAT")))
+        assertFalse(hints.contains("OpenAI API key"))
         assertTrue(labels(dialog).containsAll(listOf("Настройки приложения", "Тема оформления Integral LLM", "🧪 Диагностика")))
         assertTrue(checkbox(dialog, "Продолжать генерацию ответа в фоне").isChecked)
         assertEquals(1, widgets(dialog).filterIsInstance<Spinner>().size)
@@ -155,33 +151,27 @@ class MainActivitySettingsTest {
         assertFalse(prefs.contains("openai_auto_compaction_user_explicit"))
     }
 
-    @Test fun openAiResponseSettingsSaveOptInAndInstructionsWithoutChangingAppPreferences() {
+    @Test fun claudeResponseSettingsSaveToolsAndInstructionsWithoutChangingAppPreferences() {
         val activity = launch()
         activity.showResponseSettings()
         val dialog = ShadowAlertDialog.getLatestAlertDialog()!!
         val texts = labels(dialog)
-        assertTrue(texts.containsAll(listOf("Настройки модели и ответа", "Инструменты и контекст OpenAI", "Усилие мышления")))
+        assertTrue(texts.containsAll(listOf("Настройки модели и ответа", "Инструменты, маршрут и кэш OpenRouter", "Усилие мышления")))
         assertFalse(texts.any { it.contains("API key") || it.contains("Тема оформления") || it.contains("GitHub fine-grained PAT") })
         assertFalse(texts.contains("Продолжать генерацию ответа в фоне"))
-        assertFalse(texts.contains("OpenRouter: Web Search"))
-        val compaction = checkbox(dialog, "Автосжатие контекста")
-        assertFalse(compaction.isChecked)
-        assertFalse(prefs.getBoolean("openai_auto_compaction", true))
-        compaction.isChecked = true
-        checkbox(dialog, "Web Search").isChecked = true
+        assertFalse(texts.any { it.contains("Автосжатие") || it.contains("Инструменты и контекст OpenAI") })
+        checkbox(dialog, "OpenRouter: Web Search").isChecked = true
         widgets(dialog).filterIsInstance<EditText>().single { it.hint == "Системный промпт" }.setText("Keep all evidence")
         save(dialog)
-        assertTrue(prefs.getBoolean("openai_auto_compaction", false))
-        assertTrue(prefs.getBoolean("openai_auto_compaction_user_explicit", false))
-        assertTrue(prefs.getBoolean("web", false))
+        assertTrue(prefs.getBoolean("openrouter_web_search", false))
         assertEquals("Keep all evidence", prefs.getString("system_prompt", null))
         assertFalse(prefs.contains("app_theme"))
         activity.showResponseSettings()
         val reopened = ShadowAlertDialog.getLatestAlertDialog()!!
-        assertTrue(checkbox(reopened, "Автосжатие контекста").isChecked)
-        checkbox(reopened, "Автосжатие контекста").isChecked = false
+        assertTrue(checkbox(reopened, "OpenRouter: Web Search").isChecked)
+        checkbox(reopened, "OpenRouter: Web Search").isChecked = false
         save(reopened)
-        assertFalse(prefs.getBoolean("openai_auto_compaction", true))
+        assertFalse(prefs.getBoolean("openrouter_web_search", true))
     }
 
     @Test fun openRouterResponseSettingsDoNotOverwriteHiddenOpenAiSettings() {
@@ -201,15 +191,16 @@ class MainActivitySettingsTest {
         assertEquals("anthropic", prefs.getString("openrouter_claude_route", null))
     }
 
-    @Test fun migrationDisablesImplicitLegacyCompactionAndPreservesBackgroundChoice() {
-        prefs.edit().putBoolean("openai_auto_compaction", true).putBoolean("background_responses", false).commit()
-        val activity = launch()
-        assertFalse(prefs.getBoolean("openai_auto_compaction", true))
+    @Test fun migrationReplacesRetiredProviderButPreservesModelForExplicitChoiceAndBackgroundSetting() {
+        prefs.edit().putBoolean("background_responses", false).commit()
+        val activity = launch("openai")
+        assertEquals("openrouter", prefs.getString("provider", null))
+        assertEquals("gpt-6-astra", prefs.getString("model", null))
+        assertFalse(ModelCatalog.isClaudeModel(prefs.getString("model", null)))
         assertFalse(prefs.getBoolean("background_responses", true))
-        assertTrue(prefs.getBoolean("openai_auto_compaction_opt_in_migrated_v25", false))
-        prefs.edit().putBoolean("openai_auto_compaction", true).putBoolean("background_responses", false).commit()
+        prefs.edit().putString("model", "anthropic/claude-custom").commit()
         MainActivity::class.java.getDeclaredMethod("migrateLegacySettingsPreferences").apply { isAccessible = true }.invoke(activity)
-        assertTrue(prefs.getBoolean("openai_auto_compaction", false))
+        assertEquals("anthropic/claude-custom", prefs.getString("model", null))
         assertFalse(prefs.getBoolean("background_responses", true))
     }
 
@@ -256,10 +247,14 @@ class MainActivitySettingsTest {
         assertTrue(checkbox(openAppSettings(activity), "Продолжать генерацию ответа в фоне").isChecked)
     }
 
-    @Test fun migrationPreservesAnExplicitCompactionOptIn() {
-        prefs.edit().putBoolean("openai_auto_compaction", true).putBoolean("openai_auto_compaction_user_explicit", true).commit()
-        launch()
-        assertTrue(prefs.getBoolean("openai_auto_compaction", false))
+    @Test fun migrationPreservesSavedClaudeRouteAndCache() {
+        val activity = launch()
+        prefs.edit().putString("model", "~anthropic/claude-custom")
+            .putString("openrouter_claude_route", "auto").putString("openrouter_cache_mode", "5m").commit()
+        MainActivity::class.java.getDeclaredMethod("migrateLegacySettingsPreferences").apply { isAccessible = true }.invoke(activity)
+        assertEquals("~anthropic/claude-custom", prefs.getString("model", null))
+        assertEquals("auto", prefs.getString("openrouter_claude_route", null))
+        assertEquals("5m", prefs.getString("openrouter_cache_mode", null))
     }
 
     @Test fun selectingEachThemeAppliesRootHeaderAndInputColorsWithoutRestart() {

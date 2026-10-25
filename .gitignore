@@ -28,3 +28,7 @@ google-services.json
 publication-audit-*.json
 .DS_Store
 Thumbs.db
+
+# Python verification caches
+__pycache__/
+*.py[cod]

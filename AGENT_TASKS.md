@@ -2,6 +2,8 @@
 
 Единственный рабочий план. Правила — [NEXT_AGENT_HANDOFF.md](NEXT_AGENT_HANDOFF.md), причины прежних решений — [PROJECT_HISTORY.md](PROJECT_HISTORY.md). Номера сохранены для связи с поручениями; выполненные части исключены из активных задач.
 
+Область форка `000Chat-OR` — только OpenRouter/Claude. Сохранённые ниже пункты о прямом OpenAI API относятся к исходному проекту `000Chat` и не являются поручением реализовывать их в этом форке. Совместимость чтения и хранения прежних данных OpenAI остаётся обязательной.
+
 ## Текущие задачи
 
 ### 33. [P1/P2] Замечания владельца и проверка присланных решений
@@ -54,7 +56,6 @@
 
 ### 22. [D · P2, остаток] Bounded recovery resources
 
-- Убрать отсечение reconciliation первыми четырьмя generation IDs, учитывать длинные tool loops через очередь/явные resource budgets; саму генерацию числом rounds не ограничивать.
 - Ограничить cached thread pool `OpenRouterResponseRuntime`, с явной очередью/отменой, без потери terminal/usage и отмены другого чата.
 
 Сохранить различие OpenAI resumable background Response и OpenRouter inference: после потери SSE — partial/checkpoint/known-or-unknown cost, без скрытого второго платного запроса. Статусы «генерация / связь потеряна / получение результата / неполный / готово» соответствуют реальности. Existing Stop/Delete/Edit/notification fixes не переделывать без причины.

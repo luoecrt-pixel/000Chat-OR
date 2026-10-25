@@ -15,6 +15,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -220,6 +222,71 @@ class OpenRouterGenerationAccountingTest {
                 assertEquals("unknown", db.listRequestAccounting("chat").single().getString("cost_kind"))
             }
             assertEquals(1, server.requestCount)
+        }
+    }
+
+    @Test fun moreThanFourToolRoundsReconcileEveryGenerationAndRemainIdempotentAfterReopen() {
+        val generationIds = (0 until 9).map { "gen-long-$it" }
+        ChatDatabase(context).use { db ->
+            started(db)
+            generationIds.forEachIndexed { index, id -> db.observeOpenRouterRound("chat", "local_1", index, id) }
+            db.sealOpenRouterRounds("chat", "local_1")
+        }
+        MockWebServer().use { server ->
+            generationIds.forEach { id -> server.enqueue(MockResponse().setBody(
+                JSONObject().put("data", JSONObject().put("id", id).put("total_cost", 0.01)).toString())) }
+            ChatDatabase(context).use { db ->
+                val count = OpenRouterGenerationReconciler(OkHttpClient(), server.url("/api/v1/"))
+                    .reconcile(db.listOpenRouterRounds("chat", "local_1"), "synthetic-key") { id, metadata ->
+                        assertTrue(db.reconcileOpenRouterGeneration("chat", "local_1", id, metadata))
+                    }
+                assertEquals(9, count)
+            }
+            ChatDatabase(context).use { db ->
+                val rounds = db.listOpenRouterRounds("chat", "local_1")
+                assertEquals(generationIds, rounds.map { it.getString("generation_id") })
+                assertTrue(rounds.all { it.getString("cost_kind") == "provider_reported" })
+                assertEquals(0.09, db.listRequestAccounting("chat").single().getString("cost_usd").toDouble(), 1e-12)
+                assertEquals(0, OpenRouterGenerationReconciler(OkHttpClient(), server.url("/api/v1/"))
+                    .reconcile(rounds, "synthetic-key") { _, _ -> fail("Known cost must not be queried again") })
+            }
+            repeat(9) { assertEquals("/api/v1/generation?id=${generationIds[it]}", server.takeRequest().path) }
+            assertEquals(9, server.requestCount)
+        }
+    }
+
+    @Test fun explicitReconciliationTimeBudgetLeavesDurableQueueForNextPassAfterReopen() {
+        val ids = (0 until 7).map { "gen-queue-$it" }
+        ChatDatabase(context).use { db ->
+            started(db)
+            ids.forEachIndexed { index, id -> db.observeOpenRouterRound("chat", "local_1", index, id) }
+            db.sealOpenRouterRounds("chat", "local_1")
+        }
+        MockWebServer().use { server ->
+            ids.forEach { id -> server.enqueue(MockResponse().setBody(
+                JSONObject().put("data", JSONObject().put("id", id).put("total_cost", 0.0)).toString())) }
+            val clock = AtomicLong(1L)
+            ChatDatabase(context).use { db ->
+                assertEquals(2, OpenRouterGenerationReconciler(OkHttpClient(), server.url("/api/v1/"),
+                    maxDurationMillis = 1_000, monotonicNanos = clock::get)
+                    .reconcile(db.listOpenRouterRounds("chat", "local_1"), "synthetic-key") { id, metadata ->
+                        assertTrue(db.reconcileOpenRouterGeneration("chat", "local_1", id, metadata))
+                        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(500))
+                    })
+                assertEquals("unknown", db.listRequestAccounting("chat").single().getString("cost_kind"))
+                assertFalse(db.listRequestAccounting("chat").single().has("cost_usd"))
+            }
+            ChatDatabase(context).use { db ->
+                assertEquals(5, OpenRouterGenerationReconciler(OkHttpClient(), server.url("/api/v1/"))
+                    .reconcile(db.listOpenRouterRounds("chat", "local_1"), "synthetic-key") { id, metadata ->
+                        assertTrue(db.reconcileOpenRouterGeneration("chat", "local_1", id, metadata))
+                    })
+                val accounting = db.listRequestAccounting("chat").single()
+                assertEquals("provider_reported", accounting.getString("cost_kind"))
+                assertEquals(0.0, accounting.getString("cost_usd").toDouble(), 0.0)
+            }
+            repeat(7) { assertEquals("GET", server.takeRequest().method) }
+            assertEquals(7, server.requestCount)
         }
     }
 }

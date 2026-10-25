@@ -7,8 +7,6 @@ import java.io.File
 import java.io.IOException
 import java.io.FileNotFoundException
 import java.util.UUID
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.nio.file.FileSystemException
 
 class LocalArtifactToolExecutor(private val context: Context) {
@@ -26,44 +24,45 @@ class LocalArtifactToolExecutor(private val context: Context) {
         }
     }
 
-    fun createTextFile(arguments: JSONObject): JSONObject {
+    fun createTextFile(arguments: JSONObject): JSONObject =
+        prepareTextFile(arguments, UUID.randomUUID().toString()).use { it.publish() }
+
+    private inline fun preparing(block: (java.io.Closeable) -> LocalArtifactPublicationPlan): LocalArtifactPublicationPlan {
+        val ownership = LocalArtifactOwnership.lease()
+        return try { block(ownership) } catch (error: Throwable) { ownership.close(); throw error }
+    }
+
+    fun prepareTextFile(arguments: JSONObject, artifactKey: String): LocalArtifactPublicationPlan = preparing { ownership ->
         val rawName = JsonProtocol.nonBlank(arguments, "filename")?.trim() ?: throw IOException("filename is required")
         val content = JsonProtocol.text(arguments, "content") ?: throw IOException("content must be a string")
-        if (rawName.isBlank()) throw IOException("filename is required")
         if (TextFileFormatPolicy.extension(rawName) in TextFileFormatPolicy.office + setOf("pdf", "doc", "xls", "ppt", "png", "jpg", "jpeg", "gif", "webp", "zip", "mp3", "mp4"))
             throw IOException("create_local_text_file создаёт UTF-8 текст, а не настоящий бинарный ${TextFileFormatPolicy.extension(rawName)}. Используйте текстовый формат, например TXT, Markdown, CSV или исходный код.")
-        val safeName = rawName.substringAfterLast('/').substringAfterLast('\\')
-            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .take(160)
-            .ifBlank { "generated.txt" }
-        val dir = File(context.filesDir, "generated").apply { mkdirs() }
-        val file = File(dir, UUID.randomUUID().toString() + "_" + safeName)
+        val target = File(File(context.filesDir, "generated"), "create_${artifactToken(artifactKey)}_${safeFilename(rawName)}")
+        val staged = File.createTempFile("artifact_text_", ".tmp", context.cacheDir)
         try {
-            // A whole String -> UTF-8 ByteArray duplicates a potentially very large answer.
-            file.bufferedWriter(Charsets.UTF_8, 64 * 1024).use { writer ->
+            staged.bufferedWriter(Charsets.UTF_8, 64 * 1024).use { writer ->
                 var offset = 0
                 while (offset < content.length) {
+                    LocalUtf8FilePatch.checkActive { true }
                     val count = minOf(64 * 1024, content.length - offset)
                     writer.write(content, offset, count)
                     offset += count
                 }
             }
-        } catch (error: Throwable) {
-            file.delete()
-            throw error
-        }
-        return try { withAttachment(JSONObject()
-            .put("ok", true)
-            .put("type", "local_file")
-            .put("filename", rawName)
-            .put("path", file.absolutePath)
-            .put("mime_type", mimeForFilename(rawName))
-            .put("size_bytes", file.length()), LocalUtf8FilePatch.sha256(file)) }
-        catch (error: Throwable) { file.delete(); throw error }
+            val sha = LocalUtf8FilePatch.sha256(staged)
+            val metadata = withAttachment(JSONObject().put("ok", true).put("type", "local_file")
+                .put("filename", rawName).put("path", target.absolutePath).put("mime_type", mimeForFilename(rawName))
+                .put("size_bytes", staged.length()), sha)
+            LocalArtifactPublicationPlan(context, publicationSnapshot(metadata), staged, ownership)
+        } catch (error: Throwable) { staged.delete(); throw error }
     }
 
     fun patchLocalFile(arguments: JSONObject, files: List<OpenRouterLocalAttachment>,
-        active: () -> Boolean = { true }, artifactKey: String? = null): JSONObject = try { synchronized(patchLock) {
+        active: () -> Boolean = { true }, artifactKey: String? = null): JSONObject =
+        preparePatchLocalFile(arguments, files, artifactKey ?: UUID.randomUUID().toString(), active).use { it.publish(active) }
+
+    fun preparePatchLocalFile(arguments: JSONObject, files: List<OpenRouterLocalAttachment>,
+        artifactKey: String, active: () -> Boolean = { true }): LocalArtifactPublicationPlan = preparing { ownership -> try { synchronized(patchLock) {
         LocalUtf8FilePatch.checkActive(active)
         if (StreamingJsonRequestBody.countBytes(arguments) > 256 * 1024) throw IOException("Аргументы патча превышают 256 КБ")
         val selector = JsonProtocol.nonBlank(arguments, "file_id") ?: JsonProtocol.nonBlank(arguments, "filename")
@@ -90,46 +89,13 @@ class LocalArtifactToolExecutor(private val context: Context) {
             source.sha256.takeIf { it.isNotBlank() } ?: expected, active).use { plan ->
             val operation = StreamingJsonRequestBody.sha256(JSONObject().put("source", source.id)
                 .put("sha256", plan.sourceSha256).put("filename", source.name).put("patches", rawPatches))
-            val token = artifactKey?.let { LocalUtf8FilePatch.hex(java.security.MessageDigest.getInstance("SHA-256").digest(it.toByteArray(Charsets.UTF_8))) }
-                ?: UUID.randomUUID().toString()
+            val token = artifactToken(artifactKey)
             val dir = File(context.filesDir, "generated")
-            if (!dir.isDirectory && !dir.mkdirs()) throw IOException("Каталог версий файла недоступен")
-            val diffDir = File(dir, "patch-diffs")
-            if (!diffDir.isDirectory && !diffDir.mkdirs()) throw IOException("Каталог изменений файла недоступен")
-            val safeName = source.name.substringAfterLast('/').substringAfterLast('\\').replace(Regex("[^A-Za-z0-9._-]"), "_").take(160).ifBlank { "patched.txt" }
-            val target = File(dir, "patch_${token}_$safeName")
-            val diff = File(diffDir, "$token.json")
-            // A process may die between publishing the complete version and
-            // its sidecar. Reconstruct only that metadata after proving that
-            // the existing bytes are exactly this operation's expected result.
-            val recoverSidecar = target.isFile && !diff.exists()
-            if ((target.exists() || diff.exists()) && !recoverSidecar) {
-                if (!target.isFile || !diff.isFile || diff.length() > 2L * 1024 * 1024)
-                    throw IOException("Предыдущее применение патча неполно; повторная запись запрещена")
-                val saved = JSONObject(diff.readText(Charsets.UTF_8))
-                if (saved.optString("operation_sha256") != operation || saved.optString("result_sha256") != LocalUtf8FilePatch.sha256(target, active))
-                    throw IOException("Идентификатор вызова уже использован другой версией патча")
-                val metadata = saved.getJSONObject("artifact")
-                if (JsonProtocol.string(metadata, "path") != target.absolutePath || metadata.optString("patch_diff_path") != diff.absolutePath)
-                    throw IOException("Метаданные версии патча повреждены")
-                val manifest = metadata.optJSONObject("attachment")
-                if (manifest == null || metadata.optString("sha256") != saved.optString("result_sha256") ||
-                    manifest.optString("sha256") != metadata.optString("sha256") ||
-                    JsonProtocol.string(manifest, "path") != target.absolutePath || manifest.optString("text_path") != target.absolutePath)
-                    throw IOException("Manifest версии патча повреждён")
-                return@synchronized JsonProtocol.objectCopy(metadata)
-            }
-            // Staging belongs to reclaimable cache if the process dies before
-            // finally. Only complete, published versions live in filesDir.
+            val target = File(dir, "patch_${token}_${safeFilename(source.name)}")
+            val diff = File(File(dir, "patch-diffs"), "$token.json")
             val staged = File.createTempFile("patch_result_", ".tmp", context.cacheDir)
-            var stagedDiff: File? = null
-            var published = false
             try {
-                // Keep the first allocation guarded if the second one fails.
-                val pendingDiff = File.createTempFile("patch_diff_", ".tmp", context.cacheDir).also { stagedDiff = it }
                 val resultSha = plan.write(staged)
-                if (recoverSidecar && (target.length() != staged.length() || LocalUtf8FilePatch.sha256(target, active) != resultSha))
-                    throw IOException("Существующая версия файла не соответствует результату патча; перезапись запрещена")
                 val metadata = withAttachment(JSONObject().put("ok", true).put("type", "local_file")
                     .put("filename", source.name).put("path", target.absolutePath).put("mime_type", source.mime)
                     .put("size_bytes", staged.length()).put("patch_count", plan.hunks.size)
@@ -139,27 +105,28 @@ class LocalArtifactToolExecutor(private val context: Context) {
                     .put("search", h.replacement.search).put("replace", h.replacement.replace)) } }
                 val sidecar = JSONObject().put("version", 1).put("source_file_id", source.id).put("source_sha256", plan.sourceSha256)
                     .put("result_sha256", resultSha).put("operation_sha256", operation).put("hunks", hunks).put("artifact", metadata)
-                pendingDiff.bufferedWriter(Charsets.UTF_8).use { StreamingJsonRequestBody.writeJson(sidecar, it) }
-                LocalUtf8FilePatch.checkActive(active)
-                if (!recoverSidecar) {
-                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
-                    published = true
-                }
-                Files.move(pendingDiff.toPath(), diff.toPath(), StandardCopyOption.ATOMIC_MOVE)
-                metadata
-            } catch (error: Throwable) {
-                if (published) target.delete()
-                diff.delete()
-                throw error
-            } finally { staged.delete(); stagedDiff?.delete() }
+                LocalArtifactPublicationPlan(context, publicationSnapshot(metadata, sidecar.toString()), staged, ownership)
+            } catch (error: Throwable) { staged.delete(); throw error }
         }
     } } catch (error: FileNotFoundException) {
-        // The model receives the message, not an app-private filesystem path.
-        // Retain the cause for local diagnostics without changing interruption.
         throw IOException("Исходный файл или каталог версии недоступен. Исходник не изменён.", error)
     } catch (error: FileSystemException) {
         throw IOException("Не удалось прочитать или сохранить версию файла. Исходник не изменён.", error)
+    } }
+
+    fun recoverPublished(snapshot: JSONObject): JSONObject? = LocalArtifactPublicationPlan.recoverPublished(context, snapshot)
+
+    private fun publicationSnapshot(metadata: JSONObject, diffDocument: String? = null): JSONObject {
+        val publication = JSONObject().put("target_path", metadata.getString("path"))
+            .put("expected_sha256", metadata.getString("sha256")).put("expected_bytes", metadata.getLong("size_bytes"))
+        if (diffDocument != null) publication.put("diff_path", metadata.getString("patch_diff_path"))
+            .put("diff_document", diffDocument).put("diff_sha256", LocalArtifactPublicationPlan.documentSha256(diffDocument))
+        return JSONObject().put("version", 1).put("artifact", metadata).put("publication", publication)
     }
+
+    private fun artifactToken(key: String): String = LocalUtf8FilePatch.hex(java.security.MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8)))
+    private fun safeFilename(name: String): String = name.substringAfterLast('/').substringAfterLast('\\')
+        .replace(Regex("[^A-Za-z0-9._-]"), "_").take(160).ifBlank { "generated.txt" }
 
     private fun withAttachment(metadata: JSONObject, sha: String): JSONObject {
         val path = metadata.getString("path")

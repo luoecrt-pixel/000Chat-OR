@@ -25,14 +25,11 @@ class MainActivityNoToolRecoveryTest {
         app.getSharedPreferences("app", Context.MODE_PRIVATE).edit().clear()
             .putBoolean("response_notifications", false).commit()
         app.deleteDatabase("astra_chats.db")
-        try { androidx.work.WorkManager.getInstance(app) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(app, androidx.work.Configuration.Builder().build())
-        }
     }
 
     @After fun after() { controller?.destroy() }
 
-    @Test fun resumedActivityFinalizerRetainsFlatPaidTextWhenTerminalOmitsTypedOutput() {
+    @Test fun activityLocallyRecoversLegacyFlatPaidTextWhenTerminalOmitsTypedOutput() {
         val activity = Robolectric.buildActivity(MainActivity::class.java).create().also { controller = it }.get()
         val db = MainActivity::class.java.getDeclaredField("chatDb").apply { isAccessible = true }.get(activity) as ChatDatabase
         val chatId = "no-tool-recovery"
@@ -45,15 +42,15 @@ class MainActivityNoToolRecoveryTest {
             terminalState = ResponseTerminalState.COMPLETED, terminalResponse = terminal)
         db.upsertCurrentChat(chatId, "No tools", null, null, listOf(JSONObject().put("role", "user")
             .put("text", "Question").put("provider", "openai").put("request_id", requestId)))
+        assertTrue(db.startRequestAccounting(chatId, requestId, "openai", "gpt-legacy", "legacy_key"))
         db.setActiveResponse(chatId, responseId, requestId, "", "in_progress", System.currentTimeMillis(),
             "high", "high", false, 8, 0, true)
         db.updateActiveResponse(chatId, responseId, text, "completed", 1, requestId,
             ResponseIndexedCheckpoint.serialize(state))
         assertEquals(text, ResponseIndexedCheckpoint.restore(db.getActiveResponse(chatId)!!).text)
         assertNull(db.getOpenAiToolCheckpoint(chatId, requestId))
-        MainActivity::class.java.getDeclaredMethod("finalizeBackgroundResponse", JSONObject::class.java,
-            JSONObject::class.java, BackgroundResponseUiSnapshot::class.java).apply { isAccessible = true }
-            .invoke(activity, db.getActiveResponse(chatId)!!, terminal, null)
+        MainActivity::class.java.getDeclaredMethod("recoverInterruptedOpenRouterRequests")
+            .apply { isAccessible = true }.invoke(activity)
         assertNull(db.getActiveResponse(chatId))
         ChatDatabase(activity).use { reopened ->
             val assistant = reopened.getChat(chatId)!!.getJSONArray("messages").getJSONObject(1)
@@ -61,4 +58,31 @@ class MainActivityNoToolRecoveryTest {
             assertEquals("completed", assistant.getString("status"))
         }
     }
+    @Test fun activityRecoversOpenRouterPartialExactlyOnceWithoutStartingAnotherRequest() {
+        val activity = Robolectric.buildActivity(MainActivity::class.java).create().also { controller = it }.get()
+        val chatId = "router-partial"
+        val requestId = "router-partial-request"
+        val text = "Полученная часть ответа 😀"
+        ChatDatabase(activity).use { db ->
+            db.upsertCurrentChat(chatId, "Partial", null, null, listOf(JSONObject().put("role", "user")
+                .put("text", "Question").put("provider", "openrouter").put("request_id", requestId)))
+            db.setActiveResponse(chatId, null, requestId, "", "in_progress", System.currentTimeMillis(),
+                "high", "high", false, 8, 0, false)
+            assertTrue(db.startRequestAccounting(chatId, requestId, "openrouter", "anthropic/claude-test", "openrouter_api_key"))
+            assertTrue(db.checkpointOpenRouterResponse(chatId, requestId, text, 0L))
+        }
+        val recover = MainActivity::class.java.getDeclaredMethod("recoverInterruptedOpenRouterRequests")
+            .apply { isAccessible = true }
+        repeat(2) { recover.invoke(activity) }
+        ChatDatabase(activity).use { db ->
+            assertNull(db.getActiveResponse(chatId))
+            val messages = db.getChat(chatId)!!.getJSONArray("messages")
+            assertEquals(2, messages.length())
+            assertEquals(text, messages.getJSONObject(1).getString("text"))
+            assertEquals("disconnected", messages.getJSONObject(1).getString("status"))
+            assertEquals("openrouter", messages.getJSONObject(1).getString("provider"))
+        }
+        assertFalse(OpenRouterResponseRuntime.contains(requestId))
+    }
+
 }

@@ -1,478 +1,531 @@
 package com.example.openaichat
 
+import android.app.Activity
+import android.app.Application
+import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
-import android.util.Base64
-import android.widget.EditText
-import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import androidx.work.WorkInfo
-import androidx.work.WorkManager
-import okhttp3.MediaType
 import okhttp3.OkHttpClient
-import okhttp3.ResponseBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
-import okio.Buffer
-import okio.BufferedSource
-import okio.ForwardingSource
-import okio.buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.ByteArrayInputStream
-import java.io.IOException
+import java.io.File
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * Driven only by tools/test_android_process_recovery.py on a disposable emulator.
- * The seed invocation stays alive until the host actually kills its process.
- * Verification uses the ordinary WorkManager singleton/schedulers, not a test
- * Worker factory, TestDriver, or direct doWork() invocation. No live provider
- * key: background_created uses a synthetic key and trusted local HTTPS only.
- */
+/** Host-driven real process death after local HTTPS tool round and a persisted SSE prefix. */
 @RunWith(AndroidJUnit4::class)
 class ProcessDeathRecoveryFixture {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context get() = instrumentation.targetContext
     private val arguments get() = InstrumentationRegistry.getArguments()
-    private val scenario get() = arguments.getString("recoveryScenario").orEmpty().also {
-        require(it in setOf("terminal", "expired_partial", "stopped_pre_id", "replaced", "background_created"))
-    }
-    private val chatId get() = if (scenario == "background_created")
-        prefs.getString("actual_chat_id", "process-recovery-fixture-$scenario")!!
-        else "process-recovery-fixture-$scenario"
-    private val requestId get() = if (scenario == "background_created")
-        prefs.getString("actual_request_id", "req_process_fixture")!! else "req_process_fixture"
-    private val responseId = "resp_process_fixture"
-    private val replacementId = "req_replacement_fixture"
-    private val sourceBytes = "data: received paid source before process death\n\n".toByteArray()
     private val prefs get() = context.getSharedPreferences("process_recovery_fixture", 0)
+    private val scenario get() = arguments.getString("recoveryScenario").orEmpty().also {
+        require(it in setOf("partial", "stopped", "replaced", "intent_gap", "deleted_intent"))
+    }
+    private val chatId get() = "openrouter-process-fixture-$scenario"
+    private val providerCallId = "fixture-create"
+    private val runToken get() = prefs.getString("run_token", "unseeded")!!
+    private val requestId get() = "request-process-fixture-$runToken"
+    private val replacementId get() = "request-replacement-fixture-$runToken"
+    private val model = "anthropic/claude-sonnet-5.5"
+    private val syntheticKey = "sk-or-v1-synthetic-process-fixture"
+    private val prefix = "Полученный до остановки процесса текст 😀"
+    private val unfinishedReasoning = "unfinished-process-reasoning-data"
+    private val original = "Original tool result\nUnicode 😀\n"
+    private val appPreferenceKeys = listOf("current_chat", "provider", "model", "response_notifications")
+    private fun generationId(stage: String) = "gen-fixture-$runToken-$stage"
 
-    private fun signedItem() = JSONObject().put("type", "reasoning")
-        .put("id", "reasoning_fixture").put("encrypted_content", "signed-fixture-exact-bytes")
+    private fun await(message: String, condition: () -> Boolean) {
+        val deadline = SystemClock.elapsedRealtime() + 20_000L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (condition()) return
+            SystemClock.sleep(20)
+        }
+        assertTrue(message, condition())
+    }
+
+    private fun seedDiagnostics(server: MockWebServer): String {
+        fun safeError(raw: String): String = AstraDiagnostics(context).redactDisplayText(raw)
+            .replace(Regex("/(?:data|storage|sdcard|mnt|workspace)/[^\\s,;)\"]+"), "[local-path]").take(512)
+        val state = JSONObject().put("http_count", server.requestCount)
+            .put("runtime_present", OpenRouterResponseRuntime.contains(requestId))
+        try {
+            ChatDatabase(context).use { db ->
+                db.getActiveResponse(chatId)?.let { active ->
+                    state.put("active_owner_matches", active.optString("request_id") == requestId)
+                        .put("active_status", active.optString("status"))
+                        .put("active_text_chars", active.optString("text").length)
+                } ?: state.put("active_owner", JSONObject.NULL)
+                val messages = db.getChat(chatId)?.optJSONArray("messages") ?: JSONArray()
+                val terminal = (0 until messages.length()).mapNotNull { messages.optJSONObject(it) }
+                    .lastOrNull { it.optString("role") == "assistant" && it.optString("request_id") == requestId }
+                terminal?.let {
+                    state.put("assistant_status", it.optString("status"))
+                        .put("assistant_text_chars", it.optString("text").length)
+                        .put("assistant_error", safeError(it.optString("error")))
+                }
+                state.put("rounds", JSONArray().apply {
+                    db.listOpenRouterRounds(chatId, requestId).forEach { round -> put(JSONObject()
+                        .put("index", round.optInt("round_index"))
+                        .put("generation_id", round.optString("generation_id"))
+                        .put("cost_kind", round.optString("cost_kind"))
+                        .put("has_usage", round.has("usage_snapshot"))) }
+                })
+                state.put("request_status", db.listRequestAccounting(chatId, setOf(requestId))
+                    .singleOrNull()?.optString("local_status") ?: JSONObject.NULL)
+                val intent = db.getLocalArtifactIntent(chatId, requestId, providerCallId)
+                state.put("intent_state", intent?.optString("state") ?: JSONObject.NULL)
+                state.put("intent_tombstoned", intent?.optBoolean("tombstoned") ?: JSONObject.NULL)
+            }
+        } catch (error: Exception) {
+            state.put("diagnostic_db_error", error.javaClass.simpleName + ": " + safeError(error.message.orEmpty()))
+        }
+        return state.toString()
+    }
+
+    private fun awaitPartialPrefix(server: MockWebServer) {
+        val deadline = SystemClock.elapsedRealtime() + 20_000L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (ChatDatabase(context).use { it.getActiveResponse(chatId)?.optString("text") == prefix }) return
+            if (!OpenRouterResponseRuntime.contains(requestId))
+                throw AssertionError("Runtime exited before persisting its second-round prefix: " + seedDiagnostics(server))
+            SystemClock.sleep(20)
+        }
+        throw AssertionError("A real second HTTP round must persist the partial prefix: " + seedDiagnostics(server))
+    }
+
+    private fun savePreferences() {
+        val app = context.getSharedPreferences("app", 0)
+        val saved = JSONObject()
+        for (key in appPreferenceKeys) saved.put(key, app.all[key] ?: JSONObject.NULL)
+        val secure = context.getSharedPreferences("secure", 0)
+        assertTrue(prefs.edit().putString("saved_app", saved.toString())
+            .putString("saved_router_key", secure.getString("openrouter_key", null)).commit())
+        // Back up only encrypted bytes; the fixture never reads or uses a prior provider credential.
+        // Keep a synthetic key available across death so a missing-key guard cannot mask auto-resend.
+        assertTrue(SecureStore(context).setOpenRouterApiKey(syntheticKey))
+        assertTrue(app.edit().putString("provider", "openrouter").putString("model", model)
+            .putString("current_chat", chatId).putBoolean("response_notifications", false).commit())
+    }
 
     @Test fun seedAndWaitForHostProcessKill() {
         assumeTrue(arguments.getString("recoveryStage") == "seed")
-        assertTrue("Never run with a real provider credential", SecureStore(context).getApiKey().isBlank())
-        if (scenario == "background_created") {
-            seedBackgroundCreatedAndWaitForKill()
-            return
-        }
-        BackgroundResponseWorkScheduler.cancel(context, chatId, requestId)
+        // Intent tombstones are deliberately permanent; each host run receives a fresh request identity.
+        assertTrue(prefs.edit().putString("run_token", UUID.randomUUID().toString()).commit())
+        savePreferences()
         ChatDatabase(context).use { db ->
             db.deleteChat(chatId)
-            db.ensureChat(chatId, "Process recovery fixture")
-            db.upsertCurrentChat(chatId, "Process recovery fixture", null, "high", listOf(
-                JSONObject().put("role", "user").put("text", "Synthetic prompt")
-                    .put("provider", "openai").put("request_id", requestId)
-                    .put(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD, OpenAiInstructionChainPolicy.fingerprint(
-                        GenerationInstructions(null, null, null), "sk-synthetic-process-fixture", "gpt-6-astra"))))
-            val started = if (scenario == "expired_partial")
-                System.currentTimeMillis() - ResponseDeadlinePolicy.MAX_REQUEST_MS - 1L
-                else System.currentTimeMillis()
-            db.setActiveResponse(chatId, if (scenario == "stopped_pre_id") null else responseId,
-                requestId, "", "starting", started, "high", "high", false, 16, 0, true)
-            if (scenario == "stopped_pre_id" || scenario == "replaced") {
-                assertTrue(db.stopActiveRequestOnce(chatId, requestId))
+            db.upsertCurrentChat(chatId, "Process recovery", null, null, listOf(JSONObject()
+                .put("role", "user").put("text", "Create a local result").put("provider", "openrouter")
+                .put("request_id", requestId)))
+            db.setActiveResponse(chatId, null, requestId, "", "in_progress", System.currentTimeMillis(),
+                "high", "high", false, 20, 0, false)
+            assertTrue(db.startRequestAccounting(chatId, requestId, "openrouter", model, "openrouter_api_key"))
+            if (scenario == "intent_gap") db.writableDatabase.execSQL("""
+                CREATE TRIGGER fixture_reject_intent_completion BEFORE UPDATE OF state ON local_artifact_intents
+                WHEN NEW.chat_id='$chatId' AND NEW.state='completed'
+                BEGIN SELECT RAISE(ABORT, 'fixture intent registration gap'); END
+            """.trimIndent())
+        }
+        if (scenario == "deleted_intent") {
+            seedDeletedIntentAndWaitForHostKill()
+            return
+        }
+        val certificate = HeldCertificate.Builder().commonName("localhost")
+            .addSubjectAlternativeName("localhost").addSubjectAlternativeName("127.0.0.1").build()
+        val serverTls = HandshakeCertificates.Builder().heldCertificate(certificate).build()
+        val clientTls = HandshakeCertificates.Builder().addTrustedCertificate(certificate.certificate).build()
+        val http = OkHttpClient.Builder().sslSocketFactory(clientTls.sslSocketFactory(), clientTls.trustManager)
+            .readTimeout(0, TimeUnit.SECONDS).build()
+        val server = MockWebServer().apply { useHttps(serverTls.sslSocketFactory(), false); start() }
+        val call = JSONObject().put("index", 0).put("id", providerCallId).put("type", "function")
+            .put("function", JSONObject().put("name", "create_local_text_file").put("arguments", JSONObject()
+                .put("filename", "process-result.txt").put("content", original).toString()))
+        val toolFrame = JSONObject().put("id", generationId("tool")).put("model", model)
+            .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject()
+                .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
+                    .put("data", "synthetic-signed-process-data").put("index", 0)))
+                .put("tool_calls", JSONArray().put(call))).put("finish_reason", "tool_calls")))
+        val toolResponse = MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody("data: $toolFrame\n\ndata: [DONE]\n\n")
+        val partialFrame = JSONObject().put("id", generationId("partial")).put("model", model)
+            .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", prefix)
+                .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
+                    .put("index", 0).put("data", unfinishedReasoning))))))
+        val firstData = "data: $partialFrame"
+        val padding = 510 - firstData.toByteArray(Charsets.UTF_8).size
+        require(padding >= 0)
+        val firstChunk = firstData + " ".repeat(padding) + "\n\n"
+        val continuationResponse = if (scenario == "intent_gap") MockResponse().setResponseCode(599)
+            .setBody("Unexpected continuation after failed artifact registration")
+        else MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody(firstChunk + "data: [DONE]\n\n").throttleBody(512, 30, TimeUnit.SECONDS)
+        val responseIndex = AtomicInteger()
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            // QueueDispatcher.peek() exposes response throttling while MockWebServer
+            // is still reading the request body. Keep the default unthrottled peek;
+            // delay only the SSE response, after the entire POST has been recorded.
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse =
+                when (responseIndex.getAndIncrement()) {
+                    0 -> toolResponse
+                    1 -> continuationResponse
+                    else -> MockResponse().setResponseCode(599).setBody("Unexpected seed HTTP request")
+                }
+        }
+        val client = OpenRouterChatClient(server.url("/api/v1").toString(), http, reconcileGenerations = false)
+        OpenRouterResponseRuntime.start(context, OpenRouterRuntimeRequest(
+            chatId = chatId, requestId = requestId, model = model,
+            messages = JSONArray().put(JSONObject().put("role", "user").put("content", "Create a local result")),
+            attachments = emptyList(), effort = "high", verbosity = "", maxTokens = null,
+            github = false, githubRepo = "", githubBranches = emptySet(), webSearch = false,
+            webFetch = false, parallel = false, cacheMode = "off", background = false,
+            startedAt = SystemClock.elapsedRealtime(), taskClass = "general", effortPref = "high",
+            autoSelected = false, promptChars = 20, apiKey = syntheticKey, metadataClient = http,
+            pdfEngine = "native"), client)
+        if (scenario == "intent_gap") {
+            await("Failed SQL registration must release the runtime without another POST") {
+                !OpenRouterResponseRuntime.contains(requestId)
+            }
+            assertEquals("Unknown tool outcome must block the continuation POST", 1, server.requestCount)
+            ChatDatabase(context).use { db ->
+                val intent = db.getLocalArtifactIntent(chatId, requestId, providerCallId)!!
+                assertEquals("outcome_unknown", intent.getString("state"))
+                assertFalse(intent.has("outcome"))
+                assertEquals(0, artifactIndexCount(db))
+                val answer = storedAssistant(db)
+                val protocol = answer.getJSONObject("openrouter_protocol")
+                assertEquals("outcome_unknown", protocol.getJSONObject("tool_states").getJSONObject(providerCallId).getString("state"))
+                val tail = protocol.getJSONArray("tail")
+                assertEquals(1, tail.length())
+                assertEquals("assistant", tail.getJSONObject(0).getString("role"))
+                val path = intent.getJSONObject("plan").getJSONObject("publication").getString("target_path")
+                saveArtifactEvidence(path, tail)
+                db.writableDatabase.execSQL("DROP TRIGGER fixture_reject_intent_completion")
+            }
+            waitForHostKill()
+            return
+        }
+        awaitPartialPrefix(server)
+        assertEquals(2, server.requestCount)
+        ChatDatabase(context).use { db ->
+            val checkpoint = db.getOpenRouterCheckpoint(chatId, requestId)!!
+            assertUnfinishedReasoningRetainedOutsideReplay(checkpoint)
+            val tail = checkpoint.getJSONArray("tail")
+            assertEquals("synthetic-signed-process-data", tail.getJSONObject(0)
+                .getJSONArray("reasoning_details").getJSONObject(0).getString("data"))
+            val file = db.listLocalFiles(chatId).single()
+            val path = file.getString("path")
+            assertEquals(original, File(path).readText())
+            saveArtifactEvidence(path, tail)
+            if (scenario != "partial") {
+                assertTrue(OpenRouterResponseRuntime.stop(context, chatId, requestId, false))
+                OpenRouterResponseRuntime.cancel(requestId)
                 if (scenario == "replaced") {
-                    db.setActiveResponse(chatId, "resp_replacement_fixture", replacementId, "",
-                        "starting", System.currentTimeMillis(), "high", "high", false, 16, 0, false)
+                    db.setActiveResponse(chatId, null, replacementId, "", "in_progress", System.currentTimeMillis(),
+                        "high", "high", false, 0, 0, false)
+                    assertTrue(db.startRequestAccounting(chatId, replacementId, "openrouter", model, "openrouter_api_key"))
+                    assertTrue(db.checkpointOpenRouterResponse(chatId, replacementId, "Replacement prefix", 0))
                 }
-            } else {
-                var state = ResponseEventReducer.reduce(ResponseEventState(), JSONObject()
-                    .put("type", "response.output_item.done").put("output_index", 0)
-                    .put("item", signedItem())).state
-                state = ResponseEventReducer.reduce(state, JSONObject()
-                    .put("type", "response.output_text.delta")
-                    .put("output_index", 1).put("content_index", 0).put("delta", "received fragment")).state
-                if (scenario == "terminal") {
-                    val terminal = JSONObject().put("id", responseId).put("status", "completed")
-                        .put("output", JSONArray().put(signedItem()).put(JSONObject()
-                            .put("type", "message").put("role", "assistant")
-                            .put("content", JSONArray().put(JSONObject().put("type", "output_text")
-                                .put("text", "canonical paid result")))))
-                        .put("usage", JSONObject().put("input_tokens", 17).put("output_tokens", 31))
-                    state = ResponseEventReducer.reduce(state, JSONObject()
-                        .put("type", "response.completed").put("response", terminal)).state
-                }
-                db.updateActiveResponse(chatId, responseId, state.text,
-                    if (scenario == "terminal") "completed" else "in_progress", 9,
-                    requestId, ResponseIndexedCheckpoint.serialize(state))
-                val stored = db.getActiveResponse(chatId)!!
-                assertEquals(9L, stored.getLong("last_sequence_number"))
-                assertEquals(state.text, ResponseIndexedCheckpoint.restore(stored).text)
             }
         }
-        OpenAiRawSseArchive.archivesFor(context.filesDir, chatId, requestId).forEach { it.delete() }
-        OpenAiRawSseArchive.begin(ByteArrayInputStream(sourceBytes), context.filesDir, chatId, requestId)
-            .use { it.receiveRemaining() }
+        if (scenario != "partial") await("Cancelled runtime must release the old owner") {
+            !OpenRouterResponseRuntime.contains(requestId)
+        }
+        waitForHostKill()
+    }
+
+    private fun saveArtifactEvidence(path: String, tail: JSONArray? = null) {
+        val file = File(path)
+        assertEquals(original, file.readText())
+        val edit = prefs.edit().putString("result_path", path)
+            .putString("result_sha256", LocalUtf8FilePatch.sha256(file)).putLong("result_mtime", file.lastModified())
+        tail?.let { edit.putString("tail", it.toString()) }
+        assertTrue(edit.commit())
+    }
+
+    private fun storedAssistant(db: ChatDatabase): JSONObject {
+        val messages = db.getChat(chatId)!!.getJSONArray("messages")
+        return (0 until messages.length()).map { messages.getJSONObject(it) }
+            .single { it.optString("role") == "assistant" && it.optString("request_id") == requestId }
+    }
+
+    private fun artifactIndexCount(db: ChatDatabase): Int = db.readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM local_artifacts WHERE chat_id=? AND request_id=?", arrayOf(chatId, requestId)
+    ).use { it.moveToFirst(); it.getInt(0) }
+
+    private fun seedDeletedIntentAndWaitForHostKill() {
+        val executor = LocalArtifactToolExecutor(context)
+        val args = JSONObject().put("filename", "process-result.txt").put("content", original)
+        executor.prepareTextFile(args, "$chatId\u0000$requestId\u0000$providerCallId").use { plan ->
+            ChatDatabase(context).use { db ->
+                val record = db.beginLocalArtifactIntentIfActive(chatId, requestId, providerCallId,
+                    "create_local_text_file", StreamingJsonRequestBody.sha256(args), plan.snapshot)!!
+                assertTrue(record.getBoolean("_inserted"))
+                db.upsertCurrentChat("$chatId-survivor", "Fixture survivor", null, null, emptyList())
+                db.deleteChat(chatId)
+                // Model the already-authorized writer crossing Delete after its last ownership check.
+                // Production Plan and DB APIs execute normally; no production test hook is installed.
+                val outcome = plan.publish()
+                val completion = db.completeLocalArtifactIntent(chatId, requestId, providerCallId,
+                    "create_local_text_file", record.getString("arguments_sha256"), record.getString("plan_sha256"), outcome)!!
+                assertTrue(completion.getBoolean("tombstoned"))
+                assertFalse(completion.has("outcome"))
+                assertNull(db.getChat(chatId))
+                assertEquals(0, artifactIndexCount(db))
+                saveArtifactEvidence(outcome.getString("path"))
+                assertTrue(context.getSharedPreferences("app", 0).edit().putString("current_chat", "$chatId-survivor").commit())
+            }
+        }
+        waitForHostKill()
+    }
+
+    private fun waitForHostKill() {
         assertTrue(prefs.edit().putInt("seed_pid", Process.myPid()).putString("scenario", scenario).commit())
-        // Production scheduler, persisted work, deliberately not ready before
-        // the host kills us. A fresh process will reschedule this same owner.
-        BackgroundResponseWorkScheduler.enqueue(context, chatId, responseId, requestId, 120_000L)
-        val work = WorkManager.getInstance(context).getWorkInfosForUniqueWork(
-            BackgroundResponseWorkScheduler.workName(chatId, requestId)).get(15, TimeUnit.SECONDS)
-        assertTrue(work.any { it.state == WorkInfo.State.ENQUEUED })
         instrumentation.sendStatus(2, Bundle().apply {
             putString("stream", "PROCESS_RECOVERY_SEEDED scenario=$scenario pid=${Process.myPid()}\n")
         })
-        // Returning would let the runner end normally and fake process death.
         CountDownLatch(1).await(180, TimeUnit.SECONDS)
         fail("Host did not terminate the live seeded process")
     }
 
-    @Test fun verifyProductionScheduledRecoveryInNewProcess() {
+    @Test fun verifyLocalRecoveryInNewProcess() {
         assumeTrue(arguments.getString("recoveryStage") == "verify")
         assertEquals(scenario, prefs.getString("scenario", ""))
-        assertNotEquals("A DB reopen in the same process is insufficient", prefs.getInt("seed_pid", -1), Process.myPid())
-        assertEquals(if (scenario == "background_created") SYNTHETIC_KEY else "", SecureStore(context).getApiKey())
-        if (scenario == "background_created") assertOriginalArchive("before Worker recovery")
-        val recoveryTransport = if (scenario == "background_created") trustedRecoveryTransport() else null
-        // Same production rescheduling entry point used on Android onStop.
-        val manager = WorkManager.getInstance(context)
-        val name = BackgroundResponseWorkScheduler.workName(chatId, requestId)
-        val beforeIds = manager.getWorkInfosForUniqueWork(name).get(10, TimeUnit.SECONDS).map { it.id }.toSet()
-        BackgroundResponseWorkScheduler.enqueueImmediate(context, chatId, responseId, requestId)
-        val deadline = SystemClock.elapsedRealtime() + 60_000L
-        try {
-            var work: List<WorkInfo>
-            var firstExecution: WorkInfo? = null
-            do {
-                work = manager.getWorkInfosForUniqueWork(name).get(10, TimeUnit.SECONDS)
-                firstExecution = work.firstOrNull { it.id !in beforeIds }
-                if (firstExecution?.state == WorkInfo.State.SUCCEEDED) break
-                if (firstExecution?.state == WorkInfo.State.FAILED) fail("Production scheduled Worker failed: $work")
-                SystemClock.sleep(100)
-            } while (SystemClock.elapsedRealtime() < deadline)
-            assertEquals("Actual new WorkManager execution must finish", WorkInfo.State.SUCCEEDED, firstExecution?.state)
-            ChatDatabase(context).use { db ->
-                when (scenario) {
-                    "terminal", "expired_partial", "background_created" -> {
-                        assertNull(db.getActiveResponse(chatId))
-                        val messages = db.getChat(chatId)!!.getJSONArray("messages")
-                        assertEquals("One terminal owner, no duplicate assistant", 2, messages.length())
-                        val assistant = messages.getJSONObject(1)
-                        assertEquals(when (scenario) {
-                            "terminal" -> "canonical paid result"
-                            "background_created" -> "Recovered canonical paid result"
-                            else -> "received fragment"
-                        },
-                            assistant.getString("text"))
-                        assertEquals("signed-fixture-exact-bytes", assistant.getJSONArray("openai_protocol_output")
-                            .getJSONObject(0).getString("encrypted_content"))
-                        if (scenario == "expired_partial") {
-                            assertTrue(assistant.getBoolean("incomplete"))
-                            val source = assistant.getJSONArray("annotations").getJSONObject(0)
-                            assertArrayEquals(sourceBytes, java.io.File(source.getString("local_path")).readBytes())
-                        }
-                        if (scenario == "background_created") {
-                            assertEquals("completed", assistant.getString("status"))
-                            assertEquals(prefs.getString("original_fingerprint", ""),
-                                assistant.getString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD))
-                            assertOriginalArchive("after Worker recovery")
-                        }
-                    }
-                    "stopped_pre_id" -> {
-                        assertNull(db.getActiveResponse(chatId))
-                        assertEquals(1, db.getChat(chatId)!!.getJSONArray("messages").length())
-                        assertEquals("stopped", db.listRequestAccounting(chatId).single()
-                            .getString("local_status"))
-                    }
-                    "replaced" -> {
-                        val active = db.getActiveResponse(chatId)!!
-                        assertEquals(replacementId, active.getString("request_id"))
-                        assertEquals("resp_replacement_fixture", active.getString("response_id"))
-                        assertEquals(1, db.getChat(chatId)!!.getJSONArray("messages").length())
-                    }
-                }
-            }
-            // Another real scheduled attempt cannot claim this old terminal.
-            val previousIds = manager.getWorkInfosForUniqueWork(name).get(10, TimeUnit.SECONDS).map { it.id }.toSet()
-            BackgroundResponseWorkScheduler.enqueueImmediate(context, chatId, responseId, requestId)
-            val repeatDeadline = SystemClock.elapsedRealtime() + 30_000L
-            var repeated: WorkInfo? = null
-            do {
-                work = manager.getWorkInfosForUniqueWork(name).get(10, TimeUnit.SECONDS)
-                repeated = work.firstOrNull { it.id !in previousIds }
-                if (repeated?.state?.isFinished == true) break
-                SystemClock.sleep(100)
-            } while (SystemClock.elapsedRealtime() < repeatDeadline)
-            assertEquals("A second actual scheduled execution must finish", WorkInfo.State.SUCCEEDED, repeated?.state)
-            ChatDatabase(context).use { db ->
-                assertEquals(if (scenario in setOf("terminal", "expired_partial", "background_created")) 2 else 1,
-                    db.getChat(chatId)!!.getJSONArray("messages").length())
-            }
-            if (recoveryTransport != null) {
-                val request = recoveryTransport.first.takeRequest(10, TimeUnit.SECONDS)!!
-                assertEquals("No second paid Create", "GET", request.method)
-                assertEquals("/v1/responses/$responseId?stream=true&starting_after=2", request.path)
-                assertEquals("Bearer $SYNTHETIC_KEY", request.getHeader("Authorization"))
-                assertEquals("Repeated scheduled recovery cannot issue another request", 1,
-                    recoveryTransport.first.requestCount)
-                assertEquals(1, prefs.getInt("seed_create_count", -1))
-            }
-        } finally {
-            try {
-                ResumableResponseStreamClient.transportForTests = null
-                recoveryTransport?.second?.let { client ->
-                    client.dispatcher.executorService.shutdownNow()
-                    client.connectionPool.evictAll()
-                }
-                recoveryTransport?.first?.shutdown()
-            } finally {
-                cleanupFixture()
-            }
-        }
-    }
-
-    /** Called by the host even when seed/verification was killed or failed. */
-    @Test fun cleanupProcessRecoveryFixture() {
-        assumeTrue(arguments.getString("recoveryStage") == "cleanup")
-        cleanupFixture()
-    }
-
-    private fun assertOriginalArchive(stage: String) {
-        val expected = Base64.decode(prefs.getString("seed_source_base64", "")!!, Base64.NO_WRAP)
-        fun digest(bytes: ByteArray) = java.security.MessageDigest.getInstance("SHA-256")
-            .digest(bytes).joinToString("") { "%02x".format(it) }
-        val files = OpenAiRawSseArchive.archivesFor(context.filesDir, chatId, requestId)
-        val actual = files.map { it.readBytes() }
-        assertTrue("Original paid source survives process death ($stage); expectedBytes=${expected.size} " +
-            "expectedSha=${digest(expected)} archives=" + actual.map { "${it.size}:${digest(it)}" },
-            expected.isNotEmpty() && actual.any { it.contentEquals(expected) })
-    }
-
-    private fun seedBackgroundCreatedAndWaitForKill() {
-        saveSettingsForProcessDeath()
-        val appPrefs = context.getSharedPreferences("app", 0)
-        appPrefs.edit().putString("provider", "openai").putString("model", "gpt-6-astra")
-            .putString("reasoning", "high").putString("text_format", "text")
-            .putString("system_prompt", "").putString("instructions", "")
-            .putBoolean("background_responses", true).putBoolean("response_notifications", false)
-            .putBoolean("file_analysis_tools", false).putBoolean("web", false)
-            .putBoolean("file_search", false).putBoolean("code_interpreter", false)
-            .putBoolean("image_generation", false).commit()
-        SecureStore(context).setApiKey(SYNTHETIC_KEY)
-        val (server, trusted) = trustedServer()
-        val parsedCreated = CountDownLatch(1)
-        val releaseCreated = CountDownLatch(1)
-        val waitingAtEof = CountDownLatch(1)
-        val releaseEof = CountDownLatch(1)
-        fun wire(event: JSONObject) = "data: $event\n\n"
-        val prefix = wire(JSONObject().put("type", "response.created").put("sequence_number", 0)
-            .put("response", JSONObject().put("id", responseId))) +
-            wire(JSONObject().put("type", "response.output_text.delta").put("sequence_number", 1)
-                .put("output_index", 1).put("content_index", 0).put("delta", "received fragment")) +
-            wire(JSONObject().put("type", "response.output_item.done").put("sequence_number", 2)
-                .put("output_index", 0).put("item", signedItem()))
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(prefix))
-        val createClient = trusted.newBuilder().addInterceptor { chain ->
-            val response = chain.proceed(chain.request().newBuilder().url(server.url("/v1/responses")).build())
-            val body = response.body!!
-            val gated = object : ForwardingSource(body.source()) {
-                override fun read(sink: Buffer, byteCount: Long): Long {
-                    val count = super.read(sink, byteCount)
-                    if (count < 0L) {
-                        waitingAtEof.countDown()
-                        if (!releaseEof.await(180, TimeUnit.SECONDS)) throw IOException("Host process-kill gate timed out")
-                    }
-                    return count
-                }
-            }.buffer()
-            response.newBuilder().body(object : ResponseBody() {
-                override fun contentType(): MediaType? = body.contentType()
-                override fun contentLength(): Long = -1L
-                override fun source(): BufferedSource = gated
-            }).build()
-        }.build()
-        // If ownership regresses, a duplicate Worker stream must be observable
-        // on this local server, never sent to the live provider with a fake key.
-        ResumableResponseStreamClient.transportForTests = trusted to server.url("/")
-        val activity = ActivityScenario.launch(MainActivity::class.java)
-        try {
-            activity.onActivity { current ->
-                current.newChat()
-                val actualChatId = current.prefs.getString("current_chat", "")!!
-                prefs.edit().putString("actual_chat_id", actualChatId).commit()
-                field("client").set(current, createClient)
-                val hook: (JSONObject) -> Unit = { event ->
-                    if (event.optString("type") == "response.created") {
-                        parsedCreated.countDown()
-                        if (!releaseCreated.await(30, TimeUnit.SECONDS)) throw IOException("Before-ID fixture gate timed out")
-                    }
-                }
-                field("openAiReceivedEventHook").set(current, hook)
-                (field("input").get(current) as EditText).setText("Synthetic prompt")
-                MainActivity::class.java.getDeclaredMethod("sendMessage", Boolean::class.javaPrimitiveType!!)
-                    .apply { isAccessible = true }.invoke(current, false)
-            }
-            val create = server.takeRequest(20, TimeUnit.SECONDS)!!
-            assertEquals("POST", create.method)
-            assertTrue(JSONObject(create.body.readUtf8()).getBoolean("background"))
-            assertTrue(parsedCreated.await(20, TimeUnit.SECONDS))
-            val originalStartedAt = ChatDatabase(context).use { db ->
-                val active = db.getActiveResponse(chatId)!!
-                assertTrue(JsonProtocol.string(active, "response_id").isBlank())
-                val localRequest = active.getString("request_id")
-                val fingerprint = db.getChat(chatId)!!.getJSONArray("messages")
-                    .getJSONObject(0).getString(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD)
-                assertTrue(prefs.edit().putString("actual_request_id", localRequest)
-                    .putLong("original_started_at", active.getLong("started_at"))
-                    .putString("original_fingerprint", fingerprint).commit())
-                assertTrue(OpenAiCreateCallOwners.hasLiveCall(chatId, requestId))
-                active.getLong("started_at")
-            }
-            activity.moveToState(Lifecycle.State.CREATED)
-            assertEquals(Lifecycle.State.CREATED, activity.state)
-            releaseCreated.countDown()
-            assertTrue(waitingAtEof.await(20, TimeUnit.SECONDS))
-            ChatDatabase(context).use { db ->
-                val active = db.getActiveResponse(chatId)!!
-                assertEquals(requestId, active.getString("request_id"))
-                assertEquals(responseId, active.getString("response_id"))
-                assertEquals("Send's five-hour clock must survive late ID", originalStartedAt, active.getLong("started_at"))
-                assertEquals(2L, active.getLong("last_sequence_number"))
-                val recovered = ResponseIndexedCheckpoint.restore(active)
-                assertEquals("received fragment", recovered.text)
-                assertEquals("signed-fixture-exact-bytes", recovered.typedOutputItems[0]!!.getString("encrypted_content"))
-            }
-            val manager = WorkManager.getInstance(context)
-            val name = BackgroundResponseWorkScheduler.workName(chatId, requestId)
-            val deadline = SystemClock.elapsedRealtime() + 20_000L
-            var work: List<WorkInfo>
-            do {
-                work = manager.getWorkInfosForUniqueWork(name).get(10, TimeUnit.SECONDS)
-                if (work.any { it.state == WorkInfo.State.RUNNING }) break
-                SystemClock.sleep(50)
-            } while (SystemClock.elapsedRealtime() < deadline)
-            assertTrue("Late background response.created must run durable production recovery",
-                work.any { it.state == WorkInfo.State.RUNNING })
-            assertTrue("Primary Create remains the live reader", OpenAiCreateCallOwners.hasLiveCall(chatId, requestId))
-            assertNull("Scheduled Worker must not open a parallel stream", server.takeRequest(1, TimeUnit.SECONDS))
-            assertEquals(1, server.requestCount)
-            assertTrue(OpenAiRawSseArchive.archivesFor(context.filesDir, chatId, requestId)
-                .any { it.readText(Charsets.UTF_8) == prefix })
-            // Keep a persisted production job pending until verification installs
-            // its new-process trusted HTTPS server. No test Worker factory.
-            BackgroundResponseWorkScheduler.enqueue(context, chatId, responseId, requestId, 120_000L)
-            val pending = manager.getWorkInfosForUniqueWork(name).get(15, TimeUnit.SECONDS)
-            assertTrue(pending.any { it.state == WorkInfo.State.ENQUEUED })
-            // SharedPreferences XML indentation can append spaces after a
-            // multiline string's trailing newline. Preserve the wire bytes
-            // losslessly instead of normalizing either side of the assertion.
-            assertTrue(prefs.edit().putInt("seed_pid", Process.myPid()).putString("scenario", scenario)
-                .putString("seed_source_base64", Base64.encodeToString(prefix.toByteArray(Charsets.UTF_8), Base64.NO_WRAP))
-                .putInt("seed_create_count", server.requestCount).commit())
-            instrumentation.sendStatus(2, Bundle().apply {
-                putString("stream", "PROCESS_RECOVERY_SEEDED scenario=$scenario pid=${Process.myPid()}\n")
-            })
-            CountDownLatch(1).await(180, TimeUnit.SECONDS)
-            fail("Host did not terminate the live background-created process")
-        } finally {
-            try {
-                releaseCreated.countDown()
-                releaseEof.countDown()
-                ResumableResponseStreamClient.transportForTests = null
-                activity.close()
-                createClient.dispatcher.executorService.shutdownNow()
-                createClient.connectionPool.evictAll()
-                server.shutdown()
-            } finally {
-                cleanupFixture()
-            }
-        }
-    }
-
-    private fun trustedRecoveryTransport(): Pair<MockWebServer, OkHttpClient> = trustedServer().also { (server, client) ->
-        val terminal = JSONObject().put("id", responseId).put("status", "completed")
-            .put("output", JSONArray().put(signedItem()).put(JSONObject().put("type", "message")
-                .put("id", "msg_recovered").put("role", "assistant")
-                .put("content", JSONArray().put(JSONObject().put("type", "output_text")
-                    .put("text", "Recovered canonical paid result")))))
-            .put("usage", JSONObject().put("input_tokens", 17).put("output_tokens", 31))
-        val event = JSONObject().put("type", "response.completed").put("sequence_number", 3).put("response", terminal)
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody("data: $event\n\n"))
-        ResumableResponseStreamClient.transportForTests = client to server.url("/")
-        ChatDatabase(context).use { db ->
-            val active = db.getActiveResponse(chatId)!!
-            assertEquals(prefs.getLong("original_started_at", -1L), active.getLong("started_at"))
-            assertEquals(2L, active.getLong("last_sequence_number"))
-            assertFalse("A killed process cannot retain its Create registry", OpenAiCreateCallOwners.isRegistered(chatId, requestId))
-        }
-    }
-
-    private fun trustedServer(): Pair<MockWebServer, OkHttpClient> {
-        val certificate = HeldCertificate.Builder().commonName("localhost").addSubjectAlternativeName("localhost").build()
+        assertNotEquals(prefs.getInt("seed_pid", -1), Process.myPid())
+        assertTrue("Pre-create interception requires the CI emulator's API 29+", Build.VERSION.SDK_INT >= 29)
+        assertEquals(syntheticKey, SecureStore(context).getOpenRouterApiKey())
+        assertFalse(OpenRouterResponseRuntime.contains(requestId))
+        val certificate = HeldCertificate.Builder().commonName("localhost")
+            .addSubjectAlternativeName("localhost").addSubjectAlternativeName("127.0.0.1").build()
         val serverTls = HandshakeCertificates.Builder().heldCertificate(certificate).build()
         val clientTls = HandshakeCertificates.Builder().addTrustedCertificate(certificate.certificate).build()
-        val server = MockWebServer().apply { useHttps(serverTls.sslSocketFactory(), false); start() }
-        val client = OkHttpClient.Builder().sslSocketFactory(clientTls.sslSocketFactory(), clientTls.trustManager).build()
-        return server to client
-    }
-
-    private fun saveSettingsForProcessDeath() {
-        val appPrefs = context.getSharedPreferences("app", 0)
-        val snapshot = JSONObject()
-        SETTINGS.forEach { key ->
-            val value = appPrefs.all[key]
-            snapshot.put(key, JSONObject().put("present", value != null).apply {
-                if (value != null) put("value", value).put("type", when (value) {
-                    is Boolean -> "boolean"
-                    is Int -> "int"
-                    is Long -> "long"
-                    is Float -> "float"
-                    else -> "string"
-                })
-            })
-        }
-        assertTrue(prefs.edit().putString("saved_settings", snapshot.toString())
-            .putBoolean("synthetic_key_owned", true).commit())
-    }
-
-    private fun cleanupFixture() {
-        BackgroundResponseWorkScheduler.cancel(context, chatId, requestId)
-        ChatDatabase(context).use { it.deleteChat(chatId) }
-        OpenAiRawSseArchive.archivesFor(context.filesDir, chatId, requestId).forEach { it.delete() }
-        if (prefs.getBoolean("synthetic_key_owned", false)) {
-            val currentKey = SecureStore(context).getApiKey()
-            check(currentKey.isBlank() || currentKey == SYNTHETIC_KEY) { "Fixture cannot overwrite a different credential" }
-            SecureStore(context).setApiKey("")
-        }
-        prefs.getString("saved_settings", null)?.let { raw ->
-            val snapshot = JSONObject(raw)
-            val edit = context.getSharedPreferences("app", 0).edit()
-            snapshot.keys().forEach { key ->
-                val entry = snapshot.getJSONObject(key)
-                if (!entry.getBoolean("present")) edit.remove(key)
-                else when (entry.getString("type")) {
-                    "boolean" -> edit.putBoolean(key, entry.getBoolean("value"))
-                    "int" -> edit.putInt(key, entry.getInt("value"))
-                    "long" -> edit.putLong(key, entry.getLong("value"))
-                    "float" -> edit.putFloat(key, entry.getDouble("value").toFloat())
-                    else -> edit.putString(key, entry.getString("value"))
+        val explicitReplayAllowed = AtomicBoolean(false)
+        val server = MockWebServer().apply {
+            useHttps(serverTls.sslSocketFactory(), false)
+            dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+                override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                    if (!explicitReplayAllowed.get()) return MockResponse().setResponseCode(599).setBody("Unexpected recovery HTTP")
+                    val frame = JSONObject().put("id", generationId("explicit-replay")).put("model", model)
+                        .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", "Recovered file verified"))
+                            .put("finish_reason", "stop")))
+                    return MockResponse().setHeader("Content-Type", "text/event-stream")
+                        .setBody("data: $frame\n\ndata: [DONE]\n\n")
                 }
             }
-            assertTrue(edit.commit())
+            start()
         }
-        prefs.edit().clear().commit()
+        val endpoint = server.url("/api/v1").toString()
+        val injectedActivities = AtomicInteger()
+        val application = context.applicationContext as Application
+        val callbacks = object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityPreCreated(activity: Activity, savedInstanceState: Bundle?) {
+                if (activity !is MainActivity) return
+                val factory: () -> OpenRouterChatClient = {
+                    // Each Activity owns a fresh pool/dispatcher; closing the first one cannot
+                    // prevent a hypothetical second restart from reaching the tripwire server.
+                    val http = OkHttpClient.Builder()
+                        .sslSocketFactory(clientTls.sslSocketFactory(), clientTls.trustManager)
+                        .callTimeout(5, TimeUnit.SECONDS).build()
+                    OpenRouterChatClient(endpoint, http, reconcileGenerations = false)
+                }
+                MainActivity::class.java.getDeclaredField("openRouterClientFactory")
+                    .apply { isAccessible = true }.set(activity, factory)
+                injectedActivities.incrementAndGet()
+            }
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityStarted(activity: Activity) {}
+            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivityStopped(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        }
+        application.registerActivityLifecycleCallbacks(callbacks)
+        try {
+            repeat(2) {
+                ActivityScenario.launch(MainActivity::class.java).use { activityScenario ->
+                    activityScenario.onActivity {
+                        assertEquals(syntheticKey, SecureStore(context).getOpenRouterApiKey())
+                        assertFalse(OpenRouterResponseRuntime.contains(requestId))
+                        assertFalse(OpenRouterResponseRuntime.contains(replacementId))
+                    }
+                    if (scenario == "intent_gap") await("Startup must reconcile the exact published tool result locally") {
+                        ChatDatabase(context).use { db ->
+                            db.getLocalArtifactIntent(chatId, requestId, providerCallId)?.optString("state") == "completed" &&
+                                storedAssistant(db).optJSONObject("openrouter_protocol")?.optJSONObject("tool_states")
+                                    ?.optJSONObject(providerCallId)?.optString("state") == "completed"
+                        }
+                    }
+                }
+                assertEquals("Restart recovery must not send HTTP with the available synthetic key", 0, server.requestCount)
+            }
+            assertEquals("Both production Activity restarts must receive the pre-create tripwire", 2, injectedActivities.get())
+            if (scenario == "intent_gap") {
+                // Recovery above sent no HTTP. This is a separate, explicit synthetic next-turn wire check.
+                explicitReplayAllowed.set(true)
+                verifyRecoveredIntentAndExplicitReplay(server, clientTls)
+            }
+        } finally {
+            application.unregisterActivityLifecycleCallbacks(callbacks)
+            server.shutdown()
+        }
+        ChatDatabase(context).use { db ->
+            assertNull(db.getActiveResponse(chatId))
+            if (scenario == "deleted_intent") {
+                assertNull("Startup must not resurrect the deleted chat", db.getChat(chatId))
+                val intent = db.getLocalArtifactIntent(chatId, requestId, providerCallId)!!
+                assertTrue(intent.getBoolean("tombstoned"))
+                assertFalse(intent.has("outcome"))
+                assertEquals(0, artifactIndexCount(db))
+                verifyArtifactEvidence()
+                return@use
+            }
+            if (scenario == "intent_gap") {
+                assertEquals(1, artifactIndexCount(db))
+                assertEquals(1, recordedRoundCount(db))
+                assertEquals(2, db.getChat(chatId)!!.getJSONArray("messages").length())
+                verifyArtifactEvidence()
+                return@use
+            }
+            val messages = db.getChat(chatId)!!.getJSONArray("messages")
+            assertEquals(if (scenario == "stopped") 1 else 2, messages.length())
+            if (scenario == "partial") {
+                val answer = messages.getJSONObject(1)
+                assertEquals(prefix, answer.getString("text"))
+                assertEquals("disconnected", answer.getString("status"))
+                assertEquals("openrouter", answer.getString("provider"))
+                val originalTail = JSONArray(prefs.getString("tail", "[]"))
+                val recoveredProtocol = answer.getJSONObject("openrouter_protocol")
+                assertUnfinishedReasoningRetainedOutsideReplay(recoveredProtocol)
+                val recoveredTail = recoveredProtocol.getJSONArray("tail")
+                for (index in 0 until originalTail.length())
+                    assertEquals(originalTail.get(index).toString(), recoveredTail.get(index).toString())
+                val history = (0 until messages.length()).map { messages.getJSONObject(it) }
+                val wire = OpenRouterContextSnapshot.build(history, null, List(history.size) { emptyList() })
+                assertFalse("An unfinished signed round must not be replayed", wire.toString().contains(unfinishedReasoning))
+            } else {
+                val archive = db.getRequestRecoveryArchive(chatId, requestId)!!
+                assertEquals(prefix, archive.getString("text"))
+                assertUnfinishedReasoningRetainedOutsideReplay(archive.getJSONObject("openrouter_protocol"))
+                if (scenario == "replaced") {
+                    assertEquals(replacementId, messages.getJSONObject(1).getString("request_id"))
+                    assertEquals("Replacement prefix", messages.getJSONObject(1).getString("text"))
+                }
+            }
+            // Sealing may update status/cost, but process restart must never create another HTTP round.
+            assertEquals(2, recordedRoundCount(db))
+            verifyArtifactEvidence()
+        }
     }
 
-    private fun field(name: String) = MainActivity::class.java.getDeclaredField(name).apply { isAccessible = true }
+    private fun recordedRoundCount(db: ChatDatabase): Int = db.readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM openrouter_request_rounds WHERE chat_id=? AND local_request_id=?",
+        arrayOf(chatId, requestId)).use { it.moveToFirst(); it.getInt(0) }
 
-    companion object {
-        private const val SYNTHETIC_KEY = "sk-synthetic-process-fixture"
-        private val SETTINGS = listOf("current_chat", "provider", "model", "reasoning", "text_format",
-            "system_prompt", "instructions", "background_responses", "response_notifications",
-            "file_analysis_tools", "web", "file_search", "code_interpreter", "image_generation")
+    private fun assertUnfinishedReasoningRetainedOutsideReplay(protocol: JSONObject) {
+        val interrupted = protocol.getJSONObject("interrupted_assistant")
+        assertEquals(prefix, interrupted.getString("content"))
+        assertFalse(interrupted.getBoolean("replay_safe"))
+        assertEquals(unfinishedReasoning, interrupted.getJSONArray("reasoning_details").getJSONObject(0).getString("data"))
+        assertEquals(unfinishedReasoning, interrupted.getJSONArray("reasoning_delta_fragments").getJSONObject(0).getString("data"))
+        assertFalse(protocol.getJSONArray("tail").toString().contains(unfinishedReasoning))
+    }
+
+    private fun verifyArtifactEvidence() {
+        val file = File(prefs.getString("result_path", "")!!)
+        assertEquals(original, file.readText())
+        assertEquals(prefs.getString("result_sha256", ""), LocalUtf8FilePatch.sha256(file))
+        assertEquals("Recovery must not rewrite target content", prefs.getLong("result_mtime", -1L), file.lastModified())
+    }
+
+    private fun verifyRecoveredIntentAndExplicitReplay(server: MockWebServer, tls: HandshakeCertificates) {
+        val history = ChatDatabase(context).use { db ->
+            val intent = db.getLocalArtifactIntent(chatId, requestId, providerCallId)!!
+            assertFalse(intent.getBoolean("tombstoned"))
+            assertEquals("completed", intent.getString("state"))
+            val protocol = storedAssistant(db).getJSONObject("openrouter_protocol")
+            val tail = protocol.getJSONArray("tail")
+            assertEquals(2, tail.length())
+            assertEquals("Signed assistant must stay byte-for-byte unchanged", JSONArray(prefs.getString("tail", "[]"))
+                .getJSONObject(0).toString(), tail.getJSONObject(0).toString())
+            val result = tail.getJSONObject(1)
+            assertEquals("tool", result.getString("role"))
+            assertEquals(providerCallId, result.getString("tool_call_id"))
+            val output = JSONObject(result.getString("content"))
+            assertTrue(output.getBoolean("ok"))
+            assertFalse(output.optBoolean("cancelled"))
+            assertEquals(intent.getJSONObject("outcome").getString("file_id"), output.getString("file_id"))
+            assertFalse("Private device path must stay outside replay", output.has("path"))
+            assertEquals("completed", protocol.getJSONObject("tool_states").getJSONObject(providerCallId).getString("state"))
+            assertEquals(1, recordedRoundCount(db))
+            val rows = db.getChat(chatId)!!.getJSONArray("messages")
+            (0 until rows.length()).map { rows.getJSONObject(it) }
+        }
+        val messages = OpenRouterContextSnapshot.build(history, null, List(history.size) { emptyList() })
+            .put(JSONObject().put("role", "user").put("content", "Confirm the recovered local result"))
+        val http = OkHttpClient.Builder().sslSocketFactory(tls.sslSocketFactory(), tls.trustManager)
+            .callTimeout(10, TimeUnit.SECONDS).build()
+        val client = OpenRouterChatClient(server.url("/api/v1").toString(), http, reconcileGenerations = false)
+        val executed = AtomicInteger()
+        try {
+            val response = client.complete(syntheticKey, model, messages, sessionId = chatId,
+                tools = OpenRouterAppToolCatalog.tools(), maxTokens = null, reasoningEffort = "high", verbosity = "",
+                parallelToolCalls = false, cacheMode = "off", executeTool = { _, _ ->
+                    executed.incrementAndGet(); fail("Replay must not execute the previous file tool"); ""
+                })
+            assertEquals("Recovered file verified", response.text)
+            assertEquals(0, executed.get())
+            assertEquals("Only the explicitly requested next turn may POST", 1, server.requestCount)
+            val wire = JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8()).getJSONArray("messages")
+            val results = (0 until wire.length()).map { wire.getJSONObject(it) }
+                .filter { it.optString("role") == "tool" }
+            assertEquals(1, results.size)
+            assertEquals(providerCallId, results.single().getString("tool_call_id"))
+            assertTrue(JSONObject(results.single().getString("content")).getBoolean("ok"))
+            val assistant = (0 until wire.length()).map { wire.getJSONObject(it) }
+                .single { it.optJSONArray("tool_calls") != null }
+            assertEquals("synthetic-signed-process-data", assistant.getJSONArray("reasoning_details")
+                .getJSONObject(0).getString("data"))
+        } finally { client.close() }
+        verifyArtifactEvidence()
+    }
+
+    @Test fun cleanupProcessRecoveryFixture() {
+        assumeTrue(arguments.getString("recoveryStage") == "cleanup")
+        OpenRouterResponseRuntime.cancel(requestId)
+        val paths = ChatDatabase(context).use { db ->
+            db.writableDatabase.execSQL("DROP TRIGGER IF EXISTS fixture_reject_intent_completion")
+            val owned = db.listLocalFiles(chatId).mapNotNull { JsonProtocol.nonBlank(it, "path") }
+            db.deleteChat(chatId)
+            db.deleteChat("$chatId-survivor")
+            owned + listOfNotNull(prefs.getString("result_path", null))
+        }
+        paths.forEach { File(it).delete() }
+        val app = context.getSharedPreferences("app", 0).edit()
+        val saved = JSONObject(prefs.getString("saved_app", "{}")!!)
+        for (key in appPreferenceKeys) when (val value = saved.opt(key)) {
+            null, JSONObject.NULL -> app.remove(key)
+            is Boolean -> app.putBoolean(key, value)
+            else -> app.putString(key, value.toString())
+        }
+        assertTrue(app.commit())
+        assertTrue(context.getSharedPreferences("secure", 0).edit()
+            .putString("openrouter_key", prefs.getString("saved_router_key", null)).commit())
+        assertTrue(prefs.edit().clear().commit())
     }
 }

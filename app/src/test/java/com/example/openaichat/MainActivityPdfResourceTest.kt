@@ -3,7 +3,6 @@ package com.example.openaichat
 import android.app.Application
 import android.content.Context
 import android.graphics.pdf.PdfRenderer
-import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.widget.LinearLayout
 import org.junit.After
@@ -44,16 +43,13 @@ class MainActivityPdfResourceTest {
         val app = RuntimeEnvironment.getApplication()
         app.getSharedPreferences("app", Context.MODE_PRIVATE).edit().clear().putBoolean("response_notifications", false).commit()
         app.deleteDatabase("astra_chats.db")
-        try { androidx.work.WorkManager.getInstance(app) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(app, androidx.work.Configuration.Builder().build())
-        }
         file = File(app.cacheDir, "broken-preview.pdf").apply { writeText("invalid PDF") }
         opened = null
     }
 
     @After fun after() { controller?.destroy(); file.delete(); opened = null }
 
-    @Test fun allPdfPreviewEntrypointsCloseDescriptorWhenRendererConstructionFails() {
+    @Test fun retainedPdfPreviewEntrypointsCloseDescriptorWhenRendererConstructionFails() {
         val activity = Robolectric.buildActivity(MainActivity::class.java).create().also { controller = it }.get()
         val executorField = MainActivity::class.java.getDeclaredField("executor").apply { isAccessible = true }
         val previous = executorField.get(activity) as ExecutorService
@@ -74,12 +70,6 @@ class MainActivityPdfResourceTest {
         invoke("showPdfPreview", file.path, file.name, { true })
         assertClosed()
         invoke("addCompactPdfPreview", LinearLayout(activity), file.path, file.name)
-        assertClosed()
-        val uri = Uri.fromFile(file)
-        invoke("addUploadProgressCard", uri, "file")
-        val key = MainActivity::class.java.getDeclaredMethod("attachmentKey", Uri::class.java, String::class.java)
-            .apply { isAccessible = true }.invoke(activity, uri, "file") as String
-        invoke("showPendingLocalPreview", key, file.path, file.name, "application/pdf")
         assertClosed()
     }
 }

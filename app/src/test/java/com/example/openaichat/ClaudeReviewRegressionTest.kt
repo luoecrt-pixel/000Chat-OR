@@ -36,7 +36,7 @@ class ClaudeReviewRegressionTest {
 
     @Test fun jsonNullNeverBecomesAnAssistantMessageOrFilePath() {
         val nil = JSONObject().put("role", "assistant").put("text", JSONObject.NULL)
-        assertEquals(0, OpenAiLocalContextEncoder.encode(listOf(nil)).length())
+        assertEquals(0, OpenRouterContextSnapshot.build(listOf(nil), null, listOf(emptyList())).length())
         val attachment = OpenRouterLocalAttachment.fromJson(JSONObject().put("path", JSONObject.NULL))
         assertEquals("", attachment.path)
         assertEquals("", JsonProtocol.string(JSONArray().put(JSONObject.NULL), 0))
@@ -57,7 +57,7 @@ class ClaudeReviewRegressionTest {
             try {
                 val answer = db.getChat(chat)!!.getJSONArray("messages").getJSONObject(0)
                 assertFalse(ResponseStatusLabel.restored(answer.getString("status")).contains("Готово"))
-                val input = OpenAiLocalContextEncoder.encode(listOf(answer)).toString()
+                val input = OpenRouterContextSnapshot.build(listOf(answer), null, listOf(emptyList())).toString()
                 assertTrue(input.contains("partial science")); assertFalse(input.contains("UI failure notice"))
             } finally { db.deleteChat(chat) }
         }
@@ -66,8 +66,6 @@ class ClaudeReviewRegressionTest {
     @Test fun limitsAreWireSafetyAndNeverAnOutputCap() {
         assertThrows(IOException::class.java) { OpenRouterAttachmentPreflight.validateRequestBytes("anthropic/claude-opus-5.5", 32_000_001, OpenRouterClaudeRoute.ANTHROPIC) }
         OpenRouterAttachmentPreflight.validateRequestBytes("anthropic/claude-opus-5.5", 32_000_000, OpenRouterClaudeRoute.ANTHROPIC)
-        assertEquals(800_000, ModelCatalog.compactionThreshold("gpt-6-luna"))
-        assertNull(ModelCatalog.compactionThreshold("unknown-future-model"))
         val trace = ToolTraceSummary.entry("file_read_range", JSONObject(), "{\"ok\":false,\"error\":\"missing\"}")
         assertEquals("ошибка", trace.getString("status"))
     }

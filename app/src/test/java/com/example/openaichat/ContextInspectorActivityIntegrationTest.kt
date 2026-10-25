@@ -37,13 +37,9 @@ class ContextInspectorActivityIntegrationTest {
 
     @Before fun before() {
         context.deleteDatabase("astra_chats.db")
-        prefs.edit().clear().putString("provider", "openai").putString("model", "gpt-6-astra")
-            .putString("current_chat", "inspector-chat").putBoolean("response_notifications", false)
-            .putBoolean("file_analysis_tools", false).commit()
+        prefs.edit().clear().putString("provider", "openrouter").putString("model", "anthropic/claude-opus-5.5")
+            .putString("current_chat", "inspector-chat").putBoolean("response_notifications", false).commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
     }
     @After fun after() {
         ShadowDialog.getLatestDialog()?.dismiss()
@@ -78,31 +74,31 @@ class ContextInspectorActivityIntegrationTest {
             .findViewWithTag<TextView>("context-inspector-details").text.toString()
     }
 
-    @Test fun pdfOnlyHistoryDoesNotAdvertiseLocalTextToolsOrMaterializeNewFiles() {
+    @Test fun pdfOnlyHistoryDoesNotClaimReadableLocalTextOrMaterializeNewFiles() {
         start("document.pdf", "application/pdf")
         val before = context.filesDir.walkTopDown().filter { it.isFile }.map { it.path }.toSet()
         val details = inspect()
         assertTrue(details.contains("document.pdf"))
-        assertFalse(details.contains("read_attached_file"))
-        assertFalse(details.contains("list_attached_files"))
+        assertFalse(details.contains("Локальные инструменты будут доступны после успешной проверки файлов"))
         assertEquals(before, context.filesDir.walkTopDown().filter { it.isFile }.map { it.path }.toSet())
     }
 
     @Test fun savedTextUsesLocalToolsAndInspectionCapturesCurrentOptionsAndDraft() {
         start("data.txt", "text/plain")
-        assertTrue(inspect().contains("read_attached_file"))
-        prefs.edit().putBoolean("web", true).putBoolean("file_search", true).putString("vector_store", "vs-captured").commit()
+        assertTrue(inspect().contains("file_read_range"))
+        prefs.edit().putBoolean("openrouter_web_search", true).putBoolean("openrouter_web_fetch", true).commit()
         (field("input") as EditText).setText("new draft")
         val details = inspect()
-        assertTrue(details.contains("web_search"))
-        assertTrue(details.contains("file_search"))
-        assertTrue(details.contains("read_attached_file"))
+        assertTrue(details.contains("openrouter:web_search"))
+        assertTrue(details.contains("openrouter:web_fetch"))
+        assertTrue(details.contains("file_read_range"))
         assertTrue("Current draft must be part of the captured next request", details.contains("История: 2 сообщений"))
         assertEquals("new draft", (field("input") as EditText).text.toString())
-        prefs.edit().putBoolean("web", false).putString("vector_store", "").commit()
+        prefs.edit().putBoolean("openrouter_web_search", false).putBoolean("openrouter_web_fetch", false).commit()
         val next = inspect()
-        assertFalse(next.contains("web_search"))
-        assertFalse(next.lineSequence().first { it.startsWith("Инструменты:") }.contains("file_search"))
+        assertFalse(next.contains("openrouter:web_search"))
+        assertFalse(next.contains("openrouter:web_fetch"))
+        assertTrue(next.lineSequence().first { it.startsWith("Инструменты:") }.contains("file_search"))
     }
 
     @Test fun delayedInspectorFromPreviousChatCannotOpenAfterSwitch() {
@@ -171,7 +167,7 @@ class ContextInspectorActivityIntegrationTest {
             assertTrue("A refresh skipped during prior work must eventually use the latest model",
                 badge.contentDescription.toString().contains("anthropic/claude-updated"))
             assertTrue(badge.contentDescription.toString().contains("OpenRouter"))
-            assertFalse("The previous OpenAI replay mode must not remain", badge.text.toString().contains("replay"))
+            assertFalse("The captured OpenRouter cache mode remains visible", badge.text.toString().contains("replay"))
         } finally {
             preparation.set(activity, null)
             release.countDown()

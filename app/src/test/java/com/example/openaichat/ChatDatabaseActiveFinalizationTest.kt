@@ -165,20 +165,17 @@ class ChatDatabaseActiveFinalizationTest {
         }
     }
 
-    @Test fun fatalWorkerRecoveryClaimsBeforeActivityFinalization() {
+    @Test fun offlineLegacyRecoveryClaimsBeforeLateFinalization() {
         ChatDatabase(context).use { db ->
             prepare(db)
-            assertTrue(BackgroundRequestFailureRecorder.persist(
-                db, "chat", "local_1", "resp_1", "failed", "recovery_auth_401"
-            ))
+            assertTrue(db.recoverLegacyOpenAiRequestLocally("chat", "local_1"))
             assertFalse(commitOnce(db))
-            assertFalse(BackgroundRequestFailureRecorder.persist(
-                db, "chat", "local_1", "resp_1", "failed", "duplicate"
-            ))
-            assertEquals(1, db.listRequestEvents("chat").size)
+            assertFalse(db.recoverLegacyOpenAiRequestLocally("chat", "local_1"))
             assertEquals(1, db.listRequestAccounting("chat").size)
-            assertEquals("partial", db.getChat("chat")!!.getJSONArray("messages")
-                .getJSONObject(1).getString("text"))
+            assertNotNull(db.getRequestRecoveryArchive("chat", "local_1"))
+            val assistant = db.getChat("chat")!!.getJSONArray("messages").getJSONObject(1)
+            assertEquals("partial", assistant.getString("text"))
+            assertEquals("incomplete", assistant.getString("status"))
         }
     }
 

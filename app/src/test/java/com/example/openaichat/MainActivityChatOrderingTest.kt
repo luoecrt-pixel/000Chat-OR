@@ -30,14 +30,9 @@ class MainActivityChatOrderingTest {
 
     @Before fun before() {
         context = RuntimeEnvironment.getApplication()
-        try {
-            androidx.work.WorkManager.getInstance(context)
-        } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         prefs = context.getSharedPreferences("app", Context.MODE_PRIVATE)
         prefs.edit().clear().putBoolean("response_notifications", false)
-            .putString("provider", "openai").putString("model", "gpt-6-astra")
+            .putString("provider", "openrouter").putString("model", "anthropic/claude-sonnet-5.5")
             .putString("current_chat", "older").commit()
         context.getSharedPreferences("secure", Context.MODE_PRIVATE).edit().clear().commit()
         context.deleteDatabase("astra_chats.db")

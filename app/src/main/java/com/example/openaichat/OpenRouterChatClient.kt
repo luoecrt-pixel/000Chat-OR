@@ -57,7 +57,8 @@ class OpenRouterChatClient(
     private val baseUrl: String = "https://openrouter.ai/api/v1",
     httpClientOverride: OkHttpClient? = null,
     internal val reconcileGenerations: Boolean = true,
-    internal val sseLimits: BoundedResponseDecoder.SseLimits = BoundedResponseDecoder.SseLimits()
+    internal val sseLimits: BoundedResponseDecoder.SseLimits = BoundedResponseDecoder.SseLimits(),
+    internal val monotonicNanos: () -> Long = System::nanoTime
 ) {
     internal val metadataBaseUrl get() = (baseUrl.trimEnd('/') + "/").toHttpUrl()
     private companion object {
@@ -100,11 +101,16 @@ class OpenRouterChatClient(
         pdfEngine: String? = null,
         responseFormat: JSONObject? = null,
         claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO,
-        onFileIoObserved: (roundIndex: Int, stats: JSONObject) -> Unit = { _, _ -> }
+        onFileIoObserved: (roundIndex: Int, stats: JSONObject) -> Unit = { _, _ -> },
+        executeToolWithId: ((id: String, name: String, arguments: JSONObject) -> String)? = null,
+        streamState: OpenRouterStreamState = OpenRouterStreamState(),
+        onStreamCheckpoint: (OpenRouterStreamSnapshot) -> Unit = {}
     ): OpenRouterCompletionResult {
         // Resolve once before HTTP and all tool rounds; Activity already resolves auto.
         val requestEffort = OpenRouterReasoningPolicy.requestEffort(model, reasoningEffort)
         val history = JsonProtocol.arrayCopy(messages)
+        // Validate direct callers as well as ContextSnapshot before any paid POST.
+        OpenRouterProtocolCodec.completePendingToolCalls(history)
         val inputCount = history.length()
         val binding = OpenRouterProtocolCodec.binding(model, tools, apiKey, responseFormat, claudeRoute)
         val sourceInputHash = OpenRouterProtocolCodec.fingerprint(history)
@@ -125,14 +131,16 @@ class OpenRouterChatClient(
             }
         }
         val toolNames = mutableListOf<String>()
+        val toolStates = JSONObject()
         val accumulatedText = mutableListOf<String>()
         val roundUsages = mutableListOf<JSONObject?>()
         var responseModel: String? = null
         var accumulatedTotalTokens = 0L
+        var currentRoundTokens = 0L
         var nextRoundIndex = 0
         var roundsCompleted = 0
         var previousFileIoSnapshot: FileBackedIoTelemetry.Snapshot? = null
-        val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(COMPLETE_TIME_LIMIT_MS)
+        val deadlineNanos = monotonicNanos() + TimeUnit.MILLISECONDS.toNanos(COMPLETE_TIME_LIMIT_MS)
 
         fun snapshotAccumulatedUsage(): JSONObject? = OpenRouterUsageAccumulator.aggregate(roundUsages)
 
@@ -156,26 +164,37 @@ class OpenRouterChatClient(
 
         fun ensureWithinBudget() {
             ensureActive()
-            if (System.nanoTime() >= deadlineNanos) {
+            if (monotonicNanos() >= deadlineNanos) {
                 throw budgetException("Лимит времени OpenRouter complete() (5 часов) исчерпан.")
             }
-            if (accumulatedTotalTokens >= MAX_ACCUMULATED_TOTAL_TOKENS) {
+            if (accumulatedTotalTokens >= MAX_ACCUMULATED_TOTAL_TOKENS ||
+                currentRoundTokens >= MAX_ACCUMULATED_TOTAL_TOKENS - accumulatedTotalTokens) {
                 throw budgetException("Аварийный бюджет одного ответа OpenRouter (5 млн usage-токенов) исчерпан. Он суммирует вход каждого раунда, включая повторную историю и кэш, и выход с мышлением; история чата сохранена.")
             }
         }
 
-        fun emitProtocolCheckpoint() {
+        fun protocolCheckpoint(interruptedAssistant: JSONObject? = null): JSONObject {
             val checkpointTail = JSONArray()
             for (i in inputCount until history.length()) checkpointTail.put(JsonProtocol.copy(history.get(i)))
-            OpenRouterProtocolCodec.completePendingToolCalls(checkpointTail)
-            onProtocolCheckpoint(
-                JSONObject().put("version", 1).put("input_sha256", sourceInputHash)
+            return JSONObject().put("version", 1).put("input_sha256", sourceInputHash)
                     .put("wire_input_sha256", inputHash).put("binding_sha256", binding).put("tail", checkpointTail)
-            )
+                    .put("tool_states", JsonProtocol.objectCopy(toolStates))
+                    .apply { interruptedAssistant?.let { put("interrupted_assistant", it) } }
+        }
+
+        fun emitProtocolCheckpoint(interruptedAssistant: JSONObject? = null) {
+            val checkpoint = protocolCheckpoint(interruptedAssistant)
+            val text = (accumulatedText + listOfNotNull(interruptedAssistant?.let { JsonProtocol.text(it, "content") }))
+                .filter { it.isNotEmpty() }.joinToString("\n\n")
+            synchronized(streamState.lock) {
+                streamState.bind { OpenRouterStreamSnapshot(text, JsonProtocol.objectCopy(checkpoint)) }
+                onProtocolCheckpoint(checkpoint)
+            }
         }
 
         fun requestMessage(toolChoice: String): Pair<JSONObject, JSONObject> {
             ensureWithinBudget()
+            OpenRouterProtocolCodec.completePendingToolCalls(history)
             val body = JSONObject()
                 .put("model", model)
                 .put("messages", history)
@@ -244,7 +263,7 @@ class OpenRouterChatClient(
             }
             onCallCreated(call)
             ensureActive()
-            val remainingMillis = TimeUnit.NANOSECONDS.toMillis((deadlineNanos - System.nanoTime()).coerceAtLeast(0L))
+            val remainingMillis = TimeUnit.NANOSECONDS.toMillis((deadlineNanos - monotonicNanos()).coerceAtLeast(0L))
             if (remainingMillis <= 0L) {
                 call.cancel()
                 throw budgetException("Лимит времени OpenRouter complete() (5 часов) исчерпан.")
@@ -264,10 +283,9 @@ class OpenRouterChatClient(
                 val observed = roundUsage?.let(JsonProtocol::objectCopy)
                 roundReportedCost?.let { observed?.put("cost", it) }
                 roundUsages += observed
-                roundUsage?.let { u ->
-                    accumulatedTotalTokens += u.optLong("total_tokens", 0L).takeIf { it > 0L }
-                        ?: (u.optLong("prompt_tokens", 0L).coerceAtLeast(0L) + u.optLong("completion_tokens", 0L).coerceAtLeast(0L))
-                }
+                accumulatedTotalTokens = if (Long.MAX_VALUE - accumulatedTotalTokens < currentRoundTokens) Long.MAX_VALUE
+                    else accumulatedTotalTokens + currentRoundTokens
+                currentRoundTokens = 0L
             }
             var generationId: String? = null
             val contentParts = StringBuilder()
@@ -275,10 +293,46 @@ class OpenRouterChatClient(
             var emittedTextLength = 0
             val reasoningDetails = ReasoningDetailAccumulator()
             val toolCallsByIndex = sortedMapOf<Int, OpenRouterStreamToolCall>()
+            // Freeze the completed prefix once. The lazy source copies the current
+            // round only on a bounded checkpoint or Stop, not on every delta.
+            val roundPrefix = protocolCheckpoint()
+            val priorText = accumulatedText.toList()
+            var lastDurableNanos: Long? = null
+            var lastDurableCharacters = 0L
+            var streamRevision = 0L
+            var lastDurableRevision = -1L
+            fun changedStream() {
+                streamRevision++
+                streamState.changed()
+            }
+            streamState.bind {
+                val interrupted = JSONObject().put("role", "assistant").put("content", contentParts.toString())
+                    .put("reasoning_details", reasoningDetails.array())
+                    .put("reasoning_delta_fragments", reasoningDetails.receivedFragments()).put("replay_safe", false)
+                if (toolCallsByIndex.isNotEmpty()) interrupted.put("tool_calls", JSONArray().apply {
+                    toolCallsByIndex.values.forEach { call -> put(JSONObject().put("id", call.id).put("type", call.type)
+                        .put("function", JSONObject().put("name", call.name).put("arguments", call.arguments.toString()))) }
+                })
+                OpenRouterStreamSnapshot((priorText + contentParts.toString()).filter { it.isNotEmpty() }.joinToString("\n\n"),
+                    JsonProtocol.objectCopy(roundPrefix).put("interrupted_assistant", interrupted))
+            }
+            fun checkpointStream(force: Boolean = false) {
+                if (lastDurableRevision == streamRevision) return
+                val now = monotonicNanos()
+                val characters = contentParts.length + reasoningDetails.receivedCharacterCount
+                val last = lastDurableNanos
+                if (!force && last != null && now - last < 500_000_000L && characters - lastDurableCharacters < 65_536) return
+                // A trailing writer may already have saved this revision. Empty
+                // SSE/usage/finish frames do not change the durable stream payload.
+                streamState.dirtySnapshot()?.let(onStreamCheckpoint)
+                lastDurableNanos = now
+                lastDurableCharacters = characters
+                lastDurableRevision = streamRevision
+            }
 
             fun emitTextSnapshot(force: Boolean = false) {
                 if (contentParts.length == emittedTextLength) return
-                val now = System.nanoTime()
+                val now = monotonicNanos()
                 if (!force && lastTextSnapshot != 0L && now - lastTextSnapshot < 75_000_000L) return
                 lastTextSnapshot = now; emittedTextLength = contentParts.length
                 onTextDelta((accumulatedText + contentParts.toString()).filter { it.isNotEmpty() }.joinToString("\n\n"))
@@ -312,6 +366,10 @@ class OpenRouterChatClient(
                     // charge disappeared. Match observeOpenRouterRound's durable contract.
                     OpenRouterUsageSnapshot.from(usage).reportedCostUsd?.let { roundReportedCost = it }
                     onRoundObserved(roundIndex, generationId, roundUsage)
+                    val input = (roundUsage?.optLong("prompt_tokens", 0L) ?: 0L).coerceAtLeast(0L)
+                    val output = (roundUsage?.optLong("completion_tokens", 0L) ?: 0L).coerceAtLeast(0L)
+                    currentRoundTokens = (roundUsage?.optLong("total_tokens", 0L) ?: 0L).takeIf { it > 0L }
+                        ?: if (Long.MAX_VALUE - input < output) Long.MAX_VALUE else input + output
                 }
                 val choices = json.optJSONArray("choices")
                 if (choices == null || choices.length() == 0) return
@@ -325,29 +383,43 @@ class OpenRouterChatClient(
                 }
                 JsonProtocol.text(delta, "content")?.takeIf { it.isNotEmpty() }?.let { chunk ->
                     contentParts.append(chunk)
+                    changedStream()
                     emitTextSnapshot()
                 }
 
-                delta.optJSONArray("reasoning_details")?.let(reasoningDetails::accept)
+                delta.optJSONArray("reasoning_details")?.let { details ->
+                    val before = reasoningDetails.receivedCharacterCount
+                    try { reasoningDetails.accept(details) } finally {
+                        // Invalid identity fragments are still local evidence.
+                        if (reasoningDetails.receivedCharacterCount != before) changedStream()
+                    }
+                }
 
                 delta.optJSONArray("tool_calls")?.let { calls ->
                     for (i in 0 until calls.length()) {
                         val call = calls.optJSONObject(i) ?: continue
                         val index = call.optInt("index", i)
-                        val target = toolCallsByIndex.getOrPut(index) { OpenRouterStreamToolCall() }
+                        val target = toolCallsByIndex.getOrPut(index) {
+                            changedStream()
+                            OpenRouterStreamToolCall()
+                        }
                         JsonProtocol.nonBlank(call, "id")?.let { incomingId ->
                             if (target.id.isNotEmpty() && target.id != incomingId) {
                                 throw IOException("Conflicting streamed tool call id at index $index")
                             }
-                            target.id = incomingId
+                            if (target.id != incomingId) { target.id = incomingId; changedStream() }
                         }
-                        JsonProtocol.nonBlank(call, "type")?.let { target.type = it }
+                        JsonProtocol.nonBlank(call, "type")?.let {
+                            if (target.type != it) { target.type = it; changedStream() }
+                        }
                         call.optJSONObject("function")?.let { function ->
                             JsonProtocol.nonBlank(function, "name")?.let { incomingName ->
-                                if (target.name.isEmpty()) target.name = incomingName
-                                else if (incomingName != target.name) target.name += incomingName
+                                if (target.name.isEmpty()) { target.name = incomingName; changedStream() }
+                                else if (incomingName != target.name) { target.name += incomingName; changedStream() }
                             }
-                            JsonProtocol.text(function, "arguments")?.takeIf { it.isNotEmpty() }?.let { target.arguments.append(it) }
+                            JsonProtocol.text(function, "arguments")?.takeIf { it.isNotEmpty() }?.let {
+                                target.arguments.append(it); changedStream()
+                            }
                         }
                     }
                 }
@@ -373,15 +445,35 @@ class OpenRouterChatClient(
                     val bodyResponse = httpResponse.body ?: throw IOException("OpenRouter response has no body")
                     BoundedResponseDecoder.openSse(bodyResponse.byteStream(), sseLimits).use { reader ->
                         BoundedResponseDecoder.readSse(reader, sseLimits, onLine = { ensureWithinBudget() }) { event ->
-                            consume(event.data)
-                            sawDone
+                            synchronized(streamState.lock) {
+                                ensureActive()
+                                consume(event.data)
+                                checkpointStream()
+                                // Preserve every field received in this event before applying
+                                // the emergency usage limit, including a final co-located delta.
+                                ensureWithinBudget()
+                                sawDone
+                            }
                         }
                     }
                     if (!sawDone) throw IOException("OpenRouter SSE ended before [DONE]")
                 }
             } catch (e: Exception) {
-                emitTextSnapshot(force = true)
+                synchronized(streamState.lock) {
+                    emitTextSnapshot(force = true)
+                    try { checkpointStream(force = true) } catch (saveFailure: Exception) { e.addSuppressed(saveFailure) }
+                }
                 commitRoundUsage()
+                val receivedReasoning = reasoningDetails.receivedFragments()
+                if (receivedReasoning.length() > 0) {
+                    // Keep the original fragments for local recovery, outside the replay tail.
+                    // An ambiguous/incomplete signed turn must never be guessed into a new POST.
+                    try { emitProtocolCheckpoint(JSONObject().put("role", "assistant")
+                        .put("content", contentParts.toString())
+                        .put("reasoning_details", reasoningDetails.array())
+                        .put("reasoning_delta_fragments", receivedReasoning).put("replay_safe", false))
+                    } catch (saveFailure: Exception) { e.addSuppressed(saveFailure) }
+                }
                 if (e is CancellationException) throw e
                 if (e is OpenRouterCompletionException) {
                     val partial = buildList {
@@ -415,7 +507,10 @@ class OpenRouterChatClient(
                 }
             }
 
-            emitTextSnapshot(force = true)
+            synchronized(streamState.lock) {
+                emitTextSnapshot(force = true)
+                checkpointStream(force = true)
+            }
             ensureActive()
             commitRoundUsage()
             roundsCompleted++
@@ -497,8 +592,11 @@ class OpenRouterChatClient(
                         finishReason = finishReason,
                         protocol = JSONObject().put("version", 1).put("input_sha256", sourceInputHash)
                             .put("wire_input_sha256", inputHash)
-                            .put("binding_sha256", binding).put("tail", tail).apply {
-                                if (finishReason != "stop") put("interrupted_assistant", JsonProtocol.objectCopy(message))
+                            .put("binding_sha256", binding).put("tail", tail)
+                            .put("tool_states", JsonProtocol.objectCopy(toolStates)).apply {
+                                if (finishReason != "stop") put("interrupted_assistant",
+                                    streamState.snapshot()?.protocol?.optJSONObject("interrupted_assistant")
+                                        ?: JsonProtocol.objectCopy(message).put("replay_safe", false))
                             },
                         fileIoTelemetry = currentFileIoJson(), roundsCompleted = roundsCompleted
                     )
@@ -525,20 +623,36 @@ class OpenRouterChatClient(
                     validatedCalls.add(Triple(id, name, arguments))
                 }
                 JsonProtocol.string(message, "content").trim().takeIf { it.isNotBlank() }?.let { accumulatedText += it }
+                for ((id, name, arguments) in validatedCalls) {
+                    if (toolStates.has(id)) throw IOException("Reused provider tool call id: $id")
+                    toolStates.put(id, JSONObject().put("state", "not_started").put("tool_name", name)
+                        .put("arguments_sha256", StreamingJsonRequestBody.sha256(arguments)))
+                }
                 history.put(JSONObject(message.toString()))
                 emitProtocolCheckpoint()
                 for ((id, name, arguments) in validatedCalls) {
                     ensureWithinBudget()
                     toolNames += name
                     ensureActive()
-                    val toolResult = executeTool(name, arguments)
+                    toolStates.getJSONObject(id).put("state", "in_flight")
+                    // A failed durable acknowledgement aborts before the side effect.
+                    emitProtocolCheckpoint()
+                    ensureActive()
+                    val toolResult = try {
+                        executeToolWithId?.invoke(id, name, arguments) ?: executeTool(name, arguments)
+                    } catch (failure: Exception) {
+                        toolStates.getJSONObject(id).put("state", "outcome_unknown")
+                        try { emitProtocolCheckpoint() } catch (saveFailure: Exception) { failure.addSuppressed(saveFailure) }
+                        throw failure
+                    }
                     history.put(
                         JSONObject()
                             .put("role", "tool")
                             .put("tool_call_id", id)
                             .put("content", toolResult)
                     )
-                    // Persist durable checkpoint immediately after each completed tool side effect.
+                    toolStates.getJSONObject(id).put("state", "completed")
+                    // Persist exact output and completed state together before another POST.
                     emitProtocolCheckpoint()
                     ensureWithinBudget()
                 }

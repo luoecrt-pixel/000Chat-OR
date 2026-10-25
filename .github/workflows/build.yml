@@ -135,13 +135,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           disable-linux-hw-accel: false
-          script: |
-            gradle --no-daemon --stacktrace connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.example.openaichat.OpenAiRequestSnapshotAndUploadTest
-            cp -a app/build/reports/androidTests/connected app/build/reports/androidTests/openai-snapshot-isolated
-            cp -a app/build/outputs/androidTest-results/connected app/build/outputs/androidTest-results/openai-snapshot-isolated
-            rm -rf app/build/reports/androidTests/connected app/build/outputs/androidTest-results/connected
-            gradle --no-daemon --stacktrace connectedDebugAndroidTest
-            python3 tools/test_android_process_recovery.py
+          script: python3 tools/test_android_process_recovery.py --instrumentation-first
 
       - name: Upload process recovery evidence
         if: always()
@@ -158,8 +152,6 @@ jobs:
         with:
           name: android-instrumentation-evidence
           path: |
-            app/build/reports/androidTests/openai-snapshot-isolated/
-            app/build/outputs/androidTest-results/openai-snapshot-isolated/
             app/build/reports/androidTests/connected/
             app/build/outputs/androidTest-results/connected/
           if-no-files-found: ignore

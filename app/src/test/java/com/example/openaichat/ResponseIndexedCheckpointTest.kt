@@ -101,7 +101,7 @@ class ResponseIndexedCheckpointTest {
         assertEquals(ResponseTerminalState.COMPLETED, terminalRestored.terminalState)
         assertEquals("resp", terminalRestored.terminalResponse?.getString("id"))
         assertEquals("AUTHORITATIVE",
-            OpenAiSseStreamReader.terminalOutputText(terminalRestored.terminalResponse))
+            LegacyOpenAiCheckpoint.terminalOutputText(terminalRestored.terminalResponse))
     }
 
     @Test fun oldFlatCheckpointCanAppendUnindexedButMustRejectIndexedCorrection() {
@@ -257,18 +257,15 @@ class ResponseIndexedCheckpointTest {
                 .put("text", state.text).put("status", state.terminalState!!.wireStatus)
                 .put("indexed_checkpoint", ResponseIndexedCheckpoint.serialize(state)))
             val effective = OpenAiEffectiveResponse.assemble(reopened.terminalResponse, reopened)
-            val canonical = OpenAiSseStreamReader.terminalOutputText(effective)
+            val canonical = LegacyOpenAiCheckpoint.terminalOutputText(effective)
             assertEquals("Received textReceived refusal", canonical)
             val model = AstraResponseModel.fromResponse(effective, canonical)
             assertEquals("https://example.test/paid", model.annotations.getJSONObject(0).getString("url"))
             val assistant = model.toChatJson().put("provider", "openai")
                 .put("openai_protocol_output", effective.getJSONArray("output"))
-            val replay = OpenAiLocalContextEncoder.encode(listOf(assistant))
-            assertEquals(type, message.toString(), replay.getJSONObject(0).toString())
-            if (replay.length() > 1) {
-                assertFalse(replay.getJSONObject(1).getString("content").contains("Received text"))
-                assertFalse(replay.getJSONObject(1).getString("content").contains("Received refusal"))
-            }
+            val storedOutput = assistant.getJSONArray("openai_protocol_output")
+            assertEquals(type, message.toString(), storedOutput.getJSONObject(0).toString())
+
         }
     }
 
@@ -301,15 +298,12 @@ class ResponseIndexedCheckpointTest {
             .put("incomplete", true).put("text", restored.text)
             .put("response_id", "resp_interrupted")
             .put("openai_protocol_output", output)
-        val next = JSONObject().put("role", "user").put("text", "Follow up")
-        val replay = OpenAiLocalContextEncoder.encode(listOf(incomplete, next))
-        assertEquals("reasoning", replay.getJSONObject(0).getString("type"))
-        assertEquals("opaque-signed-blob", replay.getJSONObject(0)
-            .getString("encrypted_content"))
-        assertEquals("t_real", replay.getJSONObject(1).getString("id"))
-        assertEquals("web_search_call", replay.getJSONObject(1).getString("type"))
-        assertTrue(replay.getJSONObject(2).toString().contains("Visible partial"))
-        assertEquals(4, replay.length())
+        val stored = incomplete.getJSONArray("openai_protocol_output")
+        assertEquals("reasoning", stored.getJSONObject(0).getString("type"))
+        assertEquals("opaque-signed-blob", stored.getJSONObject(0).getString("encrypted_content"))
+        assertEquals("t_real", stored.getJSONObject(1).getString("id"))
+        assertEquals("web_search_call", stored.getJSONObject(1).getString("type"))
+        assertEquals("Visible partial", incomplete.getString("text"))
         assertFalse(incomplete.has("usage"))
         assertEquals(2, output.length())
     }

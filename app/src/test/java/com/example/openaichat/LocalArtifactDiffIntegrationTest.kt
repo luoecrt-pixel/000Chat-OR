@@ -40,9 +40,6 @@ class LocalArtifactDiffIntegrationTest {
         val prefs = context.getSharedPreferences("app", Context.MODE_PRIVATE)
         prefs.edit().clear().putBoolean("response_notifications", false).commit()
         context.deleteDatabase("astra_chats.db")
-        try { androidx.work.WorkManager.getInstance(context) } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         val controller = Robolectric.buildActivity(MainActivity::class.java).create()
         val activity = controller.get()
         val executor = LocalArtifactToolExecutor(context)

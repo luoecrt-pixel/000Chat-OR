@@ -7,6 +7,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ChatMessageFingerprintTest {
+    @Test fun legacyV1FingerprintIsStableForOpenRouterMessages() {
+        val message = JSONObject().put("role", "assistant").put("text", "hello").put("provider", "openrouter")
+        assertEquals("f161e32fc417c9264d6a177c8246e2c8d6bb7b23c5eda841f9cbe0b285621801",
+            ChatMessageFingerprint.of(message))
+    }
+
     @Test
     fun samePersistedContentHasSameFingerprint() {
         val a = JSONObject()

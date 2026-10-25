@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "OpenAIApiChat"
+rootProject.name = "IntegralLLMOpenRouter"
 include(":app")

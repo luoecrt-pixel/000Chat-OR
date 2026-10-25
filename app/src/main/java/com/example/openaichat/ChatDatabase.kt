@@ -558,16 +558,6 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     /** Recovery needs only this small binding, never another copy of the full history. */
-    fun getOpenAiRequestFingerprint(chatId: String, requestId: String): String? {
-        if (chatId.isBlank() || requestId.isBlank()) return null
-        readableDatabase.query(MESSAGE_TABLE, arrayOf(OpenAiInstructionChainPolicy.FINGERPRINT_FIELD),
-            "chat_id=? AND request_id=? AND role='user' AND provider='openai' " +
-                "AND length(openai_instructions_sha256)=132",
-            arrayOf(chatId, requestId), null, null, "position ASC", "1").use { cursor ->
-            return if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    }
-
     fun listChats(): List<JSONObject> {
         val out = mutableListOf<JSONObject>()
         SqliteLargeTextQuery.query(readableDatabase, CHAT_TABLE, null, null, null, null, null, "updated_at DESC, id DESC").use { c ->
@@ -684,6 +674,11 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     fun deleteChat(id: String) {
         writableDatabase.transaction { db ->
+            // Intents outlive the FK-owned chat rows so a late publisher cannot
+            // adopt an old operation after Delete (including recreation of this ID).
+            db.update("local_artifact_intents", ContentValues().apply {
+                put("tombstoned", 1); put("updated_at", System.currentTimeMillis())
+            }, "chat_id=?", arrayOf(id))
             db.delete(MESSAGE_TABLE, "chat_id=?", arrayOf(id))
             db.delete(METRICS_TABLE, "chat_id=?", arrayOf(id))
             // request_events and request_accounting are removed by FK CASCADE.
@@ -815,7 +810,8 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         baselineEffort: String?,
         messages: List<JSONObject>,
         expectedRequestId: String,
-        unrecoverableIndexedCheckpoint: String? = null
+        unrecoverableIndexedCheckpoint: String? = null,
+        expectedProvider: String? = null
     ): Boolean {
         // Reject a single terminal assistant with a foreign/missing local request_id.
         // Otherwise a provider HTTP request ID can consume the active claim while
@@ -823,7 +819,7 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         // contain other requests, or be empty during an explicit failure claim.
         if (messages.size == 1 && JsonProtocol.string(messages[0], "role") == "assistant" &&
             JsonProtocol.string(messages[0], "request_id") != expectedRequestId) return false
-        return completeActiveRequestOnce(id, expectedRequestId) { db ->
+        return completeActiveRequestOnce(id, expectedRequestId, expectedProvider = expectedProvider) { db ->
         val provided = messages.lastOrNull { it.optString("role") == "assistant" && it.optString("request_id") == expectedRequestId }
         val assistant = recoverAssistantInDb(db, id, expectedRequestId, provided,
             provided?.optString("status") ?: "failed", unrecoverableIndexedCheckpoint)
@@ -842,6 +838,100 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             }, "id=?", arrayOf(id))
         }
         }
+    }
+
+    /**
+     * Retire an imported direct-OpenAI owner using only bytes already on this device.
+     * The raw legacy snapshots and any existing assistant are archived before the
+     * same CAS transaction releases their cursors. No transport or tools execute.
+     */
+    fun recoverLegacyOpenAiRequestLocally(chatId: String, expectedRequestId: String): Boolean =
+        completeActiveRequestOnce(chatId, expectedRequestId, expectedProvider = "openai") { db ->
+            val active = SqliteLargeTextQuery.query(db, CHAT_TABLE,
+                arrayOf("active_response_id", "active_text", "active_indexed_checkpoint", "active_last_sequence_number", "active_status"),
+                "id=? AND active_request_id=?", arrayOf(chatId, expectedRequestId), null, null, null, "1").use { c ->
+                check(c.moveToFirst()) { "Legacy owner disappeared inside terminal transaction" }
+                JSONObject().apply {
+                    c.getString(0)?.let { put("response_id", it) }
+                    put("text", c.getString(1) ?: "")
+                    c.getString(2)?.let { put("indexed_checkpoint", it) }
+                    put("last_sequence_number", c.getLong(3))
+                    c.getString(4)?.let { put("status", it) }
+                }
+            }
+            val rawCheckpoint = SqliteLargeTextQuery.query(db, "openai_tool_checkpoints", arrayOf("request_checkpoint"),
+                "chat_id=? AND request_id=?", arrayOf(chatId, expectedRequestId), null, null, null, "1",
+                arrayOf("chat_id", "request_id")).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            var existingRawColumns: JSONObject? = null
+            val existing = SqliteLargeTextQuery.query(db, MESSAGE_TABLE, null,
+                "chat_id=? AND request_id=? AND role='assistant'", arrayOf(chatId, expectedRequestId),
+                null, null, "position DESC", "1").use { c ->
+                if (!c.moveToFirst()) null else {
+                    existingRawColumns = JSONObject().apply {
+                        for (i in 0 until c.columnCount) put(c.getColumnName(i), when (c.getType(i)) {
+                            android.database.Cursor.FIELD_TYPE_NULL -> JSONObject.NULL
+                            android.database.Cursor.FIELD_TYPE_INTEGER -> c.getLong(i)
+                            android.database.Cursor.FIELD_TYPE_FLOAT -> c.getDouble(i)
+                            else -> c.getString(i)
+                        })
+                    }
+                    messageFromCursor(c, chatId)
+                }
+            }
+            val message = try {
+                recoverAssistantInDb(db, chatId, expectedRequestId, null, "incomplete")
+            } catch (_: UnrecoverableResponsesCheckpointException) {
+                // Keep the exact damaged source in the archive below; never guess its decoded output.
+                null
+            } catch (_: org.json.JSONException) {
+                // Malformed legacy checkpoint JSON is preserved verbatim, without blocking retirement.
+                null
+            } ?: JSONObject().put("role", "assistant").put("request_id", expectedRequestId)
+                .put("provider", "openai").put("text", JsonProtocol.string(active, "text"))
+            existing?.keys()?.forEach { key ->
+                if (!message.has(key) || message.isNull(key) ||
+                    key == "text" && JsonProtocol.string(message, "text").isBlank())
+                    message.put(key, JsonProtocol.copy(existing.opt(key)))
+            }
+            // A readable summary can arrive before a completed typed reasoning item.
+            val state = try { ResponseIndexedCheckpoint.restore(active) }
+                catch (_: UnrecoverableResponsesCheckpointException) { null }
+            if (JsonProtocol.nonBlank(message, "reasoning_summary") == null)
+                state?.reasoningSummary?.takeIf { it.isNotBlank() }?.let { message.put("reasoning_summary", it) }
+            val checkpoint = rawCheckpoint?.let { raw -> try { JSONObject(raw) } catch (_: org.json.JSONException) { null } }
+            val knownStatus = if (rawCheckpoint != null && checkpoint == null) null
+                else LegacyOpenAiCheckpoint.knownTerminalStatus(checkpoint, state)
+            val status = knownStatus ?: "incomplete"
+            message.put("role", "assistant").put("provider", "openai").put("request_id", expectedRequestId)
+                .put("status", status).put("incomplete", status != "completed")
+            if (knownStatus == null)
+                message.put("error", "Прямой OpenAI API отключён; сохранены только локальные данные ответа")
+            else state?.completionError?.takeIf { it.isNotBlank() }?.let { message.put("error", it) }
+            LegacyOpenAiCheckpoint.attachRawSourceToMessage(message, appContext.filesDir, chatId, expectedRequestId)
+            val archive = JsonProtocol.objectCopy(message).put("legacy_active_snapshot", active)
+            rawCheckpoint?.let { archive.put("legacy_tool_checkpoint_raw", it) }
+            existing?.let { archive.put("legacy_stored_message", it) }
+            existingRawColumns?.let { archive.put("legacy_stored_message_columns", it) }
+            persistTerminalAssistantInDb(db, chatId, expectedRequestId, archive, archive = true)
+            persistTerminalAssistantInDb(db, chatId, expectedRequestId, message)
+            db.update(CHAT_TABLE, ContentValues().apply { putNull("response_id") }, "id=?", arrayOf(chatId))
+        }
+
+    /** Resolve only captured ownership evidence; conflicting/unknown providers fail closed. */
+    private fun capturedRequestProviderInDb(db: SQLiteDatabase, chatId: String, requestId: String): String? {
+        val providers = linkedSetOf<String>()
+        for ((table, requestColumn) in listOf(REQUEST_ACCOUNTING_TABLE to "local_request_id", MESSAGE_TABLE to "request_id")) {
+            db.query(table, arrayOf("provider"), "chat_id=? AND $requestColumn=?", arrayOf(chatId, requestId),
+                null, null, null).use { c -> while (c.moveToNext())
+                c.getString(0)?.takeIf { it.isNotBlank() }?.let(providers::add) }
+        }
+        if (db.rawQuery("SELECT 1 FROM openai_tool_checkpoints WHERE chat_id=? AND request_id=? LIMIT 1",
+                arrayOf(chatId, requestId)).use { it.moveToFirst() } ||
+            db.rawQuery("SELECT 1 FROM $CHAT_TABLE WHERE id=? AND active_request_id=? AND active_indexed_checkpoint IS NOT NULL LIMIT 1",
+                arrayOf(chatId, requestId)).use { it.moveToFirst() }) providers.add("openai")
+        if (db.rawQuery("SELECT 1 FROM openrouter_checkpoints WHERE chat_id=? AND request_id=? LIMIT 1",
+                arrayOf(chatId, requestId)).use { it.moveToFirst() }) providers.add("openrouter")
+        return providers.singleOrNull()?.takeIf { it in setOf("openai", "openrouter") }
     }
 
     /** Fatal recovery with no new messages still consumes its one-shot claim. */
@@ -948,7 +1038,7 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 c.getString(4)?.let { put("status", it) }
             }
         }
-        var durable = OpenAiLocalFileToolBridge.durableResponse(oa)
+        var durable = LegacyOpenAiCheckpoint.durableResponse(oa)
         var unrecoverableIndexedState: JSONObject? = null
         if (!router && JsonProtocol.nonBlank(active, "indexed_checkpoint") != null) {
             val state = try {
@@ -990,10 +1080,10 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             .put("text", JsonProtocol.string(active, "text"))
         val output = durable?.optJSONArray("output")
         if (output != null && (oa?.optString("phase") == "finished" || !message.has("openai_protocol_output"))) {
-            message.put("openai_protocol_output", OpenAiLocalFileToolBridge.completePendingOutputs(output))
+            message.put("openai_protocol_output", LegacyOpenAiCheckpoint.completePendingOutputs(output))
         }
         if (durable != null) {
-            val fallbackText = OpenAiSseStreamReader.terminalOutputText(durable)
+            val fallbackText = LegacyOpenAiCheckpoint.terminalOutputText(durable)
             val model = AstraResponseModel.fromResponse(durable, fallbackText, requestId, terminalStatus)
             val restored = model.toChatJson()
             for (key in listOf("response_id", "response_model", "reasoning_summary", "annotations", "tools")) {
@@ -1033,7 +1123,7 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             val combined = OpenAiUsageLedger.merge(existingLedger, paidLedger)
             OpenAiUsageLedger.total(combined)?.let { message.put("usage", it) }
             if (combined.length() > 0) message.put(OpenAiUsageLedger.FIELD, combined)
-            val tools = OpenAiLocalFileToolBridge.extractTelemetrySummary(oa)
+            val tools = LegacyOpenAiCheckpoint.extractTelemetrySummary(oa)
             val incoming = message.optJSONObject("telemetry_summary") ?: JSONObject()
             if (combined.length() > 0) incoming.put(OpenAiUsageLedger.FIELD, combined)
             FileBackedIoTelemetry.mergeTelemetryJson(tools?.toString(), incoming)?.let {
@@ -1111,7 +1201,8 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
      * finalizer either wins the ownership claim first or observes Stop; the
      * two cannot both persist a terminal assistant message.
      */
-    fun stopActiveRequestOnce(chatId: String, expectedRequestId: String, removeUserMessage: Boolean = false): Boolean {
+    fun stopActiveRequestOnce(chatId: String, expectedRequestId: String, removeUserMessage: Boolean = false,
+        streamSnapshot: OpenRouterStreamSnapshot? = null): Boolean {
         if (chatId.isBlank() || expectedRequestId.isBlank()) return false
         var stopped = false
         writableDatabase.transaction { db ->
@@ -1122,6 +1213,12 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             }
             if (!ActiveResponseWritePolicy.shouldCommit(active?.first, expectedRequestId)) {
                 return@transaction
+            }
+            // The runtime's SSE fence stays held through this transaction. The
+            // freshest parsed text and opaque fragments enter the winning archive
+            // before ownership/checkpoints are cleared, or the entire Stop rolls back.
+            if (streamSnapshot != null) check(checkpointOpenRouterStreamInDb(db, chatId, expectedRequestId, streamSnapshot)) {
+                "OpenRouter Stop snapshot owner mismatch"
             }
             // A tombstone also covers legacy requests with no accounting row.
             db.insertWithOnConflict(REQUEST_ACCOUNTING_TABLE, null, ContentValues().apply {
@@ -1203,7 +1300,7 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             PreparedAttachmentFiles.cleanupPending(appContext) {
                 PreparedAttachmentFiles.Owners(
                     durable = listAllLocalFilePaths().toSet() + LocalAttachmentReferences.allComposerPaths(prefs.all),
-                    active = OpenRouterResponseRuntime.localFilePaths() + listActiveOpenAiToolAttachmentPaths()
+                    active = OpenRouterResponseRuntime.localFilePaths() + listLegacyCheckpointAttachmentPaths()
                 )
             }
         } catch (_: Exception) {
@@ -1214,6 +1311,7 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     private fun completeActiveRequestOnce(
         chatId: String,
         expectedRequestId: String,
+        expectedProvider: String? = null,
         persist: (SQLiteDatabase) -> Unit
     ): Boolean {
         if (chatId.isBlank() || expectedRequestId.isBlank()) return false
@@ -1229,6 +1327,8 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             if (!ActiveResponseWritePolicy.shouldCommit(activeId, expectedRequestId)) {
                 return@transaction
             }
+            if (expectedProvider != null && capturedRequestProviderInDb(db, chatId, expectedRequestId) != expectedProvider)
+                return@transaction
             persist(db)
             sealOpenRouterRoundsInDb(db, chatId, expectedRequestId)
             val cleared = ContentValues().apply {
@@ -2150,86 +2250,6 @@ data class ExistingMessageRow(
         return changed
     }
 
-    fun updateUserFileLocalPath(
-        target: HistoricalAttachmentDownloadTarget,
-        localPath: String,
-        mimeType: String? = null,
-        sizeBytes: Long? = null
-    ): Boolean {
-        val index = target.index ?: return false
-        if (localPath.isBlank()) return false
-        var changed = false
-        writableDatabase.transaction { db ->
-            val current = historicalDownloadMessage(db, target) ?: return@transaction
-            if (!target.matches(current)) return@transaction
-            val ids = current.optJSONArray("file_ids") ?: JSONArray()
-            val sizes = current.optJSONArray("file_sizes") ?: JSONArray()
-            val paths = current.optJSONArray("file_paths") ?: JSONArray()
-            val mimes = current.optJSONArray("file_mimes") ?: JSONArray()
-            val targetLength = maxOf(index + 1, ids.length(), paths.length(), mimes.length(), sizes.length())
-            while (paths.length() < targetLength) paths.put("")
-            while (mimes.length() < targetLength) mimes.put("")
-            while (sizes.length() < targetLength) sizes.put(0L)
-            paths.put(index, localPath)
-            if (!mimeType.isNullOrBlank()) mimes.put(index, mimeType)
-            if (sizeBytes != null && sizeBytes >= 0L) sizes.put(index, sizeBytes)
-            val values = ContentValues().apply {
-                put("file_paths", paths.toString())
-                put("file_mimes", mimes.toString())
-                put("file_sizes", sizes.toString())
-                putNull("content_hash")
-            }
-            changed = db.update(MESSAGE_TABLE, values, "id=?", arrayOf(current.getLong("_db_message_id").toString())) == 1
-        }
-        return changed
-    }
-
-    fun updateUserImageLocalPath(
-        target: HistoricalAttachmentDownloadTarget,
-        localPath: String,
-        mimeType: String? = null,
-        sizeBytes: Long? = null
-    ): Boolean {
-        if (!target.image || localPath.isBlank()) return false
-        var changed = false
-        writableDatabase.transaction { db ->
-            val current = historicalDownloadMessage(db, target) ?: return@transaction
-            if (!target.matches(current)) return@transaction
-            val values = ContentValues().apply {
-                put("image_path", localPath)
-                if (!mimeType.isNullOrBlank()) put("image_mime", mimeType)
-                if (sizeBytes != null && sizeBytes >= 0L) put("image_size", sizeBytes)
-                putNull("content_hash")
-            }
-            changed = db.update(MESSAGE_TABLE, values, "id=?", arrayOf(current.getLong("_db_message_id").toString())) == 1
-        }
-        return changed
-    }
-
-
-    /** Recheck on the UI thread: a repair can commit after HTTP/SQLite, before the posted callback. */
-    fun isHistoricalAttachmentDownloadCurrent(target: HistoricalAttachmentDownloadTarget, downloadedPath: String? = null): Boolean =
-        historicalDownloadMessage(readableDatabase, target)?.let { target.matches(it, downloadedPath) } == true
-
-    private fun historicalDownloadMessage(db: SQLiteDatabase, target: HistoricalAttachmentDownloadTarget): JSONObject? {
-        val identity = if (target.messageId > 0L) "id=?" else "request_id=?"
-        val args = arrayOf(target.chatId, if (target.messageId > 0L) target.messageId.toString() else target.requestId!!)
-        return SqliteLargeTextQuery.query(db, MESSAGE_TABLE,
-            (listOf("id", "request_id") + AttachmentMessageState.columns.filter { it != "attachments" }).toTypedArray(),
-            "chat_id=? AND role='user' AND $identity", args, null, null, "position DESC", "1").use { c ->
-            if (!c.moveToFirst()) return@use null
-            JSONObject().apply {
-                put("_db_message_id", c.getLong(c.getColumnIndexOrThrow("id")))
-                c.getString(c.getColumnIndexOrThrow("request_id"))?.let { put("request_id", it) }
-                AttachmentMessageState.arrays.filter { it != "attachments" }.forEach { key ->
-                    parseArrayColumn(c.getString(c.getColumnIndexOrThrow(key)))?.let { put(key, it) }
-                }
-                AttachmentMessageState.strings.forEach { key -> c.getString(c.getColumnIndexOrThrow(key))?.let { put(key, it) } }
-                put("image_size", c.getLong(c.getColumnIndexOrThrow("image_size")))
-            }
-        }
-    }
-
     fun updateGeneratedFileState(
         chatId: String,
         fileId: String,
@@ -2620,6 +2640,17 @@ data class ExistingMessageRow(
             FOREIGN KEY(chat_id) REFERENCES $CHAT_TABLE(id) ON DELETE CASCADE
         )""")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_local_artifacts_chat_created ON local_artifacts(chat_id, created_at DESC)")
+        // Additive onOpen ensure for existing v25 installs. No FK: deletion must
+        // retain an immutable tombstone across physical publication/SQLite gaps.
+        db.execSQL("""CREATE TABLE IF NOT EXISTS local_artifact_intents (
+            chat_id TEXT NOT NULL, request_id TEXT NOT NULL, tool_call_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL, arguments_sha256 TEXT NOT NULL, plan_sha256 TEXT NOT NULL,
+            path TEXT NOT NULL, plan TEXT NOT NULL, state TEXT NOT NULL,
+            tombstoned INTEGER NOT NULL DEFAULT 0, outcome TEXT,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id, request_id, tool_call_id)
+        )""")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_local_artifact_intents_path ON local_artifact_intents(path)")
     }
 
     fun getOpenAiToolCheckpoint(chatId: String, requestId: String): JSONObject? =
@@ -2642,43 +2673,42 @@ data class ExistingMessageRow(
         return saved
     }
 
-    fun compareOpenAiToolCheckpoint(chatId: String, requestId: String, before: String, after: JSONObject): Boolean {
-        var changed = false
-        writableDatabase.transaction { db ->
-            if (!isActiveRequest(chatId, requestId)) return@transaction
-            changed = db.update("openai_tool_checkpoints", ContentValues().apply {
-                put("request_checkpoint", after.toString())
-            }, "chat_id=? AND request_id=? AND request_checkpoint=?", arrayOf(chatId, requestId, before)) == 1
-        }
-        return changed
+    /** Text and opaque stream fragments are one owner-aware durable snapshot. */
+    fun checkpointOpenRouterStream(chatId: String, requestId: String, snapshot: OpenRouterStreamSnapshot): Boolean {
+        var saved = false
+        writableDatabase.transaction { db -> saved = checkpointOpenRouterStreamInDb(db, chatId, requestId, snapshot) }
+        return saved
     }
 
-    /** A tool round has its own response identity and SSE cursor; only its current owner may advance it. */
-    fun advanceOpenAiToolResponse(chatId: String, requestId: String, previousId: String,
-        nextId: String, checkpoint: JSONObject): Boolean {
-        var advanced = false
-        writableDatabase.transaction { db ->
-            val count = db.update(CHAT_TABLE, ContentValues().apply {
-                put("active_response_id", nextId); put("active_status", "in_progress")
-                put("active_text", ""); put("active_last_sequence_number", -1)
-                putNull("active_indexed_checkpoint")
-            }, "id=? AND active_request_id=? AND active_response_id=? AND active_status IN ('completed','in_progress','starting','queued')",
-                arrayOf(chatId, requestId, previousId))
-            if (count != 1) return@transaction
-            check(saveOpenAiToolCheckpoint(chatId, requestId, checkpoint))
-            advanced = true
-        }
-        return advanced
+    private fun checkpointOpenRouterStreamInDb(db: SQLiteDatabase, chatId: String, requestId: String,
+        snapshot: OpenRouterStreamSnapshot): Boolean {
+        val sequence = db.rawQuery("""SELECT active_last_sequence_number FROM $CHAT_TABLE
+            WHERE id=? AND active_request_id=? AND active_status IN ('starting','in_progress')
+            AND active_response_id IS NULL AND active_indexed_checkpoint IS NULL
+            AND EXISTS (SELECT 1 FROM $REQUEST_ACCOUNTING_TABLE a WHERE a.chat_id=$CHAT_TABLE.id
+                AND a.local_request_id=$CHAT_TABLE.active_request_id AND a.provider='openrouter' AND a.local_status='running')""",
+            arrayOf(chatId, requestId)).use { c -> if (c.moveToFirst()) c.getLong(0) + 1L else null } ?: return false
+        check(db.update(CHAT_TABLE, ContentValues().apply {
+            put("active_text", snapshot.text); put("active_status", "in_progress")
+            put("active_last_sequence_number", sequence); put("updated_at", System.currentTimeMillis())
+        }, "id=? AND active_request_id=?", arrayOf(chatId, requestId)) == 1)
+        check(db.insertWithOnConflict("openrouter_checkpoints", null, ContentValues().apply {
+            put("chat_id", chatId); put("request_id", requestId); put("protocol", snapshot.protocol.toString())
+        }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "OpenRouter stream checkpoint was not persisted" }
+        return true
     }
 
-    fun saveOpenRouterCheckpoint(chatId: String, requestId: String, protocol: JSONObject) {
+    fun saveOpenRouterCheckpoint(chatId: String, requestId: String, protocol: JSONObject): Boolean {
+        var saved = false
         writableDatabase.transaction { db ->
             val active = db.query(CHAT_TABLE, arrayOf("active_request_id"), "id=?", arrayOf(chatId), null, null, null).use { c -> if (c.moveToFirst()) c.getString(0) else null }
             if (active != requestId) return@transaction
-            db.insertWithOnConflict("openrouter_checkpoints", null, ContentValues().apply {
+            check(db.insertWithOnConflict("openrouter_checkpoints", null, ContentValues().apply {
                 put("chat_id", chatId); put("request_id", requestId); put("protocol", protocol.toString())
-            }, SQLiteDatabase.CONFLICT_REPLACE)
+            }, SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "OpenRouter checkpoint was not persisted" }
+            saved = true
         }
+        return saved
     }
 
     private fun queueAnswerNotification(db: SQLiteDatabase, chatId: String, requestId: String, completed: Boolean) {
@@ -2901,8 +2931,415 @@ data class ExistingMessageRow(
         return committed
     }
 
+    private fun localArtifactIntentInDb(sql: SQLiteDatabase, chatId: String, requestId: String, callId: String): JSONObject? =
+        SqliteLargeTextQuery.query(sql, "local_artifact_intents", null,
+            "chat_id=? AND request_id=? AND tool_call_id=?", arrayOf(chatId, requestId, callId),
+            null, null, null, "1", arrayOf("chat_id", "request_id", "tool_call_id")).use { c ->
+            if (c.moveToFirst()) localArtifactIntentFromCursor(c) else null
+        }
+
+    private fun localArtifactIntentFromCursor(c: android.database.Cursor): JSONObject = JSONObject().apply {
+        for (key in listOf("chat_id", "request_id", "tool_call_id", "tool_name", "arguments_sha256", "plan_sha256", "path", "state"))
+            put(key, c.getString(c.getColumnIndexOrThrow(key)))
+        val rawPlan = c.getString(c.getColumnIndexOrThrow("plan"))
+        check(StreamingJsonRequestBody.sha256(rawPlan) == getString("plan_sha256")) { "Artifact intent plan changed" }
+        put("plan", JSONObject(rawPlan))
+        put("tombstoned", c.getInt(c.getColumnIndexOrThrow("tombstoned")) != 0)
+        put("created_at", c.getLong(c.getColumnIndexOrThrow("created_at")))
+        put("updated_at", c.getLong(c.getColumnIndexOrThrow("updated_at")))
+        c.getString(c.getColumnIndexOrThrow("outcome"))?.let { put("outcome", JSONObject(it)) }
+    }
+
+    fun getLocalArtifactIntent(chatId: String, requestId: String, callId: String): JSONObject? =
+        localArtifactIntentInDb(readableDatabase, chatId, requestId, callId)
+
+    fun listLocalArtifactIntents(): List<JSONObject> {
+        val records = mutableListOf<JSONObject>()
+        SqliteLargeTextQuery.query(readableDatabase, "local_artifact_intents", null, null, null, null, null,
+            "created_at", keyColumns = arrayOf("chat_id", "request_id", "tool_call_id")).use { c ->
+            while (c.moveToNext()) records += localArtifactIntentFromCursor(c)
+        }
+        return records
+    }
+
+    private fun validateLocalArtifactPlan(plan: JSONObject): JSONObject {
+        require(plan.optInt("version") == 1) { "Unsupported artifact plan" }
+        val artifact = plan.getJSONObject("artifact")
+        val publication = plan.getJSONObject("publication")
+        require(artifact.optBoolean("ok") && JsonProtocol.nonBlank(artifact, "type") == "local_file")
+        val path = artifact.getString("path")
+        val hash = publication.getString("expected_sha256")
+        require(hash.matches(Regex("[0-9a-f]{64}")) && artifact.getString("sha256") == hash)
+        require(publication.getString("target_path") == path && publication.getLong("expected_bytes") >= 0L &&
+            artifact.getLong("size_bytes") == publication.getLong("expected_bytes"))
+        val generated = java.io.File(appContext.filesDir, "generated").canonicalFile
+        require(java.io.File(path).canonicalFile.parentFile == generated) { "Artifact target is outside generated files" }
+        val manifest = artifact.getJSONObject("attachment")
+        require(manifest.getString("path") == path && manifest.getString("text_path") == path &&
+            manifest.getString("sha256") == hash && manifest.getLong("size") == publication.getLong("expected_bytes"))
+        val fileId = JsonProtocol.nonBlank(artifact, "file_id")
+        require(fileId != null && fileId == JsonProtocol.nonBlank(manifest, "id"))
+        JsonProtocol.nonBlank(publication, "diff_path")?.let { diff ->
+            require(java.io.File(diff).canonicalFile.parentFile == java.io.File(generated, "patch-diffs").canonicalFile)
+            require(JsonProtocol.nonBlank(artifact, "patch_diff_path") == diff &&
+                publication.getString("diff_sha256").matches(Regex("[0-9a-f]{64}")) && publication.has("diff_document"))
+        }
+        return artifact
+    }
+
+    /** Only the newly inserted, active OpenRouter claim authorizes physical publication. */
+    fun beginLocalArtifactIntentIfActive(chatId: String, requestId: String, callId: String,
+        toolName: String, argumentsSha256: String, plan: JSONObject): JSONObject? {
+        require(callId.isNotBlank() && toolName in setOf("create_local_text_file", "patch_local_file") &&
+            argumentsSha256.matches(Regex("[0-9a-f]{64}")))
+        val artifact = validateLocalArtifactPlan(plan)
+        val rawPlan = plan.toString()
+        val planHash = StreamingJsonRequestBody.sha256(rawPlan)
+        var record: JSONObject? = null
+        writableDatabase.transaction { sql ->
+            val existing = localArtifactIntentInDb(sql, chatId, requestId, callId)
+            if (existing != null) {
+                check(existing.getString("tool_name") == toolName && existing.getString("arguments_sha256") == argumentsSha256 &&
+                    existing.getString("plan_sha256") == planHash) { "Artifact call identity changed" }
+                record = existing.put("_inserted", false)
+                return@transaction
+            }
+            val active = sql.query(CHAT_TABLE, arrayOf("active_request_id"), "id=?", arrayOf(chatId),
+                null, null, null, "1").use { c -> c.moveToFirst() && c.getString(0) == requestId }
+            if (!active || capturedRequestProviderInDb(sql, chatId, requestId) != "openrouter") return@transaction
+            val now = System.currentTimeMillis()
+            sql.insertOrThrow("local_artifact_intents", null, ContentValues().apply {
+                put("chat_id", chatId); put("request_id", requestId); put("tool_call_id", callId)
+                put("tool_name", toolName); put("arguments_sha256", argumentsSha256); put("plan_sha256", planHash)
+                put("path", artifact.getString("path")); put("plan", rawPlan); put("state", "in_flight")
+                put("created_at", now); put("updated_at", now)
+            })
+            record = localArtifactIntentInDb(sql, chatId, requestId, callId)!!.put("_inserted", true)
+        }
+        return record
+    }
+
+    private fun checkedLocalArtifactIntent(sql: SQLiteDatabase, chatId: String, requestId: String, callId: String,
+        toolName: String, argumentsSha256: String, planSha256: String): JSONObject? {
+        val record = localArtifactIntentInDb(sql, chatId, requestId, callId) ?: return null
+        check(record.getString("tool_name") == toolName && record.getString("arguments_sha256") == argumentsSha256 &&
+            record.getString("plan_sha256") == planSha256) { "Artifact completion identity changed" }
+        return record
+    }
+
+    private fun verifiedLocalArtifactPlan(plan: JSONObject): JSONObject? {
+        val artifact = validateLocalArtifactPlan(plan)
+        val publication = plan.getJSONObject("publication")
+        val file = java.io.File(publication.getString("target_path"))
+        if (!file.isFile || file.length() != publication.getLong("expected_bytes") ||
+            LocalUtf8FilePatch.sha256(file) != publication.getString("expected_sha256")) return null
+        JsonProtocol.nonBlank(publication, "diff_path")?.let { path ->
+            val diff = java.io.File(path)
+            if (!diff.isFile || LocalUtf8FilePatch.sha256(diff) != publication.getString("diff_sha256")) return null
+        }
+        return JsonProtocol.objectCopy(artifact)
+    }
+
+    /** A previously authorized publication can commit after Stop, but never after Delete. */
+    fun completeLocalArtifactIntent(chatId: String, requestId: String, callId: String, toolName: String,
+        argumentsSha256: String, planSha256: String, outcome: JSONObject?): JSONObject? {
+        var record: JSONObject? = null
+        writableDatabase.transaction { sql ->
+            val existing = checkedLocalArtifactIntent(sql, chatId, requestId, callId, toolName, argumentsSha256, planSha256)
+                ?: return@transaction
+            record = existing
+            if (existing.getBoolean("tombstoned") || existing.getString("state") == "completed") return@transaction
+            val chatExists = sql.query(CHAT_TABLE, arrayOf("id"), "id=?", arrayOf(chatId), null, null, null, "1").use { it.moveToFirst() }
+            if (!chatExists) return@transaction
+            val artifact = verifiedLocalArtifactPlan(existing.getJSONObject("plan")) ?: return@transaction
+            require(outcome != null && outcome.optBoolean("ok") && JsonProtocol.nonBlank(outcome, "path") == artifact.getString("path") &&
+                JsonProtocol.nonBlank(outcome, "sha256") == artifact.getString("sha256")) { "Artifact outcome does not match its plan" }
+            artifact.put("tool_name", toolName).put("arguments_sha256", argumentsSha256).put("tool_call_id", callId)
+            val prior = SqliteLargeTextQuery.query(sql, "local_artifacts", arrayOf("chat_id", "request_id", "metadata"),
+                "path=?", arrayOf(artifact.getString("path")), null, null, null, "1", arrayOf("path")).use { c ->
+                if (!c.moveToFirst()) null else {
+                    check(c.getString(0) == chatId && c.getString(1) == requestId) { "Artifact path has another owner" }
+                    JSONObject(c.getString(2)).also { saved ->
+                        check(JsonProtocol.nonBlank(saved, "tool_call_id") == callId && JsonProtocol.nonBlank(saved, "tool_name") == toolName &&
+                            JsonProtocol.nonBlank(saved, "arguments_sha256") == argumentsSha256) { "Artifact path identity changed" }
+                    }
+                }
+            }
+            if (prior == null) sql.insertOrThrow("local_artifacts", null, ContentValues().apply {
+                put("path", artifact.getString("path")); put("chat_id", chatId); put("request_id", requestId)
+                put("created_at", System.currentTimeMillis()); put("metadata", artifact.toString())
+            })
+            sql.update("local_artifact_intents", ContentValues().apply {
+                put("state", "completed"); put("outcome", (prior ?: artifact).toString()); put("updated_at", System.currentTimeMillis())
+            }, "chat_id=? AND request_id=? AND tool_call_id=? AND tombstoned=0", arrayOf(chatId, requestId, callId))
+            record = localArtifactIntentInDb(sql, chatId, requestId, callId)
+        }
+        return record
+    }
+
+    fun markLocalArtifactIntentUnknown(chatId: String, requestId: String, callId: String, toolName: String,
+        argumentsSha256: String, planSha256: String): JSONObject? {
+        var record: JSONObject? = null
+        writableDatabase.transaction { sql ->
+            val existing = checkedLocalArtifactIntent(sql, chatId, requestId, callId, toolName, argumentsSha256, planSha256)
+                ?: return@transaction
+            if (existing.getString("state") != "completed") sql.update("local_artifact_intents", ContentValues().apply {
+                put("state", "outcome_unknown"); put("updated_at", System.currentTimeMillis())
+            }, "chat_id=? AND request_id=? AND tool_call_id=?", arrayOf(chatId, requestId, callId))
+            record = localArtifactIntentInDb(sql, chatId, requestId, callId)
+        }
+        return record
+    }
+
+    /**
+     * A verified SQL result may outlive its in-memory tool loop. Repair only an
+     * existing protocol owner; neither Stop nor Delete can create a new message.
+     * All candidate protocols share this transaction so a conflicting historical
+     * copy leaves the original checkpoint/archive/message bytes untouched.
+     */
+    fun reconcileLocalArtifactProtocolOutcome(chatId: String, requestId: String, callId: String,
+        toolName: String, argumentsSha256: String, planSha256: String): Boolean {
+        var changed = false
+        writableDatabase.transaction { sql ->
+            val intent = checkedLocalArtifactIntent(sql, chatId, requestId, callId, toolName,
+                argumentsSha256, planSha256) ?: return@transaction
+            if (intent.getBoolean("tombstoned") || intent.getString("state") != "completed") return@transaction
+            val activeRequest = sql.query(CHAT_TABLE, arrayOf("active_request_id"), "id=?", arrayOf(chatId),
+                null, null, null, "1").use { c ->
+                if (!c.moveToFirst()) return@transaction
+                c.getString(0)
+            }
+            if (capturedRequestProviderInDb(sql, chatId, requestId) != "openrouter") return@transaction
+            val verified = verifiedLocalArtifactPlan(intent.getJSONObject("plan")) ?: return@transaction
+            verified.put("tool_name", toolName).put("arguments_sha256", argumentsSha256).put("tool_call_id", callId)
+            val outcome = intent.getJSONObject("outcome")
+            check(JsonProtocol.nonBlank(outcome, "path") == verified.getString("path") &&
+                outcome.getJSONObject("attachment").toString() == verified.getJSONObject("attachment").toString() &&
+                LocalArtifactToolExecutor.toolResult(outcome).toString() ==
+                LocalArtifactToolExecutor.toolResult(verified).toString()) { "Stored artifact outcome changed" }
+
+            fun repair(raw: String): String? = OpenRouterProtocolCodec.reconcileCompletedLocalArtifact(
+                JSONObject(raw), callId, toolName, argumentsSha256, outcome)?.toString()
+
+            if (activeRequest == requestId) {
+                val raw = SqliteLargeTextQuery.query(sql, "openrouter_checkpoints", arrayOf("protocol"),
+                    "chat_id=? AND request_id=?", arrayOf(chatId, requestId), null, null, null,
+                    "1", arrayOf("chat_id", "request_id")).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                if (raw != null) repair(raw)?.let { updated ->
+                    check(sql.update("openrouter_checkpoints", ContentValues().apply { put("protocol", updated) },
+                        "chat_id=? AND request_id=? AND protocol=?", arrayOf(chatId, requestId, raw)) == 1) {
+                        "OpenRouter checkpoint changed during artifact reconciliation"
+                    }
+                    changed = true
+                }
+            }
+
+            SqliteLargeTextQuery.query(sql, MESSAGE_TABLE, null,
+                "chat_id=? AND request_id=? AND role='assistant' AND openrouter_protocol IS NOT NULL",
+                arrayOf(chatId, requestId), null, null, "id ASC").use { c ->
+                while (c.moveToNext()) {
+                    val raw = c.getString(c.getColumnIndexOrThrow("openrouter_protocol"))
+                    val updated = repair(raw) ?: continue
+                    val message = messageFromCursor(c, chatId).put("openrouter_protocol", JSONObject(updated))
+                    val rowId = c.getLong(c.getColumnIndexOrThrow("id")).toString()
+                    check(sql.update(MESSAGE_TABLE, ContentValues().apply {
+                        put("openrouter_protocol", updated); put("content_hash", ChatMessageFingerprint.of(message))
+                    }, "id=? AND chat_id=? AND request_id=? AND role='assistant' AND openrouter_protocol=?",
+                        arrayOf(rowId, chatId, requestId, raw)) == 1) {
+                        "Historical OpenRouter message changed during artifact reconciliation"
+                    }
+                    changed = true
+                }
+            }
+
+            val archiveRaw = SqliteLargeTextQuery.query(sql, "request_recovery_archive", arrayOf("recovery_message"),
+                "chat_id=? AND request_id=?", arrayOf(chatId, requestId), null, null, null,
+                "1", arrayOf("chat_id", "request_id")).use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            if (archiveRaw != null) {
+                val archive = JSONObject(archiveRaw)
+                val rawProtocol = archive.optJSONObject("openrouter_protocol")
+                if (archive.has("openrouter_protocol") && !archive.isNull("openrouter_protocol")) {
+                    check(rawProtocol != null && JsonProtocol.nonBlank(archive, "request_id") == requestId &&
+                        JsonProtocol.nonBlank(archive, "role") == "assistant" &&
+                        JsonProtocol.nonBlank(archive, "provider") == "openrouter" &&
+                        (!archive.has("chat_id") || JsonProtocol.nonBlank(archive, "chat_id") == chatId)) {
+                        "Recovery archive has another protocol owner"
+                    }
+                    OpenRouterProtocolCodec.reconcileCompletedLocalArtifact(rawProtocol, callId, toolName,
+                        argumentsSha256, outcome)?.let { updated ->
+                        archive.put("openrouter_protocol", updated)
+                        check(sql.update("request_recovery_archive", ContentValues().apply {
+                            put("recovery_message", archive.toString())
+                        }, "chat_id=? AND request_id=? AND recovery_message=?", arrayOf(chatId, requestId, archiveRaw)) == 1) {
+                            "Recovery archive changed during artifact reconciliation"
+                        }
+                        changed = true
+                    }
+                }
+            }
+        }
+        return changed
+    }
+
+    /**
+     * Caller holds the process ownership fence before entering this transaction.
+     * The callback may only perform its already-verified, small filesystem unlink;
+     * file hashing, UI work and acquiring other ownership locks belong outside.
+     * A durable tombstone remains after cleanup, including when bytes are absent.
+     */
+    fun withTombstonedArtifactCleanup(chatId: String, requestId: String, callId: String,
+        toolName: String, argumentsSha256: String, planSha256: String, expectedUpdatedAt: Long,
+        action: (JSONObject, Set<String>) -> Boolean): Boolean {
+        var cleaned = false
+        writableDatabase.transaction { sql ->
+            val intent = checkedLocalArtifactIntent(sql, chatId, requestId, callId, toolName,
+                argumentsSha256, planSha256) ?: return@transaction
+            if (!intent.getBoolean("tombstoned") || intent.getLong("updated_at") != expectedUpdatedAt) return@transaction
+            val references = strictArtifactCleanupReferences(sql)
+            val publication = intent.getJSONObject("plan").getJSONObject("publication")
+            val candidates = listOfNotNull(JsonProtocol.nonBlank(publication, "target_path"),
+                JsonProtocol.nonBlank(publication, "diff_path"))
+            val canonicalReferences = references.map { java.io.File(it).canonicalPath }.toSet()
+            if (candidates.any { it in references || java.io.File(it).canonicalPath in canonicalReferences }) return@transaction
+            cleaned = action(intent, references)
+        }
+        return cleaned
+    }
+
+    /** Strict ownership snapshot for destructive cleanup; display/reopen parsing stays tolerant. */
+    private fun strictArtifactCleanupReferences(sql: SQLiteDatabase): Set<String> {
+        val paths = linkedSetOf<String>()
+        val pathKeys = setOf("path", "local_path", "source_path", "patch_diff_path", "diff_path",
+            "text_path", "wire_path", "image_path", "target_path")
+        val objectKeys = setOf("attachment", "attachment_manifest", "openrouter_protocol", "legacy_stored_message",
+            "legacy_active_snapshot", "unrecoverable_indexed_state")
+        val arrayKeys = setOf("attachments", "openrouter_attachments", "pending_attachments", "local_artifacts",
+            "annotations", "generated_images", "openai_protocol_output")
+        // Finish one row before reading the next; history JSON must not accumulate here.
+        fun visit(document: Any) {
+            val pending = java.util.ArrayDeque<Any>().apply { add(document) }
+            while (pending.isNotEmpty()) when (val value = pending.removeFirst()) {
+                is JSONArray -> for (index in 0 until value.length()) {
+                    val item = value.get(index)
+                    if (item is JSONObject || item is JSONArray) pending.add(item)
+                }
+                is JSONObject -> {
+                    val outputKey = when {
+                        JsonProtocol.string(value, "role") == "tool" -> "content"
+                        JsonProtocol.string(value, "type") == "function_call_output" -> "output"
+                        else -> null
+                    }
+                    outputKey?.let { key -> JsonProtocol.text(value, key)?.trimStart()?.let { raw ->
+                        if (raw.startsWith("{")) pending.add(JSONObject(raw))
+                        else if (raw.startsWith("[")) pending.add(JSONArray(raw))
+                    } }
+                    for (key in value.keys()) {
+                        if (value.isNull(key)) continue
+                        val item = value.get(key)
+                        when {
+                            key in pathKeys -> {
+                                val path = item as? String ?: error("Invalid durable $key ownership")
+                                if (path.isNotBlank()) paths.add(path)
+                            }
+                            key == "file_paths" -> {
+                                val items = item as? JSONArray ?: error("Invalid durable file_paths ownership")
+                                for (index in 0 until items.length()) {
+                                    val path = JsonProtocol.text(items, index) ?: error("Invalid durable file path")
+                                    if (path.isNotBlank()) paths.add(path)
+                                }
+                            }
+                            key == "legacy_tool_checkpoint_raw" -> {
+                                pending.add(JSONObject(item as? String ?: error("Invalid raw legacy checkpoint ownership")))
+                            }
+                            key == "indexed_checkpoint" -> {
+                                val raw = item as? String ?: error("Invalid raw indexed checkpoint ownership")
+                                if (raw.isNotBlank()) pending.add(JSONObject(raw))
+                            }
+                            key == "legacy_stored_message_columns" -> {
+                                val columns = item as? JSONObject ?: error("Invalid raw archived columns ownership")
+                                val message = JSONObject()
+                                for (field in listOf("file_paths", "attachments", "annotations", "generated_images", "image_path",
+                                        "openrouter_protocol", "openai_protocol_output")) {
+                                    if (!columns.has(field) || columns.isNull(field)) continue
+                                    val raw = JsonProtocol.text(columns, field) ?: error("Invalid raw archived $field ownership")
+                                    if (raw.isNotBlank()) message.put(field, when (field) {
+                                        "image_path" -> raw
+                                        "openrouter_protocol" -> JSONObject(raw)
+                                        else -> JSONArray(raw)
+                                    })
+                                }
+                                pending.add(message)
+                            }
+                            key in objectKeys -> pending.add(item as? JSONObject ?: error("Invalid durable $key ownership"))
+                            key in arrayKeys -> {
+                                val items = item as? JSONArray ?: error("Invalid durable $key ownership")
+                                for (index in 0 until items.length())
+                                    pending.add(items.optJSONObject(index) ?: error("Invalid durable $key entry"))
+                            }
+                            item is JSONObject || item is JSONArray -> pending.add(item)
+                        }
+                    }
+                }
+            }
+        }
+        fun addRaw(raw: String?) { visit(JSONObject(raw ?: error("Missing durable ownership document"))) }
+        SqliteLargeTextQuery.query(sql, "local_artifact_intents", null, "tombstoned=0", null,
+            null, null, null, keyColumns = arrayOf("chat_id", "request_id", "tool_call_id")).use { c ->
+            while (c.moveToNext()) {
+                val intent = localArtifactIntentFromCursor(c)
+                validateLocalArtifactPlan(intent.getJSONObject("plan"))
+                visit(intent.getJSONObject("plan"))
+                intent.optJSONObject("outcome")?.let(::visit)
+            }
+        }
+        SqliteLargeTextQuery.query(sql, "local_artifacts", arrayOf("path", "metadata"), null, null,
+            null, null, null, keyColumns = arrayOf("path")).use { c ->
+            while (c.moveToNext()) { paths.add(c.getString(0)); addRaw(c.getString(1)) }
+        }
+        val messageFields = arrayOf("file_paths", "image_path", "attachments", "annotations", "generated_images",
+            "openrouter_protocol", "openai_protocol_output")
+        SqliteLargeTextQuery.query(sql, MESSAGE_TABLE, messageFields, null, null, null, null, null).use { c ->
+            while (c.moveToNext()) {
+                val message = JSONObject()
+                for ((index, key) in messageFields.withIndex()) {
+                    val raw = c.getString(index)
+                    if (raw.isNullOrBlank()) continue
+                    message.put(key, when (key) {
+                        "image_path" -> raw
+                        "openrouter_protocol" -> JSONObject(raw)
+                        else -> JSONArray(raw)
+                    })
+                }
+                visit(message)
+            }
+        }
+        SqliteLargeTextQuery.query(sql, CHAT_TABLE, arrayOf("active_indexed_checkpoint"),
+            "active_indexed_checkpoint IS NOT NULL", null, null, null, null).use { c ->
+            while (c.moveToNext()) c.getString(0)?.takeIf { it.isNotBlank() }?.let { visit(JSONObject(it)) }
+        }
+        for ((table, column) in listOf("openrouter_checkpoints" to "protocol", "openai_tool_checkpoints" to "request_checkpoint",
+                "request_recovery_archive" to "recovery_message")) {
+            SqliteLargeTextQuery.query(sql, table, arrayOf(column), null, null, null, null, null,
+                keyColumns = arrayOf("chat_id", "request_id")).use { c -> while (c.moveToNext()) addRaw(c.getString(0)) }
+        }
+        return paths
+    }
+
+    private fun localArtifactIntentPaths(chatId: String? = null): Set<String> {
+        val paths = linkedSetOf<String>()
+        for (record in listLocalArtifactIntents()) {
+            if (record.getBoolean("tombstoned") || chatId != null && record.getString("chat_id") != chatId) continue
+            val artifact = validateLocalArtifactPlan(record.getJSONObject("plan"))
+            paths.add(artifact.getString("path"))
+            for (key in listOf("source_path", "patch_diff_path", "diff_path")) JsonProtocol.nonBlank(artifact, key)?.let(paths::add)
+            paths.addAll(LocalAttachmentReferences.openRouterPaths(JSONArray().put(artifact.getJSONObject("attachment"))))
+        }
+        return paths
+    }
+
     private fun localArtifactPaths(chatId: String? = null): Set<String> {
         val out = linkedSetOf<String>()
+        out.addAll(localArtifactIntentPaths(chatId))
         SqliteLargeTextQuery.query(readableDatabase, "local_artifacts", arrayOf("path", "metadata"),
             if (chatId == null) null else "chat_id=?", chatId?.let { arrayOf(it) }, null, null, null,
             keyColumns = arrayOf("path")).use { c -> while (c.moveToNext()) {
@@ -2943,6 +3380,13 @@ data class ExistingMessageRow(
                 if (java.io.File(path).isFile && seen.add("file:$path")) out += a
                     .put("kind", "file").put("chat_id", c.getString(0)).put("chat_title", title(c.getString(0)))
             }
+        }
+        for (record in listLocalArtifactIntents()) {
+            if (record.getBoolean("tombstoned") || chatId != null && record.getString("chat_id") != chatId) continue
+            val artifact = verifiedLocalArtifactPlan(record.getJSONObject("plan")) ?: continue
+            val path = artifact.getString("path")
+            if (seen.add("file:$path")) out += artifact.put("kind", "file").put("chat_id", record.getString("chat_id"))
+                .put("chat_title", title(record.getString("chat_id")))
         }
         SqliteLargeTextQuery.query(readableDatabase, MESSAGE_TABLE,
             arrayOf("chat_id", "annotations", "generated_images"),
@@ -2996,29 +3440,47 @@ data class ExistingMessageRow(
         return out
     }
 
+    private fun archivedMessagePaths(message: JSONObject): Set<String> {
+        val out = linkedSetOf<String>()
+        out.addAll(LocalAttachmentReferences.composerPaths(message))
+        out.addAll(LocalAttachmentReferences.openRouterPaths(message.optJSONArray("attachments")))
+        for (key in listOf("annotations", "generated_images")) {
+            message.optJSONArray(key)?.let { items -> for (i in 0 until items.length()) {
+                items.optJSONObject(i)?.let { item ->
+                    JsonProtocol.nonBlank(item, "local_path")?.let(out::add)
+                    for (manifestKey in listOf("attachment", "attachment_manifest")) {
+                        if (item.has(manifestKey) && !item.isNull(manifestKey)) {
+                            val manifest = item.optJSONObject(manifestKey) ?: error("Invalid archived artifact manifest")
+                            out.addAll(LocalAttachmentReferences.openRouterPaths(JSONArray().put(manifest)))
+                        }
+                    }
+                    for (pathKey in listOf("source_path", "patch_diff_path")) JsonProtocol.nonBlank(item, pathKey)?.let(out::add)
+                }
+            } }
+        }
+        return out
+    }
+
     private fun recoveryArchivePaths(chatId: String? = null): Set<String> {
         val out = linkedSetOf<String>()
         SqliteLargeTextQuery.query(readableDatabase, "request_recovery_archive", arrayOf("recovery_message"),
             if (chatId == null) null else "chat_id=?", chatId?.let { arrayOf(it) }, null, null, null,
             keyColumns = arrayOf("chat_id", "request_id")).use { cursor ->
             while (cursor.moveToNext()) {
-                // Ownership must fail closed; ignoring a damaged archive could delete its paid files.
+                // Any damaged ownership source stops cleanup instead of releasing its paid files.
                 val message = JSONObject(cursor.getString(0))
-                out.addAll(LocalAttachmentReferences.composerPaths(message))
-                out.addAll(LocalAttachmentReferences.openRouterPaths(message.optJSONArray("attachments")))
-                for (key in listOf("annotations", "generated_images")) {
-                    message.optJSONArray(key)?.let { items -> for (i in 0 until items.length()) {
-                        items.optJSONObject(i)?.let { item ->
-                            JsonProtocol.nonBlank(item, "local_path")?.let(out::add)
-                            for (manifestKey in listOf("attachment", "attachment_manifest")) {
-                                if (item.has(manifestKey) && !item.isNull(manifestKey)) {
-                                    val manifest = item.optJSONObject(manifestKey) ?: error("Invalid archived artifact manifest")
-                                    out.addAll(LocalAttachmentReferences.openRouterPaths(JSONArray().put(manifest)))
-                                }
-                            }
-                            for (pathKey in listOf("source_path", "patch_diff_path")) JsonProtocol.nonBlank(item, pathKey)?.let(out::add)
-                        }
-                    } }
+                out.addAll(archivedMessagePaths(message))
+                message.optJSONObject("legacy_stored_message")?.let { out.addAll(archivedMessagePaths(it)) }
+                message.optJSONObject("legacy_stored_message_columns")?.let { columns ->
+                    val rawMessage = JSONObject()
+                    for (key in listOf("file_paths", "attachments", "annotations", "generated_images")) {
+                        JsonProtocol.nonBlank(columns, key)?.let { raw -> rawMessage.put(key, JSONArray(raw)) }
+                    }
+                    JsonProtocol.nonBlank(columns, "image_path")?.let { rawMessage.put("image_path", it) }
+                    out.addAll(archivedMessagePaths(rawMessage))
+                }
+                JsonProtocol.nonBlank(message, "legacy_tool_checkpoint_raw")?.let { raw ->
+                    out.addAll(LegacyOpenAiCheckpoint.ownedPaths(JSONObject(raw)))
                 }
             }
         }
@@ -3043,10 +3505,7 @@ data class ExistingMessageRow(
             "chat_id=?", arrayOf(chatId), null, null, null,
             keyColumns = arrayOf("chat_id", "request_id")).use { c ->
             while (c.moveToNext()) {
-                try {
-                    val cp = JSONObject(c.getString(0).orEmpty())
-                    out.addAll(LocalAttachmentReferences.openRouterPaths(cp.optJSONArray("attachments")))
-                } catch (_: Exception) {}
+                out.addAll(LegacyOpenAiCheckpoint.ownedPaths(JSONObject(c.getString(0))))
             }
         }
         out.addAll(recoveryArchivePaths(chatId))
@@ -3087,16 +3546,13 @@ data class ExistingMessageRow(
         }
     }
 
-    fun listActiveOpenAiToolAttachmentPaths(): Set<String> {
+    fun listLegacyCheckpointAttachmentPaths(): Set<String> {
         val out = linkedSetOf<String>()
         SqliteLargeTextQuery.query(readableDatabase, "openai_tool_checkpoints", arrayOf("request_checkpoint"),
             null, null, null, null, null,
             keyColumns = arrayOf("chat_id", "request_id")).use { c ->
             while (c.moveToNext()) {
-                try {
-                    val cp = JSONObject(c.getString(0).orEmpty())
-                    out.addAll(LocalAttachmentReferences.openRouterPaths(cp.optJSONArray("attachments")))
-                } catch (_: Exception) {}
+                out.addAll(LegacyOpenAiCheckpoint.ownedPaths(JSONObject(c.getString(0))))
             }
         }
         return out
@@ -3106,6 +3562,12 @@ data class ExistingMessageRow(
         if (path.isBlank()) return false
         var removed = false
         writableDatabase.transaction { db ->
+            // Explicit deletion also retires a not-yet-adopted publication.
+            // A late completion/recovery must not put the user's deleted copy
+            // back into the index, even if its bytes still exist until cleanup.
+            if (db.update("local_artifact_intents", ContentValues().apply {
+                    put("tombstoned", 1); put("updated_at", System.currentTimeMillis())
+                }, "path=? AND tombstoned=0", arrayOf(path)) > 0) removed = true
             if (db.delete("local_artifacts", "path=?", arrayOf(path)) > 0) removed = true
             SqliteLargeTextQuery.query(db, MESSAGE_TABLE, arrayOf("id", "annotations", "generated_images"), null, null, null, null, "id ASC").use { c ->
                 while (c.moveToNext()) {
@@ -3187,47 +3649,49 @@ data class ExistingMessageRow(
     private fun loadMessages(chatId: String): JSONArray {
         val arr = JSONArray()
         SqliteLargeTextQuery.query(readableDatabase, MESSAGE_TABLE, null, "chat_id=?", arrayOf(chatId), null, null, "position ASC, id ASC").use { c ->
-            while (c.moveToNext()) {
-                val m = JSONObject()
-                    .put("_db_message_id", c.getLong(c.getColumnIndexOrThrow("id")))
-                    .put("chat_id", chatId)
-                    .put("role", c.getString(c.getColumnIndexOrThrow("role")))
-                    .put("text", c.getString(c.getColumnIndexOrThrow("text")))
-                c.getString(c.getColumnIndexOrThrow("response_id"))?.let { if (it.isNotBlank()) m.put("response_id", it) }
-                c.getString(c.getColumnIndexOrThrow("request_id"))?.let { if (it.isNotBlank()) m.put("request_id", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_ids")))?.let { m.put("file_ids", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_names")))?.let { m.put("file_names", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_sizes")))?.let { m.put("file_sizes", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_paths")))?.let { m.put("file_paths", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_mimes")))?.let { m.put("file_mimes", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("attachments")))?.let { m.put("attachments", it) }
-                c.getString(c.getColumnIndexOrThrow("image_path"))?.let { if (it.isNotBlank()) m.put("image_path", it) }
-                c.getString(c.getColumnIndexOrThrow("image_file_id"))?.let { if (it.isNotBlank()) m.put("image_file_id", it) }
-                c.getString(c.getColumnIndexOrThrow("image_name"))?.let { if (it.isNotBlank()) m.put("image_name", it) }
-                c.getString(c.getColumnIndexOrThrow("image_mime"))?.let { if (it.isNotBlank()) m.put("image_mime", it) }
-                m.put("image_size", c.getLong(c.getColumnIndexOrThrow("image_size")))
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("annotations")))?.let { m.put("annotations", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("generated_images")))?.let { m.put("generated_images", it) }
-                parseArrayColumn(c.getString(c.getColumnIndexOrThrow("tools")))?.let { m.put("tools", it) }
-                c.getString(c.getColumnIndexOrThrow("status"))?.let { if (it.isNotBlank()) m.put("status", it) }
-                if (!c.isNull(c.getColumnIndexOrThrow("feedback"))) m.put("feedback", c.getInt(c.getColumnIndexOrThrow("feedback")))
-                MessageMetadataCodec.allKeys.forEach { key ->
-                    MessageMetadataCodec.decodeInto(m, key, c.getString(c.getColumnIndexOrThrow(key)))
-                }
-                // SQLite stores the durable OpenAI assistant status, not the
-                // transient JSON flag "incomplete". Reconstruct that flag
-                // only for interrupted OpenAI assistant turns on reopen.
-                // Without it, a Worker failure saved with incomplete=true
-                // reopens as an apparently complete assistant message.
-                if (m.optString("role") == "assistant" &&
-                    m.optString("provider") == "openai" &&
-                    m.optString("status") in setOf("failed", "disconnected", "incomplete", "cancelled")) {
-                    m.put("incomplete", true)
-                }
-                arr.put(m)
-            }
+            while (c.moveToNext()) arr.put(messageFromCursor(c, chatId))
         }
         return arr
+    }
+
+    private fun messageFromCursor(c: android.database.Cursor, chatId: String): JSONObject {
+        val m = JSONObject()
+            .put("_db_message_id", c.getLong(c.getColumnIndexOrThrow("id")))
+            .put("chat_id", chatId)
+            .put("role", c.getString(c.getColumnIndexOrThrow("role")))
+            .put("text", c.getString(c.getColumnIndexOrThrow("text")))
+        c.getString(c.getColumnIndexOrThrow("response_id"))?.let { if (it.isNotBlank()) m.put("response_id", it) }
+        c.getString(c.getColumnIndexOrThrow("request_id"))?.let { if (it.isNotBlank()) m.put("request_id", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_ids")))?.let { m.put("file_ids", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_names")))?.let { m.put("file_names", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_sizes")))?.let { m.put("file_sizes", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_paths")))?.let { m.put("file_paths", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("file_mimes")))?.let { m.put("file_mimes", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("attachments")))?.let { m.put("attachments", it) }
+        c.getString(c.getColumnIndexOrThrow("image_path"))?.let { if (it.isNotBlank()) m.put("image_path", it) }
+        c.getString(c.getColumnIndexOrThrow("image_file_id"))?.let { if (it.isNotBlank()) m.put("image_file_id", it) }
+        c.getString(c.getColumnIndexOrThrow("image_name"))?.let { if (it.isNotBlank()) m.put("image_name", it) }
+        c.getString(c.getColumnIndexOrThrow("image_mime"))?.let { if (it.isNotBlank()) m.put("image_mime", it) }
+        m.put("image_size", c.getLong(c.getColumnIndexOrThrow("image_size")))
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("annotations")))?.let { m.put("annotations", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("generated_images")))?.let { m.put("generated_images", it) }
+        parseArrayColumn(c.getString(c.getColumnIndexOrThrow("tools")))?.let { m.put("tools", it) }
+        c.getString(c.getColumnIndexOrThrow("status"))?.let { if (it.isNotBlank()) m.put("status", it) }
+        if (!c.isNull(c.getColumnIndexOrThrow("feedback"))) m.put("feedback", c.getInt(c.getColumnIndexOrThrow("feedback")))
+        MessageMetadataCodec.allKeys.forEach { key ->
+            MessageMetadataCodec.decodeInto(m, key, c.getString(c.getColumnIndexOrThrow(key)))
+        }
+        // SQLite stores the durable OpenAI assistant status, not the
+        // transient JSON flag "incomplete". Reconstruct that flag
+        // only for interrupted OpenAI assistant turns on reopen.
+        // Without it, a Worker failure saved with incomplete=true
+        // reopens as an apparently complete assistant message.
+        if (m.optString("role") == "assistant" &&
+            m.optString("provider") == "openai" &&
+            m.optString("status") in setOf("failed", "disconnected", "incomplete", "cancelled")) {
+            m.put("incomplete", true)
+        }
+        return m
     }
 
     private fun upsertChatObject(db: SQLiteDatabase, c: JSONObject) {

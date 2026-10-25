@@ -16,6 +16,7 @@ object PreparedAttachmentFiles {
     fun lease(context: Context) = Lease(File(context.filesDir, "attachments"), context.getSharedPreferences(JOURNAL, Context.MODE_PRIVATE))
     class Lease(directory: File, private val journal: SharedPreferences? = null) {
         internal val directory = directory.canonicalFile.apply { mkdirs() }
+        private val artifactOwnership = LocalArtifactOwnership.lease()
         private val id = java.util.UUID.randomUUID().toString()
         private val created = linkedSetOf<File>()
         private var released = false
@@ -43,8 +44,9 @@ object PreparedAttachmentFiles {
             journal?.edit()?.apply { if (retained.isEmpty()) remove(id) else putString(id, JSONArray(retained.map { it.path }).toString()) }?.commit()
             released = true
             live.remove(id, this)
+            artifactOwnership.close()
         }
-        @Synchronized fun defer() { released = true; live.remove(id, this) }
+        @Synchronized fun defer() { released = true; live.remove(id, this); artifactOwnership.close() }
     }
     fun derivative(directory: File, suffix: String): File {
         val lease = current.get()

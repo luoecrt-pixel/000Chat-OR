@@ -2,60 +2,71 @@ package com.example.openaichat
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 
-/** Merge streaming fragments by explicit identity while retaining block order and opaque signatures. */
+/** Merge ordered deltas by either explicit identity; never rewrite opaque signed fields. */
 class ReasoningDetailAccumulator {
     private val blocks = mutableListOf<JSONObject>()
-    private val indexes = mutableMapOf<String, Int>()
+    private data class Identity(val kind: String, val value: String, val type: String)
+    private val indexes = mutableMapOf<Identity, Int>()
+    private val fragments = JSONArray()
+    var receivedCharacterCount: Long = 0L
+        private set
+
+    private fun alias(kind: String, value: String, type: String): Identity {
+        val untyped = Identity(kind, value, "")
+        if (type.isNotBlank()) {
+            val typed = Identity(kind, value, type)
+            if (!indexes.containsKey(typed) && indexes.containsKey(untyped)) {
+                indexes[typed] = indexes.remove(untyped)!!
+            }
+            return typed
+        }
+        val candidates = indexes.keys.filter { it.kind == kind && it.value == value }
+        if (candidates.size > 1) throw IOException("Ambiguous reasoning block identity: missing type")
+        return candidates.singleOrNull() ?: untyped
+    }
+
     fun accept(details: JSONArray) {
         for (i in 0 until details.length()) {
-            val item = details.optJSONObject(i) ?: continue
+            // Preserve the received fragment even if its identity proves inconsistent below.
+            val raw = JsonProtocol.copy(details.get(i))
+            fragments.put(raw)
+            receivedCharacterCount += raw.toString().length
+            val item = raw as? JSONObject ?: throw IOException("Invalid reasoning detail fragment")
             val type = JsonProtocol.nonBlank(item, "type").orEmpty()
-            val key = when {
-                item.has("index") && !item.isNull("index") -> {
-                    val prefix = "index:${item.opt("index")}:type:"
-                    if (type.isNotBlank()) {
-                        val exactKey = prefix + type
-                        if (!indexes.containsKey(exactKey) && indexes.containsKey(prefix)) {
-                            val idx = indexes.remove(prefix)!!
-                            indexes[exactKey] = idx
-                        }
-                        exactKey
-                    } else {
-                        val candidates = indexes.keys.filter { it.startsWith(prefix) }
-                        if (candidates.size > 1) throw java.io.IOException("Ambiguous reasoning block identity: missing type")
-                        candidates.singleOrNull() ?: prefix
-                    }
-                }
-                JsonProtocol.nonBlank(item, "id") != null -> {
-                    val id = item.getString("id")
-                    val suffix = ":id:$id"
-                    if (type.isNotBlank()) {
-                        val exactKey = "$type$suffix"
-                        if (!indexes.containsKey(exactKey) && indexes.containsKey(suffix)) {
-                            val idx = indexes.remove(suffix)!!
-                            indexes[exactKey] = idx
-                        }
-                        exactKey
-                    } else {
-                        val candidates = indexes.keys.filter { it.endsWith(suffix) }
-                        if (candidates.size > 1) throw java.io.IOException("Ambiguous reasoning block identity: missing type")
-                        candidates.singleOrNull() ?: suffix
-                    }
-                }
-                else -> null
+            val aliases = buildList {
+                if (item.has("index") && !item.isNull("index")) add(alias("index", item.get("index").toString(), type))
+                JsonProtocol.nonBlank(item, "id")?.let { add(alias("id", it, type)) }
             }
-            val existing = key?.let { indexes[it] }
+            val owners = aliases.mapNotNull { indexes[it] }.distinct()
+            if (owners.size > 1) throw IOException("Conflicting reasoning block identities")
+            val existing = owners.singleOrNull()
             if (existing == null) {
-                if (key != null) indexes[key] = blocks.size
+                aliases.forEach { indexes[it] = blocks.size }
                 blocks.add(JsonProtocol.objectCopy(item))
             } else {
                 val block = blocks[existing]
+                // Both index and id are aliases of the same detail. A later frame can omit
+                // either one, but it cannot change an already captured identity or format.
                 item.keys().forEach { field ->
                     val value = item.opt(field)
                     if (value != null && value != JSONObject.NULL) {
-                        // OpenRouter documents ordered delta concatenation. Do not guess that a
-                        // repeated fragment is a full snapshot: that would corrupt legitimate data.
+                        val previous = block.opt(field)
+                        if (field !in setOf("text", "summary", "data", "signature") &&
+                            previous != null && previous != JSONObject.NULL && previous.toString() != value.toString()) {
+                            throw IOException("Conflicting reasoning detail metadata: $field")
+                        }
+                        if (field in setOf("text", "summary", "data", "signature") && value !is String)
+                            throw IOException("Invalid reasoning detail payload: $field")
+                    }
+                }
+                aliases.forEach { indexes[it] = existing }
+                item.keys().forEach { field ->
+                    val value = item.opt(field)
+                    if (value != null && value != JSONObject.NULL) {
+                        // OpenRouter documents ordered delta concatenation, including opaque
+                        // signature/data fragments. The first one does not close the block.
                         if (field in setOf("text", "summary", "data", "signature") && value is String)
                             block.put(field, JsonProtocol.text(block, field).orEmpty() + value)
                         else block.put(field, JsonProtocol.copy(value))
@@ -64,5 +75,7 @@ class ReasoningDetailAccumulator {
             }
         }
     }
+
     fun array() = JSONArray().apply { blocks.forEach { put(JsonProtocol.objectCopy(it)) } }
+    fun receivedFragments(): JSONArray = JsonProtocol.arrayCopy(fragments)
 }

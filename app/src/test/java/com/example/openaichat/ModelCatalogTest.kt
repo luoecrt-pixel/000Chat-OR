@@ -14,33 +14,13 @@ import java.util.concurrent.TimeUnit
 class ModelCatalogTest {
     @Test
     fun everyCatalogModelAgreesWithProviderReasoningPolicies() {
-        for (source in ModelCatalog.sources) {
-            for (model in source.models) {
-                assertEquals(model.label, ModelCatalog.displayName(source.id, "~${model.id}"))
-                val isOpenAi = source.id == "openai"
-                assertEquals(isOpenAi, ModelRequestPolicy.supportsReasoningMode(source.id, model.id))
-                assertEquals(isOpenAi, OpenRouterReasoningPolicy.supportsResponseVerbosity(model.id))
-                for (effort in listOf("low", "medium", "high", "xhigh", "max")) {
-                    assertEquals(effort, OpenRouterReasoningPolicy.requestEffort(model.id, effort))
-                    for (mode in listOf("standard", "pro")) {
-                        assertEquals(
-                            if (isOpenAi) mode else null,
-                            ModelRequestPolicy.supportedMode(source.id, "~${model.id}", mode)
-                        )
-                        if (isOpenAi) {
-                            val reasoning = ModelRequestPolicy.openAiReasoning(model.id, effort, mode, "auto")
-                            assertEquals(effort, reasoning.getString("effort"))
-                            assertEquals(mode, reasoning.getString("mode"))
-                        }
-                    }
-                }
-                if (isOpenAi) {
-                    assertEquals(1_050_000, ModelCatalog.openAiContextWindow(model.id))
-                    assertEquals(800_000, ModelCatalog.compactionThreshold(model.id))
-                } else {
-                    assertNull(ModelCatalog.openAiContextWindow(model.id))
-                    assertNull(ModelCatalog.compactionThreshold(model.id))
-                }
+        assertEquals(listOf("openrouter"), ModelCatalog.sources.map { it.id })
+        for (model in ModelCatalog.source("openrouter").models) {
+            assertTrue(ModelCatalog.isClaudeModel(model.id))
+            assertEquals(model.label, ModelCatalog.displayName("openrouter", "~${model.id}"))
+            assertFalse(OpenRouterReasoningPolicy.supportsResponseVerbosity(model.id))
+            for (effort in listOf("low", "medium", "high", "xhigh", "max")) {
+                assertEquals(effort, OpenRouterReasoningPolicy.requestEffort(model.id, effort))
             }
         }
     }
@@ -96,11 +76,13 @@ class ModelCatalogTest {
     }
 
     @Test
-    fun openAiContainsLatestThreeModels() {
-        assertEquals(
-            listOf("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"),
-            ModelCatalog.source("openai").models.map { it.id }
-        )
+    fun unsupportedStoredModelRequiresAnExplicitClaudeChoice() {
+        assertEquals("anthropic/claude-custom", ModelCatalog.normalizedClaudeModel("~anthropic/claude-custom"))
+        for (model in listOf("gpt-6-astra", "openai/gpt-test", "other/model")) {
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                ModelCatalog.normalizedClaudeModel(model)
+            }
+        }
     }
 
     @Test
@@ -119,8 +101,8 @@ class ModelCatalogTest {
 
     @Test
     fun unknownModelIsShownById() {
-        assertEquals("custom/model", ModelCatalog.displayName("openai", "custom/model"))
-        assertNull(ModelCatalog.model("openai", "custom/model"))
+        assertEquals("custom/model", ModelCatalog.displayName("openrouter", "custom/model"))
+        assertNull(ModelCatalog.model("openrouter", "custom/model"))
     }
 
     @Test

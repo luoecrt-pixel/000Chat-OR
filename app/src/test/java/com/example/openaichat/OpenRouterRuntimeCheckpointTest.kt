@@ -114,11 +114,6 @@ class OpenRouterRuntimeCheckpointTest {
         .getDeclaredField("messageAdapter").apply { isAccessible = true }.get(activity) as ChatMessageAdapter
 
     @Test fun delayedSsePersistsAndDisplaysGrowingPrefixesBeforeTerminalCommit() {
-        try {
-            androidx.work.WorkManager.getInstance(context)
-        } catch (_: IllegalStateException) {
-            androidx.work.WorkManager.initialize(context, androidx.work.Configuration.Builder().build())
-        }
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().also { controller = it }.get()
         started()
         startDelayedStream()
