@@ -337,10 +337,14 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         if (!secure.discardLegacyOpenAiCredential()) {
             diagnostics.log("legacy_credential_cleanup_failed", mapOf("provider" to "openai"))
         }
-        chatDb.migrateLegacyPrefs(prefs)
+        val legacyHistoryMigrated = chatDb.migrateLegacyPrefs(prefs)
         ensureChatStore()
         buildUi()
         restoreCurrentChat()
+        if (!legacyHistoryMigrated) {
+            status.text = "Старая история не импортирована полностью. Исходные данные сохранены; текущая история не заменена."
+            diagnostics.log("legacy_history_import_deferred", emptyMap())
+        }
         OpenRouterUiBridge.attach(this)
         openNotificationChat(intent)
         executor.execute { cleanupOrphanOpenRouterAttachments() }
@@ -1776,7 +1780,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             setTextColor(theme.textPrimary)
             setSingleLine(true)
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            setText(prefs.getString("max_output", "").orEmpty().takeUnless { it == "128000" }.orEmpty())
+            setText(prefs.getString("max_output", "").orEmpty().takeUnless {
+                it == "128000" && !prefs.getBoolean("max_output_explicit", false)
+            }.orEmpty())
         }
         box.addView(max)
         val presentation = chk("Соглашения оформления Markdown, кода и файлов", "response_presentation_instructions", true)
@@ -1855,6 +1861,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                     .putString("reasoning", efforts[effort.selectedItemPosition])
                     .putString("verbosity", verbosities[verbosity.selectedItemPosition])
                     .putString("max_output", max.text.toString().trim())
+                    .putBoolean("max_output_explicit", max.text.toString().trim().isNotEmpty())
                     .putBoolean("response_presentation_instructions", presentation.isChecked)
                     .putBoolean("response_scientific_preview", scientificPreview.isChecked)
                     .putBoolean("parallel_tools", parallelTools.isChecked)
@@ -2298,7 +2305,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         webSearchEnabled: Boolean, webFetchEnabled: Boolean, parallelToolCallsEnabled: Boolean,
         githubRepo: String, githubBranches: String, cacheMode: String, background: Boolean, pdfEngine: String,
         responseFormat: JSONObject? = null,
-        claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO
+        claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO,
+        githubCredential: String? = null
     ) {
         activeAssistantItemId = addBubble(
             AssistantModelLabel.text(JSONObject().put("provider", "openrouter").put("requested_model", model)),
@@ -2313,7 +2321,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             effort, verbosity, maxOut, githubEnabled, githubRepo,
             githubBranches.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
             webSearchEnabled, webFetchEnabled, parallelToolCallsEnabled, cacheMode, background,
-            startedAt, taskClass, effortPref, autoSelected, promptChars, apiKey, pollingClient, pdfEngine, responseFormat, claudeRoute), openRouterClient)
+            startedAt, taskClass, effortPref, autoSelected, promptChars, apiKey, pollingClient, pdfEngine, responseFormat, claudeRoute,
+            githubCredential = githubCredential), openRouterClient)
     }
 
     override fun isViewing(chatId: String): Boolean = activityVisible && !isFinishing && currentChatId() == chatId
@@ -2367,7 +2376,9 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             status.text = when (terminal.optString("status")) {
                 "completed" -> "Готово"
                 "incomplete" -> "Ответ не завершён · ${OpenRouterFinishPolicy.description(JsonProtocol.text(terminal, "finish_reason"))}"
-                else -> "Ошибка OpenRouter — частичный ответ сохранён"
+                else -> if (JsonProtocol.string(terminal, "text").isNotEmpty())
+                    "Ошибка OpenRouter — частичный ответ сохранён"
+                else "Ошибка OpenRouter — текст ответа не получен"
             }
             renderRequestTelemetry()
         }
@@ -2396,11 +2407,14 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                 .firstOrNull { it.optString("local_request_id") == requestId }
             if (account?.optString("provider") != "openrouter" ||
                 OpenRouterResponseRuntime.contains(requestId)) return@forEach
-            val error = "Соединение прервано после остановки процесса Android. Частичный ответ сохранён; повторная платная отправка не выполнялась."
+            val receivedText = JsonProtocol.string(active, "text")
+            val error = "Соединение прервано после остановки процесса Android. " +
+                (if (receivedText.isNotEmpty()) "Частичный ответ сохранён" else "Текст ответа не получен") +
+                "; повторная платная отправка не выполнялась."
             val message = JSONObject().put("role", "assistant").put("provider", "openrouter")
                 .put("request_id", requestId).put("requested_model", account.opt("requested_model"))
                 .put("status", "disconnected").put("error", error)
-                .put("text", JsonProtocol.string(active, "text"))
+                .put("text", receivedText)
             chatDb.getOpenRouterCheckpoint(chatId, requestId)?.let {
                 message.put("openrouter_protocol", OpenRouterProtocolCodec.withVisibleTail(it, message))
             }
@@ -2869,6 +2883,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
         val capturedPresentation = configuration.instructions.presentationInstructions
         val capturedDeveloperInstructions = configuration.instructions.developerInstructions
         val capturedGithubEnabled = configuration.github
+        val capturedGithubCredential = if (capturedGithubEnabled) secure.getGitHubToken() else null
         val capturedGithubRepo = configuration.githubRepo
         val capturedGithubBranches = configuration.githubBranches
         val capturedWebSearch = configuration.webSearch
@@ -2967,7 +2982,8 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
                             parallelToolCallsEnabled = capturedParallelTools,
                             githubRepo = capturedGithubRepo, githubBranches = capturedGithubBranches,
                             cacheMode = capturedCacheMode, background = backgroundEnabled, pdfEngine = capturedPdfEngine,
-                            responseFormat = openRouterResponseFormat, claudeRoute = capturedClaudeRoute
+                            responseFormat = openRouterResponseFormat, claudeRoute = capturedClaudeRoute,
+                            githubCredential = capturedGithubCredential
                         )
                     } finally { releasePreparedFiles(preparedFiles) }
                 }
@@ -2993,7 +3009,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
 
     private fun configuredMaxOutputTokens(): Int? {
         val raw = prefs.getString("max_output", "")?.trim().orEmpty()
-        if (raw.isBlank() || raw == "128000") return null
+        if (raw.isBlank() || (raw == "128000" && !prefs.getBoolean("max_output_explicit", false))) return null
         return raw.toLongOrNull()
             ?.takeIf { it > 0L }
             ?.coerceAtMost(Int.MAX_VALUE.toLong())

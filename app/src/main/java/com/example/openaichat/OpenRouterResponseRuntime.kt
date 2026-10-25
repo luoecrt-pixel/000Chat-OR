@@ -22,7 +22,8 @@ data class OpenRouterRuntimeRequest(
     val autoSelected: Boolean, val promptChars: Int,
     val apiKey: String, val metadataClient: OkHttpClient, val pdfEngine: String,
     val responseFormat: JSONObject? = null,
-    val claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO
+    val claudeRoute: OpenRouterClaudeRoute = OpenRouterClaudeRoute.AUTO,
+    val githubCredential: String? = null
 ) {
     override fun toString() = "OpenRouterRuntimeRequest(chatId=$chatId, requestId=$requestId, model=$model, background=$background)"
 }
@@ -240,7 +241,7 @@ object OpenRouterResponseRuntime {
                 github = GitHubToolExecutor(secure, { r.githubRepo }, { r.githubBranches },
                     { name, args -> OpenRouterUiBridge.confirm(r.chatId, r.requestId, name, args) },
                     { name, args -> diagnostics.log("github_write", mapOf("tool" to name, "target" to ToolTraceSummary.entry(name, args, "{}").optJSONObject("target"))) },
-                    ::active, File(item.context.cacheDir, "github_text_pages"))
+                    ::active, File(item.context.cacheDir, "github_text_pages"), expectedCredential = r.githubCredential)
             }
             val tools = OpenRouterAppToolCatalog.tools()
             if (r.github) GitHubToolCatalog.tools().let { array -> for (i in 0 until array.length()) tools.put(array.get(i)) }

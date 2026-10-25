@@ -503,19 +503,66 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     /** One-time migration from v4.13's SharedPreferences chat_store JSON. */
-    fun migrateLegacyPrefs(prefs: android.content.SharedPreferences) {
-        if (prefs.getBoolean("chat_store_migrated_v7", false)) return
-        val raw = prefs.getString("chat_store", null)
-        writableDatabase.transaction { sql ->
-            if (!raw.isNullOrBlank()) {
-                val chats = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
-                for (i in 0 until chats.length()) {
-                    val c = chats.optJSONObject(i) ?: continue
-                    upsertChatObject(sql, c)
-                }
+    fun migrateLegacyPrefs(prefs: android.content.SharedPreferences): Boolean {
+        val before = prefs.all
+        val marker = before["chat_store_migrated_v7"]
+        if (marker == true) return true
+        if (marker != null && marker !is Boolean) return false
+        val source = before["chat_store"]
+        if (source != null && source !is String) return false
+        val raw = source as? String
+        // JSONTokener also treats a literal NUL as EOF; valid JSON escapes it.
+        if (raw?.contains('\u0000') == true) return false
+        val chats = if (raw.isNullOrBlank()) JSONArray() else try {
+            val reader = org.json.JSONTokener(raw)
+            val value = reader.nextValue()
+            if (value !is JSONArray || reader.nextClean() != '\u0000') return false
+            value
+        } catch (_: org.json.JSONException) { return false }
+        val imports = mutableListOf<JSONObject>()
+        val ids = linkedSetOf<String>()
+        // Validate the entire source before writing any row. A malformed item
+        // must not turn into an empty chat or silently disappear from history.
+        val arrays = listOf("file_ids", "file_names", "file_sizes", "file_paths", "file_mimes",
+            "attachments", "annotations", "generated_images", "tools") + MessageMetadataCodec.arrayKeys
+        val strings = listOf("role", "text", "response_id", "request_id", "image_path", "image_file_id",
+            "image_name", "image_mime", "status") + MessageMetadataCodec.textKeys
+        for (index in 0 until chats.length()) {
+            val chat = chats.optJSONObject(index) ?: return false
+            val id = JsonProtocol.nonBlank(chat, "id")?.trim() ?: return false
+            if (!ids.add(id)) return false
+            val messages = if (!chat.has("messages") || chat.isNull("messages")) JSONArray()
+                else chat.optJSONArray("messages") ?: return false
+            for (position in 0 until messages.length()) {
+                val message = messages.optJSONObject(position) ?: return false
+                if (arrays.any { message.has(it) && !message.isNull(it) && message.optJSONArray(it) == null } ||
+                    MessageMetadataCodec.objectKeys.any {
+                        message.has(it) && !message.isNull(it) && message.optJSONObject(it) == null
+                    } || strings.any { message.has(it) && !message.isNull(it) && message.opt(it) !is String }) return false
             }
+            imports += chat
         }
-        prefs.edit().putBoolean("chat_store_migrated_v7", true).remove("chat_store").apply()
+        var imported = false
+        writableDatabase.transaction { sql ->
+            // SQL may already contain newer history, or the prior import may
+            // have committed just before process death lost the prefs marker.
+            // Retain the original source rather than replacing either history.
+            for (id in ids) {
+                if (sql.query(CHAT_TABLE, arrayOf("id"), "id=?", arrayOf(id), null, null, null, "1")
+                        .use { it.moveToFirst() }) return@transaction
+            }
+            imports.forEach { upsertChatObject(sql, it) }
+            imported = true
+        }
+        if (!imported || prefs.all["chat_store"] != source) return false
+        if (prefs.edit().putBoolean("chat_store_migrated_v7", true).remove("chat_store").commit()) return true
+        // commit() updates the in-memory preferences even when the disk write
+        // fails. Restore their retryable state; the committed SQL is untouched.
+        prefs.edit().apply {
+            if (source == null) remove("chat_store") else putString("chat_store", raw)
+            if (marker == null) remove("chat_store_migrated_v7") else putBoolean("chat_store_migrated_v7", false)
+        }.commit()
+        return false
     }
 
     fun ensureChat(id: String, title: String = "Новый чат") {

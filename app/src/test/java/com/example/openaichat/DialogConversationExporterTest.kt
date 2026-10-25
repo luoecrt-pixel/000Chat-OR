@@ -45,6 +45,19 @@ class DialogConversationExporterTest {
         assertFalse(exported.contains("HIDDEN_"))
     }
 
+    @Test fun patchToolKeepsItsKnownNameInBothFormatsWithoutExportingPatchContents() {
+        val trace = JSONArray().put(ToolTraceSummary.entry("patch_local_file", JSONObject()
+            .put("filename", "HIDDEN_FILENAME").put("patches", JSONArray().put(JSONObject()
+                .put("search", "HIDDEN_ORIGINAL").put("replace", "HIDDEN_REPLACEMENT"))),
+            JSONObject().put("ok", true).put("path", "HIDDEN_PATH").toString()))
+        for (format in DialogConversationExporter.Format.values()) {
+            val exported = DialogConversationExporter.export("Patch", listOf(message("assistant", "Updated")
+                .put("tool_trace", trace)), format = format)
+            assertTrue(exported.contains("Инструмент: patch_local_file — готово"))
+            assertFalse(exported.contains("HIDDEN_"))
+        }
+    }
+
     @Test fun openAiCallsPairByCallIdAndSummarizeRealResultsWithoutRawArgumentsOrOutput() {
         val output = JSONArray()
             .put(JSONObject().put("type", "reasoning").put("encrypted_content", "HIDDEN_REASONING"))

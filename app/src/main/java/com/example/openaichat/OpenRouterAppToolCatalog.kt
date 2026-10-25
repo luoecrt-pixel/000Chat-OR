@@ -20,7 +20,7 @@ object OpenRouterAppToolCatalog {
     ).apply {
         put(JSONObject().put("type", "function").put("function", JSONObject()
             .put("name", "patch_local_file")
-            .put("description", "Atomically create a new UTF-8 file version. Each nonempty search must occur exactly once in the ORIGINAL file; patches cannot overlap. Old versions remain available. Use exact file_id when names are ambiguous.")
+            .put("description", "Atomically create a new UTF-8 file version. Supply file_id or an unambiguous filename; at least one is required and the app rejects a missing or ambiguous selector. Each nonempty search must occur exactly once in the ORIGINAL file; patches cannot overlap. Old versions remain available. Prefer exact file_id when names are ambiguous.")
             .put("parameters", JSONObject().put("type", "object").put("properties", JSONObject()
                 .put("file_id", JSONObject().put("type", "string").put("description", "Captured file_id or unambiguous existing filename; never a device path"))
                 .put("filename", JSONObject().put("type", "string"))
@@ -30,9 +30,9 @@ object OpenRouterAppToolCatalog {
                         .put("search", JSONObject().put("type", "string").put("minLength", 1))
                         .put("replace", JSONObject().put("type", "string")))
                         .put("required", JSONArray().put("search").put("replace")).put("additionalProperties", false))))
-                .put("required", JSONArray().put("patches")).put("additionalProperties", false)
-                .put("anyOf", JSONArray().put(JSONObject().put("required", JSONArray().put("file_id")))
-                    .put(JSONObject().put("required", JSONArray().put("filename")))))))
+                // Claude rejects root-level anyOf/oneOf/allOf even for an unused
+                // tool. The executor enforces the selector alternative locally.
+                .put("required", JSONArray().put("patches")).put("additionalProperties", false))))
         val id = JSONObject().put("type", "string").put("description", "The file_id from a supplied file descriptor, never a device path")
         fun add(name: String, description: String, extra: JSONObject, vararg required: String) {
             val properties = JSONObject().put("file_id", id)
