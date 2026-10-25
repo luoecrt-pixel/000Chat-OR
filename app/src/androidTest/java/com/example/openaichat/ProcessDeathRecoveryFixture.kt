@@ -161,8 +161,8 @@ class ProcessDeathRecoveryFixture {
                 .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
                     .put("data", "synthetic-signed-process-data").put("index", 0)))
                 .put("tool_calls", JSONArray().put(call))).put("finish_reason", "tool_calls")))
-        server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
-            .setBody("data: $toolFrame\n\ndata: [DONE]\n\n"))
+        val toolResponse = MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody("data: $toolFrame\n\ndata: [DONE]\n\n")
         val partialFrame = JSONObject().put("id", generationId("partial")).put("model", model)
             .put("choices", JSONArray().put(JSONObject().put("delta", JSONObject().put("content", prefix)
                 .put("reasoning_details", JSONArray().put(JSONObject().put("type", "reasoning.encrypted")
@@ -171,10 +171,22 @@ class ProcessDeathRecoveryFixture {
         val padding = 510 - firstData.toByteArray(Charsets.UTF_8).size
         require(padding >= 0)
         val firstChunk = firstData + " ".repeat(padding) + "\n\n"
-        if (scenario == "intent_gap") server.enqueue(MockResponse().setResponseCode(599)
-            .setBody("Unexpected continuation after failed artifact registration"))
-        else server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream")
-            .setBody(firstChunk + "data: [DONE]\n\n").throttleBody(512, 30, TimeUnit.SECONDS))
+        val continuationResponse = if (scenario == "intent_gap") MockResponse().setResponseCode(599)
+            .setBody("Unexpected continuation after failed artifact registration")
+        else MockResponse().setHeader("Content-Type", "text/event-stream")
+            .setBody(firstChunk + "data: [DONE]\n\n").throttleBody(512, 30, TimeUnit.SECONDS)
+        val responseIndex = AtomicInteger()
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            // QueueDispatcher.peek() exposes response throttling while MockWebServer
+            // is still reading the request body. Keep the default unthrottled peek;
+            // delay only the SSE response, after the entire POST has been recorded.
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse =
+                when (responseIndex.getAndIncrement()) {
+                    0 -> toolResponse
+                    1 -> continuationResponse
+                    else -> MockResponse().setResponseCode(599).setBody("Unexpected seed HTTP request")
+                }
+        }
         val client = OpenRouterChatClient(server.url("/api/v1").toString(), http, reconcileGenerations = false)
         OpenRouterResponseRuntime.start(context, OpenRouterRuntimeRequest(
             chatId = chatId, requestId = requestId, model = model,

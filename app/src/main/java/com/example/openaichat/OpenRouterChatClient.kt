@@ -299,6 +299,12 @@ class OpenRouterChatClient(
             val priorText = accumulatedText.toList()
             var lastDurableNanos: Long? = null
             var lastDurableCharacters = 0L
+            var streamRevision = 0L
+            var lastDurableRevision = -1L
+            fun changedStream() {
+                streamRevision++
+                streamState.changed()
+            }
             streamState.bind {
                 val interrupted = JSONObject().put("role", "assistant").put("content", contentParts.toString())
                     .put("reasoning_details", reasoningDetails.array())
@@ -311,13 +317,17 @@ class OpenRouterChatClient(
                     JsonProtocol.objectCopy(roundPrefix).put("interrupted_assistant", interrupted))
             }
             fun checkpointStream(force: Boolean = false) {
+                if (lastDurableRevision == streamRevision) return
                 val now = monotonicNanos()
                 val characters = contentParts.length + reasoningDetails.receivedCharacterCount
                 val last = lastDurableNanos
                 if (!force && last != null && now - last < 500_000_000L && characters - lastDurableCharacters < 65_536) return
-                streamState.snapshot()?.let(onStreamCheckpoint)
+                // A trailing writer may already have saved this revision. Empty
+                // SSE/usage/finish frames do not change the durable stream payload.
+                streamState.dirtySnapshot()?.let(onStreamCheckpoint)
                 lastDurableNanos = now
                 lastDurableCharacters = characters
+                lastDurableRevision = streamRevision
             }
 
             fun emitTextSnapshot(force: Boolean = false) {
@@ -373,29 +383,43 @@ class OpenRouterChatClient(
                 }
                 JsonProtocol.text(delta, "content")?.takeIf { it.isNotEmpty() }?.let { chunk ->
                     contentParts.append(chunk)
+                    changedStream()
                     emitTextSnapshot()
                 }
 
-                delta.optJSONArray("reasoning_details")?.let(reasoningDetails::accept)
+                delta.optJSONArray("reasoning_details")?.let { details ->
+                    val before = reasoningDetails.receivedCharacterCount
+                    try { reasoningDetails.accept(details) } finally {
+                        // Invalid identity fragments are still local evidence.
+                        if (reasoningDetails.receivedCharacterCount != before) changedStream()
+                    }
+                }
 
                 delta.optJSONArray("tool_calls")?.let { calls ->
                     for (i in 0 until calls.length()) {
                         val call = calls.optJSONObject(i) ?: continue
                         val index = call.optInt("index", i)
-                        val target = toolCallsByIndex.getOrPut(index) { OpenRouterStreamToolCall() }
+                        val target = toolCallsByIndex.getOrPut(index) {
+                            changedStream()
+                            OpenRouterStreamToolCall()
+                        }
                         JsonProtocol.nonBlank(call, "id")?.let { incomingId ->
                             if (target.id.isNotEmpty() && target.id != incomingId) {
                                 throw IOException("Conflicting streamed tool call id at index $index")
                             }
-                            target.id = incomingId
+                            if (target.id != incomingId) { target.id = incomingId; changedStream() }
                         }
-                        JsonProtocol.nonBlank(call, "type")?.let { target.type = it }
+                        JsonProtocol.nonBlank(call, "type")?.let {
+                            if (target.type != it) { target.type = it; changedStream() }
+                        }
                         call.optJSONObject("function")?.let { function ->
                             JsonProtocol.nonBlank(function, "name")?.let { incomingName ->
-                                if (target.name.isEmpty()) target.name = incomingName
-                                else if (incomingName != target.name) target.name += incomingName
+                                if (target.name.isEmpty()) { target.name = incomingName; changedStream() }
+                                else if (incomingName != target.name) { target.name += incomingName; changedStream() }
                             }
-                            JsonProtocol.text(function, "arguments")?.takeIf { it.isNotEmpty() }?.let { target.arguments.append(it) }
+                            JsonProtocol.text(function, "arguments")?.takeIf { it.isNotEmpty() }?.let {
+                                target.arguments.append(it); changedStream()
+                            }
                         }
                     }
                 }
@@ -423,7 +447,7 @@ class OpenRouterChatClient(
                         BoundedResponseDecoder.readSse(reader, sseLimits, onLine = { ensureWithinBudget() }) { event ->
                             synchronized(streamState.lock) {
                                 ensureActive()
-                                try { consume(event.data) } finally { streamState.changed() }
+                                consume(event.data)
                                 checkpointStream()
                                 // Preserve every field received in this event before applying
                                 // the emergency usage limit, including a final co-located delta.
