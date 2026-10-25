@@ -61,7 +61,8 @@ def main() -> None:
     if args.instrumentation_first:
         print("Running connected Android instrumentation before host process recovery", flush=True)
         instrumentation_status = subprocess.run(
-            ["gradle", "--no-daemon", "--stacktrace", "connectedDebugAndroidTest"], check=False).returncode
+            ["gradle", "--no-daemon", "--stacktrace", "connectedDebugAndroidTest"], check=False,
+            env={**os.environ, "ANDROID_SERIAL": args.serial}).returncode
         print(f"Android instrumentation exit status: {instrumentation_status}; collecting host recovery evidence", flush=True)
     # connectedDebugAndroidTest uninstalls its APKs on completion. Install the
     # exact current build for this separate host-driven run, retaining app data.
