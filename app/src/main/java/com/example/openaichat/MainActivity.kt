@@ -338,7 +338,7 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
             diagnostics.log("legacy_credential_cleanup_failed", mapOf("provider" to "openai"))
         }
         val legacyHistoryMigrated = chatDb.migrateLegacyPrefs(prefs)
-        ensureChatStore()
+        ensureChatStore(legacyMigrationPending = !legacyHistoryMigrated)
         buildUi()
         restoreCurrentChat()
         if (!legacyHistoryMigrated) {
@@ -4094,14 +4094,14 @@ class MainActivity : ComponentActivity(), OpenRouterUiBridge.Host {
     }
 
     // ---------- storage ----------
-    private fun ensureChatStore(){
+    private fun ensureChatStore(legacyMigrationPending: Boolean = false){
         val existing=currentChatId()
         if(existing.isBlank()){
             val id = newChatId()
             prefs.edit().putString("current_chat",id).apply()
-            chatDb.ensureChat(id,"Новый чат")
+            chatDb.ensureChat(id,"Новый чат", legacyMigrationPlaceholder = legacyMigrationPending)
         } else {
-            chatDb.ensureChat(existing,"Новый чат")
+            chatDb.ensureChat(existing,"Новый чат", legacyMigrationPlaceholder = legacyMigrationPending)
         }
     }
 
