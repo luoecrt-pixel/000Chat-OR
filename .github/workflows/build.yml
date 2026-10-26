@@ -67,15 +67,31 @@ jobs:
           set -euo pipefail
           python3 tools/test_verify_v4_17_0_mutations.py
 
+      - name: Verify APK signing guard controls
+        shell: bash
+        run: python3 -m unittest discover -s tools -p 'test_verify_debug_apk_signer.py' -v
+
       - name: Decode persistent debug keystore
+        # PR code is tested without access to the long-lived signing identity.
+        if: github.event_name != 'pull_request'
+        shell: bash
         env:
           DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+          DEBUG_SIGNER_SHA256: ${{ vars.DEBUG_SIGNER_SHA256 }}
         run: |
           set -euo pipefail
-          if [ -n "${DEBUG_KEYSTORE_BASE64:-}" ]; then
-            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/debug.keystore"
-            echo "DEBUG_KEYSTORE_PATH=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+          if [ -z "${DEBUG_KEYSTORE_BASE64:-}" ]; then
+            echo "::error::Configure the persistent DEBUG_KEYSTORE_BASE64 secret. Refusing to publish an APK signed with a runner-generated key."
+            exit 1
           fi
+          if [[ ! "${DEBUG_SIGNER_SHA256:-}" =~ ^([[:xdigit:]]{2}:?){31}[[:xdigit:]]{2}$ ]]; then
+            echo "::error::Configure DEBUG_SIGNER_SHA256 with the public SHA-256 certificate fingerprint of the persistent debug key."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/debug.keystore"
+          test -s "$RUNNER_TEMP/debug.keystore"
+          printf 'DEBUG_KEYSTORE_PATH=%s\n' "$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
 
       - name: Test, lint and build
         shell: bash
@@ -157,10 +173,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 5
 
+      - name: Verify installable APK signing identity
+        if: github.event_name != 'pull_request'
+        id: verify-apk-signer
+        shell: bash
+        env:
+          DEBUG_SIGNER_SHA256: ${{ vars.DEBUG_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          python3 tools/verify_debug_apk_signer.py \
+            --apksigner "$sdk_root/build-tools/35.0.0/apksigner" \
+            --apk app/build/outputs/apk/debug/app-debug.apk \
+            --expected "$DEBUG_SIGNER_SHA256" \
+            --evidence app/build/outputs/apk/debug/signing-identity.json
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
       - name: Upload APK
+        if: github.event_name != 'pull_request' && steps.verify-apk-signer.outputs.verified == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: OpenAIApiChat-Astra-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/signing-identity.json
           if-no-files-found: error
           retention-days: 5
