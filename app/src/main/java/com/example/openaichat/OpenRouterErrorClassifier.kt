@@ -137,6 +137,10 @@ object OpenRouterErrorClassifier {
         val immutableThinking = (lowerMsg + " " + providerDetail.orEmpty().lowercase()).let {
             "thinking" in it && "blocks" in it && "cannot be modified" in it
         }
+        val invalidToolSchema = (lowerMsg + " " + providerDetail.orEmpty().lowercase()).let {
+            "input_schema" in it && "top level" in it &&
+                listOf("oneof", "allof", "anyof").any { keyword -> keyword in it }
+        }
         val retryHint = buildList {
             retryAfterSec?.let { add("Retry-After: ${it} с") }
             resetsAt?.let { add("сброс лимита: $it") }
@@ -144,6 +148,8 @@ object OpenRouterErrorClassifier {
 
         return when (status) {
             400 -> when {
+                invalidToolSchema ->
+                    "Несовместимая схема инструмента Claude. Требуется исправление приложения; автоматический повтор не выполнялся"
                 immutableThinking ->
                     "Провайдер отклонил повторное использование подписанных блоков мышления Claude. " +
                         "Верните исходные модель и маршрут либо начните новый чат с нужным контекстом. " +

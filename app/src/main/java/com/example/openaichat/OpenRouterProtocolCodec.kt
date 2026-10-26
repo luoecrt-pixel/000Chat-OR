@@ -197,6 +197,20 @@ object OpenRouterProtocolCodec {
         val protocol = stored.optJSONObject("openrouter_protocol") ?: return false
         if (protocol.optInt("version") != 1) return false
         val rawTail = protocol.optJSONArray("tail") ?: return false
+        // Older terminal error handling invented this placeholder even when an
+        // HTTP rejection produced no model content. Keep its local evidence,
+        // but do not turn it into an empty assistant message in the next POST.
+        // Signed/tool-bearing or otherwise unfamiliar blocks are never filtered.
+        if (stored.optString("status") in setOf("failed", "disconnected") && rawTail.length() == 1 &&
+            (!protocol.has("tool_states") || protocol.optJSONObject("tool_states")?.length() == 0)) {
+            val placeholder = rawTail.optJSONObject(0)
+            if (placeholder?.length() == 2 && placeholder.optString("role") == "assistant" &&
+                placeholder.opt("content") is String && placeholder.getString("content").isEmpty()) {
+                // A stale placeholder must not hide text retained in the local
+                // terminal record. Fall back to that text when it is present.
+                return JsonProtocol.string(stored, "text").isEmpty()
+            }
+        }
         val tail = JsonProtocol.arrayCopy(rawTail).also { completePendingToolCalls(it, protocol.optJSONObject("tool_states")) }
         val exactPrefix = protocol.optString("input_sha256") == fingerprint(destination)
         for (i in 0 until tail.length()) {
@@ -262,7 +276,7 @@ object OpenRouterProtocolCodec {
             fullText.startsWith("$priorJoined\n\n") -> fullText.removePrefix("$priorJoined\n\n")
             else -> fullText
         }
-        if (unrepresentedText.isNotEmpty() || tail.length() == 0) {
+        if (unrepresentedText.isNotEmpty()) {
             tail.put(JSONObject().put("role", "assistant").put("content", unrepresentedText))
         }
     }

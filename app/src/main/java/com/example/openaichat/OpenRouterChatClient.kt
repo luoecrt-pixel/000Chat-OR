@@ -106,6 +106,7 @@ class OpenRouterChatClient(
         streamState: OpenRouterStreamState = OpenRouterStreamState(),
         onStreamCheckpoint: (OpenRouterStreamSnapshot) -> Unit = {}
     ): OpenRouterCompletionResult {
+        OpenRouterToolSchemaPreflight.validate(tools)
         // Resolve once before HTTP and all tool rounds; Activity already resolves auto.
         val requestEffort = OpenRouterReasoningPolicy.requestEffort(model, reasoningEffort)
         val history = JsonProtocol.arrayCopy(messages)

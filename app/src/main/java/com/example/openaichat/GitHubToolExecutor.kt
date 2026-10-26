@@ -23,8 +23,13 @@ class GitHubToolExecutor(
     private val confirmWrite: (toolName: String, arguments: JSONObject) -> Boolean,
     private val auditWrite: (toolName: String, arguments: JSONObject) -> Unit,
     private val canExecute: () -> Boolean = { true },
-    private val cacheDirectory: java.io.File? = null
+    private val cacheDirectory: java.io.File? = null,
+    private val credentialSource: () -> String = secureStore::getGitHubToken,
+    expectedCredential: String? = null
 ) {
+    // A tool chain belongs to the credential that existed when it started.
+    // Updating settings cannot switch a pending confirmation to another account.
+    private val capturedCredential = expectedCredential ?: credentialSource()
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
@@ -39,6 +44,7 @@ class GitHubToolExecutor(
 
     fun execute(name: String, arguments: JSONObject): String = try {
         if (!canExecute()) throw IOException("GitHub request owner is no longer current")
+        ensureCredentialCurrent()
         when (name) {
             "get_pull_request" -> getPullRequest(arguments)
             "list_pull_requests" -> listPullRequests(arguments)
@@ -46,7 +52,7 @@ class GitHubToolExecutor(
             "get_workflow_runs" -> getWorkflowRuns(arguments)
             "get_workflow_run_jobs" -> getWorkflowRunJobs(arguments)
             "get_file" -> getFile(arguments)
-            "get_file_range" -> getFileRange(arguments)
+            "get_file_range" -> getFileRange(arguments).also { ensureCredentialCurrent() }
             "list_directory" -> listDirectory(arguments)
             "create_issue_comment" -> createIssueComment(arguments)
             "submit_pull_request_review" -> submitPullRequestReview(arguments)
@@ -66,9 +72,17 @@ class GitHubToolExecutor(
         errorResult(e.message ?: e.javaClass.simpleName)
     }
 
-    private fun token(): String =
-        secureStore.getGitHubToken().takeIf { it.isNotBlank() }
+    private fun ensureCredentialCurrent() {
+        if (credentialSource() != capturedCredential) {
+            throw IOException("GitHub PAT изменён или удалён. Начните новый запрос для выбранного аккаунта.")
+        }
+    }
+
+    private fun token(): String {
+        ensureCredentialCurrent()
+        return capturedCredential.takeIf { it.isNotBlank() }
             ?: throw IOException("GitHub PAT is not configured")
+    }
 
     private fun repo(a: JSONObject): Pair<String, String> {
         val owner = a.optString("owner").trim()
@@ -123,6 +137,7 @@ class GitHubToolExecutor(
         var body = ""
         while (attempt < 3) {
             if (!canExecute()) throw IOException("GitHub request owner is no longer current")
+            ensureCredentialCurrent()
             var observedCode: Int? = null
             try { transport.newCall(outbound).execute().use { httpResponse ->
                 code = httpResponse.code
@@ -134,6 +149,7 @@ class GitHubToolExecutor(
                 } else {
                     BoundedResponseDecoder.readErrorBody(httpResponse.body)
                 }
+                if (!mutation) ensureCredentialCurrent()
                 if (mutation || (code != 403 && code != 429)) return code to body
                 val retryMs = httpResponse.header("Retry-After")?.toLongOrNull()
                     ?.coerceIn(0L, 10L)?.times(1000L) ?: 750L * (attempt + 1)
@@ -389,8 +405,10 @@ class GitHubToolExecutor(
     }
 
     private fun requireConfirmation(name: String, args: JSONObject) {
+        ensureCredentialCurrent()
         if (!canExecute() || !confirmWrite(name, args) || !canExecute())
             throw IOException("User declined or request owner is no longer current")
+        ensureCredentialCurrent()
     }
 
     private fun sanitized(input: JSONObject): JSONObject = JSONObject(input.toString()).apply {

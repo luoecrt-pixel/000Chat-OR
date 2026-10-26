@@ -29,6 +29,12 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         private const val REQUEST_EVENT_TABLE = "request_events"
         private const val REQUEST_ACCOUNTING_TABLE = "request_accounting"
         private const val OPENROUTER_ROUND_TABLE = "openrouter_request_rounds"
+        private const val LEGACY_PLACEHOLDER_TABLE = "legacy_migration_placeholders"
+        private val LEGACY_PLACEHOLDER_CHILD_TABLES = listOf(
+            MESSAGE_TABLE, METRICS_TABLE, REQUEST_EVENT_TABLE, REQUEST_ACCOUNTING_TABLE, OPENROUTER_ROUND_TABLE,
+            "answer_notifications", "openai_tool_checkpoints", "openrouter_checkpoints",
+            "request_recovery_archive", "local_artifacts", "local_artifact_intents"
+        )
     }
 
     init {
@@ -163,6 +169,35 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         super.onOpen(db)
         ensureLocalArtifactsTable(db)
         ensureTelemetryAndCostColumns(db)
+        ensureLegacyMigrationPlaceholders(db)
+    }
+
+    private fun ensureLegacyMigrationPlaceholders(db: SQLiteDatabase) {
+        // Provenance is created only with a new bootstrap row, never inferred
+        // from an empty user chat. It survives restart but not any later use.
+        db.execSQL("""CREATE TABLE IF NOT EXISTS $LEGACY_PLACEHOLDER_TABLE (
+            chat_id TEXT PRIMARY KEY NOT NULL,
+            FOREIGN KEY(chat_id) REFERENCES $CHAT_TABLE(id) ON DELETE CASCADE
+        )""")
+        db.execSQL("""CREATE TRIGGER IF NOT EXISTS legacy_placeholder_chat_updated
+            AFTER UPDATE ON $CHAT_TABLE BEGIN
+                DELETE FROM $LEGACY_PLACEHOLDER_TABLE WHERE chat_id=NEW.id;
+            END""")
+        LEGACY_PLACEHOLDER_CHILD_TABLES.forEach { table ->
+            db.execSQL("""CREATE TRIGGER IF NOT EXISTS legacy_placeholder_used_$table
+                AFTER INSERT ON $table BEGIN
+                    DELETE FROM $LEGACY_PLACEHOLDER_TABLE WHERE chat_id=NEW.chat_id;
+                END""")
+        }
+    }
+
+    private fun isUnusedLegacyMigrationPlaceholder(db: SQLiteDatabase, id: String): Boolean {
+        if (!db.rawQuery("SELECT 1 FROM $LEGACY_PLACEHOLDER_TABLE WHERE chat_id=? LIMIT 1", arrayOf(id))
+                .use { it.moveToFirst() }) return false
+        // Include non-FK records that may predate this newly-created chat ID.
+        return LEGACY_PLACEHOLDER_CHILD_TABLES.none { table ->
+            db.rawQuery("SELECT 1 FROM $table WHERE chat_id=? LIMIT 1", arrayOf(id)).use { it.moveToFirst() }
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -503,35 +538,85 @@ class ChatDatabase(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     /** One-time migration from v4.13's SharedPreferences chat_store JSON. */
-    fun migrateLegacyPrefs(prefs: android.content.SharedPreferences) {
-        if (prefs.getBoolean("chat_store_migrated_v7", false)) return
-        val raw = prefs.getString("chat_store", null)
-        writableDatabase.transaction { sql ->
-            if (!raw.isNullOrBlank()) {
-                val chats = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
-                for (i in 0 until chats.length()) {
-                    val c = chats.optJSONObject(i) ?: continue
-                    upsertChatObject(sql, c)
-                }
+    fun migrateLegacyPrefs(prefs: android.content.SharedPreferences): Boolean {
+        val before = prefs.all
+        val marker = before["chat_store_migrated_v7"]
+        if (marker == true) return true
+        if (marker != null && marker !is Boolean) return false
+        val source = before["chat_store"]
+        if (source != null && source !is String) return false
+        val raw = source as? String
+        // JSONTokener also treats a literal NUL as EOF; valid JSON escapes it.
+        if (raw?.contains('\u0000') == true) return false
+        val chats = if (raw.isNullOrBlank()) JSONArray() else try {
+            val reader = org.json.JSONTokener(raw)
+            val value = reader.nextValue()
+            if (value !is JSONArray || reader.nextClean() != '\u0000') return false
+            value
+        } catch (_: org.json.JSONException) { return false }
+        val imports = mutableListOf<JSONObject>()
+        val ids = linkedSetOf<String>()
+        // Validate the entire source before writing any row. A malformed item
+        // must not turn into an empty chat or silently disappear from history.
+        val arrays = listOf("file_ids", "file_names", "file_sizes", "file_paths", "file_mimes",
+            "attachments", "annotations", "generated_images", "tools") + MessageMetadataCodec.arrayKeys
+        val strings = listOf("role", "text", "response_id", "request_id", "image_path", "image_file_id",
+            "image_name", "image_mime", "status") + MessageMetadataCodec.textKeys
+        for (index in 0 until chats.length()) {
+            val chat = chats.optJSONObject(index) ?: return false
+            val id = JsonProtocol.nonBlank(chat, "id")?.trim() ?: return false
+            if (!ids.add(id)) return false
+            val messages = if (!chat.has("messages") || chat.isNull("messages")) JSONArray()
+                else chat.optJSONArray("messages") ?: return false
+            for (position in 0 until messages.length()) {
+                val message = messages.optJSONObject(position) ?: return false
+                if (arrays.any { message.has(it) && !message.isNull(it) && message.optJSONArray(it) == null } ||
+                    MessageMetadataCodec.objectKeys.any {
+                        message.has(it) && !message.isNull(it) && message.optJSONObject(it) == null
+                    } || strings.any { message.has(it) && !message.isNull(it) && message.opt(it) !is String }) return false
             }
+            imports += chat
         }
-        prefs.edit().putBoolean("chat_store_migrated_v7", true).remove("chat_store").apply()
+        var imported = false
+        writableDatabase.transaction { sql ->
+            // SQL may already contain newer history, or the prior import may
+            // have committed just before process death lost the prefs marker.
+            // Only an explicitly-created, still-unused bootstrap placeholder
+            // can be adopted. Ordinary empty chats remain real conflicts.
+            for (id in ids) {
+                val exists = sql.rawQuery("SELECT 1 FROM $CHAT_TABLE WHERE id=? LIMIT 1", arrayOf(id))
+                    .use { it.moveToFirst() }
+                if (exists && !isUnusedLegacyMigrationPlaceholder(sql, id)) return@transaction
+            }
+            imports.forEach { upsertChatObject(sql, it) }
+            imported = true
+        }
+        if (!imported || prefs.all["chat_store"] != source) return false
+        if (prefs.edit().putBoolean("chat_store_migrated_v7", true).remove("chat_store").commit()) return true
+        // commit() updates the in-memory preferences even when the disk write
+        // fails. Restore their retryable state; the committed SQL is untouched.
+        prefs.edit().apply {
+            if (source == null) remove("chat_store") else putString("chat_store", raw)
+            if (marker == null) remove("chat_store_migrated_v7") else putBoolean("chat_store_migrated_v7", false)
+        }.commit()
+        return false
     }
 
-    fun ensureChat(id: String, title: String = "Новый чат") {
+    fun ensureChat(id: String, title: String = "Новый чат", legacyMigrationPlaceholder: Boolean = false) {
         if (id.isBlank()) return
-        val d = writableDatabase
-        d.query(CHAT_TABLE, arrayOf("id"), "id=?", arrayOf(id), null, null, null, "1").use { c ->
-            if (c.moveToFirst()) return
+        writableDatabase.transaction { sql ->
+            if (sql.rawQuery("SELECT 1 FROM $CHAT_TABLE WHERE id=? LIMIT 1", arrayOf(id))
+                    .use { it.moveToFirst() }) return@transaction
+            sql.insertOrThrow(CHAT_TABLE, null, ContentValues().apply {
+                put("id", id)
+                put("title", title.ifBlank { "Новый чат" })
+                putNull("response_id")
+                putNull("baseline_effort")
+                put("updated_at", System.currentTimeMillis())
+            })
+            if (legacyMigrationPlaceholder) sql.insertOrThrow(LEGACY_PLACEHOLDER_TABLE, null,
+                ContentValues().apply { put("chat_id", id) })
         }
-        val v = ContentValues().apply {
-            put("id", id)
-            put("title", title.ifBlank { "Новый чат" })
-            putNull("response_id")
-            putNull("baseline_effort")
-            put("updated_at", System.currentTimeMillis())
-        }
-        d.insertOrThrow(CHAT_TABLE, null, v)
     }
 
     fun getChat(id: String): JSONObject? {
@@ -3707,7 +3792,11 @@ data class ExistingMessageRow(
             putStringOrNull("baseline_effort", baseline)
             put("updated_at", System.currentTimeMillis())
         }
-        db.insertWithOnConflict(CHAT_TABLE, null, v, SQLiteDatabase.CONFLICT_REPLACE)
+        // Adopt only proven bootstrap rows, in place. Never REPLACE a parent:
+        // FK cascades must not remove any existing user's related records.
+        val adopted = db.update(CHAT_TABLE, v,
+            "id=? AND EXISTS (SELECT 1 FROM $LEGACY_PLACEHOLDER_TABLE WHERE chat_id=?)", arrayOf(id, id))
+        if (adopted == 0) db.insertOrThrow(CHAT_TABLE, null, v)
         db.delete(MESSAGE_TABLE, "chat_id=?", arrayOf(id))
         val arr = c.optJSONArray("messages") ?: JSONArray()
         for (i in 0 until arr.length()) {

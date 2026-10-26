@@ -14,7 +14,7 @@ object DialogConversationExporter {
 
     private val terminal = setOf("completed", "failed", "cancelled", "canceled", "stopped", "incomplete", "disconnected")
     private val toolNames = setOf(
-        "create_local_text_file", "file_list", "file_info", "file_read_range", "file_search", "file_table_stats",
+        "create_local_text_file", "patch_local_file", "file_list", "file_info", "file_read_range", "file_search", "file_table_stats",
         "list_attached_files", "search_attached_file", "read_attached_file", "read_attached_table",
         "get_file", "get_file_range", "list_directory", "get_pull_request", "list_pull_requests", "list_issues",
         "get_workflow_runs", "get_workflow_run_jobs", "create_file", "update_file", "delete_file",
