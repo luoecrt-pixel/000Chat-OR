@@ -1,6 +1,6 @@
-# Инструкции для агентов 000Chat
+# Инструкции для агентов 000Chat-OR
 
-Этот форк использует только OpenRouter с моделями Claude. Прямые OpenAI API, их сетевые recovery/upload/download и WorkManager не поддерживаются. Локальные legacy codecs, SQLite-поля и экспорт старой истории сохраняют совместимость данных; их наличие не является разрешением вернуть OpenAI transport. Android applicationId форка отдельный, Kotlin namespace и исторические идентификаторы хранилища сохранены.
+Этот форк использует только OpenRouter с моделями Claude. План прямых API OpenAI, DeepSeek и других провайдеров относится к [исходному `000Chat`](https://github.com/luoecrt-pixel/000Chat). Прямые OpenAI API, их сетевые recovery/upload/download и WorkManager не поддерживаются. Локальные legacy codecs, SQLite-поля и экспорт старой истории сохраняют совместимость данных; их наличие не является разрешением вернуть OpenAI transport. Android applicationId форка отдельный, Kotlin namespace и исторические идентификаторы хранилища сохранены.
 
 Прочти [NEXT_AGENT_HANDOFF.md](NEXT_AGENT_HANDOFF.md) (необходимые постоянные правила) и [AGENT_TASKS.md](AGENT_TASKS.md) (единственный актуальный план и критерии). [PROJECT_HISTORY.md](PROJECT_HISTORY.md) — только для разбора неочевидных прежних решений, не обязательный журнал для каждого нового агента.
 
