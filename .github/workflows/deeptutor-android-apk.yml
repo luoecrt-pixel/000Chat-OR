@@ -16,7 +16,11 @@ jobs:
           java-version: '17'
       - name: Use preinstalled Android SDK
         run: echo ANDROID_HOME=$ANDROID_HOME
-      - run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Install Android platform
+        run: |
+          SDKMGR="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)"
+          if [ -z "$SDKMGR" ]; then echo "No cmdline-tools found"; exit 1; fi
+          yes | "$SDKMGR" --install 'platforms;android-35' 'build-tools;35.0.0' || test "${PIPESTATUS[1]}" -eq 0
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
