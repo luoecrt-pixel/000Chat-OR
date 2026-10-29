@@ -1,0 +1,123 @@
+name: Build DeepTutor APK client
+on:
+  push:
+    branches: [deeptutor-android-apk]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate Android client
+        run: |
+          mkdir -p dtapp/app/src/main/java/org/example/deeptutormobile dtapp/app/src/main/res/values
+          cat > dtapp/settings.gradle <<'END_SETTINGS'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name='DeepTutorMobile'
+          include ':app'
+          END_SETTINGS
+          cat > dtapp/build.gradle <<'END_ROOT'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          END_ROOT
+          cat > dtapp/gradle.properties <<'END_PROPS'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          END_PROPS
+          cat > dtapp/app/build.gradle <<'END_APP'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'org.example.deeptutormobile'
+              compileSdk 35
+              defaultConfig { applicationId 'org.example.deeptutormobile'; minSdk 26; targetSdk 33; versionCode 1; versionName '1.0' }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          END_APP
+          cat > dtapp/app/src/main/res/values/styles.xml <<'END_STYLES'
+          <resources>
+            <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+              <item name="android:colorAccent">#346BDF</item>
+            </style>
+          </resources>
+          END_STYLES
+          cat > dtapp/app/src/main/AndroidManifest.xml <<'END_MANIFEST'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="DeepTutor Mobile" android:allowBackup="false" android:usesCleartextTraffic="false" android:theme="@style/AppTheme">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          END_MANIFEST
+          cat > dtapp/app/src/main/java/org/example/deeptutormobile/MainActivity.java <<'END_JAVA'
+          package org.example.deeptutormobile;
+          import android.app.*;
+          import android.os.*;
+          import android.content.*;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.view.*;
+          import android.webkit.*;
+          import android.widget.*;
+          public class MainActivity extends Activity {
+            private LinearLayout base;
+            private WebView web;
+            private String url;
+            private ValueCallback<Uri[]> fileCallback;
+            private int dp(int n) { return (int)(n*getResources().getDisplayMetrics().density+.5f); }
+            @Override public void onCreate(Bundle b) { super.onCreate(b); url=getPreferences(0).getString("url",""); home(); }
+            private void home() {
+              base=new LinearLayout(this); base.setOrientation(1); base.setBackgroundColor(Color.WHITE); setContentView(base);
+              LinearLayout header=new LinearLayout(this); header.setGravity(Gravity.CENTER_VERTICAL); base.addView(header,new LinearLayout.LayoutParams(-1,dp(52)));
+              TextView name=new TextView(this); name.setText("DeepTutor Mobile"); name.setTextSize(18); name.setPadding(dp(12),0,0,0);
+              header.addView(name,new LinearLayout.LayoutParams(0,-2,1));
+              Button browser=new Button(this); browser.setText("Chrome"); header.addView(browser); browser.setOnClickListener(v->{ if(!url.isEmpty()) startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url))); });
+              Button address=new Button(this); address.setText("Адрес"); header.addView(address); address.setOnClickListener(v->settings());
+              if(url.isEmpty()) settings(); else showWeb();
+            }
+            private void settings() {
+              if(web!=null) { base.removeView(web); web.destroy(); web=null; }
+              while(base.getChildCount()>1) base.removeViewAt(1);
+              LinearLayout panel=new LinearLayout(this); panel.setOrientation(1); panel.setPadding(dp(24),dp(24),dp(24),0); base.addView(panel);
+              TextView message=new TextView(this); message.setText("Адрес запущенного DeepTutor (HTTPS). Например: https://имя-3782.app.github.dev\n\nAPK — клиент. Для работы нужен сервер DeepTutor и настроенная AI-модель."); message.setTextSize(16); panel.addView(message);
+              EditText edit=new EditText(this); edit.setSingleLine(true); edit.setHint("https://..."); edit.setText(url); panel.addView(edit);
+              Button save=new Button(this); save.setText("Подключиться"); panel.addView(save);
+              save.setOnClickListener(v->{ String s=edit.getText().toString().trim(); Uri u=Uri.parse(s); if(!"https".equalsIgnoreCase(u.getScheme())||u.getHost()==null||u.getUserInfo()!=null){edit.setError("Нужен HTTPS-адрес");return;} url=s;getPreferences(0).edit().putString("url",url).apply();showWeb(); });
+            }
+            private void showWeb() {
+              while(base.getChildCount()>1) base.removeViewAt(1);
+              web=new WebView(this); base.addView(web,new LinearLayout.LayoutParams(-1,0,1));
+              web.getSettings().setJavaScriptEnabled(true);web.getSettings().setDomStorageEnabled(true);web.getSettings().setAllowFileAccess(false);
+              CookieManager.getInstance().setAcceptCookie(true);CookieManager.getInstance().setAcceptThirdPartyCookies(web,true);
+              web.setWebViewClient(new WebViewClient(){
+                @Override public boolean shouldOverrideUrlLoading(WebView v,WebResourceRequest r){String s=r.getUrl().getScheme();if("https".equalsIgnoreCase(s))return false; if("http".equalsIgnoreCase(s))return true;try{startActivity(new Intent(Intent.ACTION_VIEW,r.getUrl()));}catch(Exception ignored){}return true;}
+                @Override public void onReceivedError(WebView v,WebResourceRequest req,WebResourceError e){if(req.isForMainFrame()) Toast.makeText(MainActivity.this,"Сервер не отвечает. Запустите Codespace.",Toast.LENGTH_LONG).show();}
+              });
+              web.setWebChromeClient(new WebChromeClient(){
+                @Override public boolean onShowFileChooser(WebView v,ValueCallback<Uri[]> cb,FileChooserParams p){fileCallback=cb;try{startActivityForResult(p.createIntent(),1);return true;}catch(Exception e){fileCallback=null;cb.onReceiveValue(null);return false;}}
+              });
+              web.setDownloadListener((link,ua,disposition,mime,length)-> {try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(link)));}catch(Exception ignored){}});
+              web.loadUrl(url);
+            }
+            @Override protected void onActivityResult(int request,int result,Intent data){super.onActivityResult(request,result,data);if(request==1&&fileCallback!=null){fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result,data));fileCallback=null;}}
+            @Override public void onBackPressed(){if(web!=null&&web.canGoBack())web.goBack();else super.onBackPressed();}
+          }
+          END_JAVA
+      - name: Build APK
+        run: gradle -p dtapp --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepTutor-Mobile-APK
+          path: dtapp/app/build/outputs/apk/debug/app-debug.apk
